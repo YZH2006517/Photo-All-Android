@@ -5,19 +5,20 @@
     <style name="FilmTheme" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:forceDarkAllowed">false</item>
         <item name="android:windowBackground">#000000</item>
-        <item name="android:colorBackground">#161616</item>
-        <item name="android:colorAccent">#E0B060</item>
-        <item name="android:colorControlActivated">#E0B060</item>
-        <item name="android:colorControlNormal">#9A9A9A</item>
-        <item name="android:textColorPrimary">#FFFFFF</item>
-        <item name="android:textColorSecondary">#BBBBBB</item>
-        <item name="android:colorButtonNormal">#3A3A3A</item>
+        <item name="android:colorBackground">#121212</item>
+        <item name="android:colorAccent">#F2C14E</item>
+        <item name="android:colorControlActivated">#F2C14E</item>
+        <item name="android:colorControlNormal">#8E8E8E</item>
+        <item name="android:textColorPrimary">#F2F2F2</item>
+        <item name="android:textColorSecondary">#8E8E8E</item>
+        <item name="android:colorButtonNormal">#121212</item>
         <item name="android:alertDialogTheme">@style/FilmDialog</item>
     </style>
 
     <style name="FilmDialog" parent="@android:style/Theme.Material.Dialog.Alert">
         <item name="android:forceDarkAllowed">false</item>
-        <item name="android:colorAccent">#E0B060</item>
-        <item name="android:textColorPrimary">#FFFFFF</item>
+        <item name="android:colorAccent">#F2C14E</item>
+        <item name="android:textColorPrimary">#F2F2F2</item>
+        <item name="android:colorBackground">#1E1E1E</item>
     </style>
 </resources>

@@ -1,8 +1,10 @@
 // JNI bridge for org.photoall.film.engine.FilmNative.
 #include <android/asset_manager_jni.h>
 #include <android/bitmap.h>
+#include <android/log.h>
 #include <jni.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -185,13 +187,20 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_develop(
 // Returns {width, height, passes, peak bytes, gpu us, TIFF orientation}.
 JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng(
     JNIEnv *env, jclass, jlong handle_value, jobjectArray paths, jobjectArray names, jfloatArray values,
-    jint max_long_edge, jfloat exposure_ev, jint seed, jboolean output_p3, jfloat match_key)
+    jint max_long_edge, jfloat exposure_ev, jint seed, jboolean output_p3, jfloat match_key, jfloat local_tone,
+    jfloat chroma_denoise, jfloat raw_denoise,
+    jfloatArray neutral_override, jfloat noise_s, jfloat noise_o, jfloatArray flash_mix,
+    jfloatArray flash_white)
 {
   Handle *handle = handle_of(handle_value);
   film::FilmParams params;
   film::Stages stages;
   if(!read_params(env, names, values, params, stages)) return nullptr;
 
+  // The camera's own neutral and noise model at the shot (CameraX writes stale ones).
+  float neutral[3] = {0, 0, 0};
+  const bool has_neutral = neutral_override && env->GetArrayLength(neutral_override) == 3;
+  if(has_neutral) env->GetFloatArrayRegion(neutral_override, 0, 3, neutral);
   const jsize count = env->GetArrayLength(paths);
   std::vector<film::RawImage> raws(static_cast<size_t>(count));
   std::string error;
@@ -212,7 +221,12 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
       std::fclose(f);
     }
     if(bytes.empty()) error = "cannot read " + file;
-    else film::parse_dng(bytes.data(), bytes.size(), raws[i], error);
+    else if(film::parse_dng(bytes.data(), bytes.size(), raws[i], error, has_neutral ? neutral : nullptr) &&
+            noise_s > 0.0f)
+    {
+      raws[i].noise_scale = noise_s;
+      raws[i].noise_offset = noise_o;
+    }
   }
   if(count == 0) error = "no DNG given";
   if(!error.empty())
@@ -234,6 +248,40 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
   options.output = output_p3 ? film::ColourSpace::DisplayP3 : film::ColourSpace::Srgb;
   options.stages = stages;
   options.match_key = match_key;
+  options.local_tone = local_tone;
+  options.chroma_denoise = chroma_denoise;
+  options.raw_denoise = raw_denoise;
+  if(flash_mix && env->GetArrayLength(flash_mix) == 5)
+  {
+    float f[5];
+    env->GetFloatArrayRegion(flash_mix, 0, 5, f);
+    options.flash.enabled = true;
+    options.flash.ambient = f[0];
+    options.flash.target = f[1];
+    for(int c = 0; c < 3; c++) options.flash.wb[c] = f[2 + c];
+  }
+  if(flash_white && env->GetArrayLength(flash_white) == 6)
+  {
+    float n[6];
+    env->GetFloatArrayRegion(flash_white, 0, 6, n);
+    options.flash_white.enabled = true;
+    for(int c = 0; c < 3; c++)
+    {
+      options.flash_white.ambient[c] = n[c];
+      options.flash_white.flash[c] = n[3 + c];
+    }
+  }
+  // Diagnosis of what the DNGs carry: pixel brightness (log-average key) against the
+  // viewfinder's, and the white balance and noise model taken from each header.
+  for(size_t i = 0; i < raws.size(); i++)
+  {
+    const film::RawImage &r = raws[i];
+    const float key = film::raw_key(r);
+    __android_log_print(ANDROID_LOG_INFO, "FilmEngine",
+                        "dng %zu: key %.5f (viewfinder %.5f, push %+.2f ev) wb %.3f %.3f %.3f noise %.3g %.3g",
+                        i, key, match_key, key > 0 && match_key > 0 ? std::log2(match_key / key) : 0.0f, r.wb[0],
+                        r.wb[1], r.wb[2], r.noise_scale, r.noise_offset);
+  }
   std::lock_guard<std::mutex> lock(handle->mutex);
   if(!handle->engine->develop(source, params, options, handle->last, error))
   {
@@ -291,6 +339,14 @@ JNIEXPORT jbyteArray JNICALL Java_org_photoall_film_engine_FilmNative_previewLut
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
   env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()), reinterpret_cast<const jbyte *>(rgba.data()));
   return out;
+}
+
+// The last develop's record ("section\tkey\tvalue" lines).
+JNIEXPORT jstring JNICALL Java_org_photoall_film_engine_FilmNative_lastNote(JNIEnv *env, jclass, jlong handle_value)
+{
+  Handle *handle = handle_of(handle_value);
+  std::lock_guard<std::mutex> lock(handle->mutex);
+  return env->NewStringUTF(handle->last.note.c_str());
 }
 
 JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_copyResult(JNIEnv *env, jclass, jlong handle_value,

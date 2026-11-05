@@ -10,10 +10,12 @@ import android.widget.ImageView
 
 /**
  * Fit-to-screen image with pinch zoom, pan and double-tap. When not zoomed, a
- * horizontal fling is reported through [onSwipe] (-1 previous, +1 next).
+ * horizontal fling is reported through [onSwipe] (-1 previous, +1 next), a vertical one
+ * through [onSwipeVertical] (+1 up, -1 down).
  */
 class ZoomImageView(context: Context) : ImageView(context) {
     var onSwipe: (Int) -> Unit = {}
+    var onSwipeVertical: (Int) -> Unit = {}
     private val m = Matrix()
     private var fit = 1f
     private var scale = 1f // relative to fit
@@ -40,6 +42,7 @@ class ZoomImageView(context: Context) : ImageView(context) {
 
         override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
             if (scale <= 1.01f && Math.abs(vx) > Math.abs(vy) && Math.abs(vx) > 800) onSwipe(if (vx < 0) 1 else -1)
+            else if (scale <= 1.01f && Math.abs(vy) > Math.abs(vx) && Math.abs(vy) > 800) onSwipeVertical(if (vy < 0) 1 else -1)
             return true
         }
 

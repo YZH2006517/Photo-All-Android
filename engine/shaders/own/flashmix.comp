@@ -1,0 +1,95 @@
+#version 450
+// Flash / no-flash mix in the Bayer domain. The ambient mosaic (one raw or the merge of
+// several) and a flash frame were taken at the same exposure, so the light the flash
+// alone added is their difference. The output re-lights the scene:
+//   out = ambient_gain * A + flash_gain * wb[colour] * max(F - A, 0)
+// with wb converting the flash's colour to the ambient's white (each light balanced for
+// itself). The difference is gated by a noise test on 3x3 same-colour means, so areas
+// the flash did not reach add nothing rather than rectified noise; where the flash frame
+// came out darker (something moved) it adds nothing either.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform usampler2D img_ambient;
+layout(set = 1, binding = 1) uniform usampler2D img_flash;
+layout(set = 1, binding = 2, std430) readonly buffer offsets_t { ivec2 offsets[]; };
+layout(set = 1, binding = 3, r32ui) uniform writeonly restrict uimage2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4  a_black;      // ambient: per 2x2 position, code values
+  vec4  f_black;      // flash frame
+  vec4  wb;           // flash colour -> ambient white, per colour (r g b)
+  float a_white;
+  float f_white;
+  float ambient_gain;
+  float flash_gain;
+  ivec4 cfa;          // colour per 2x2 position
+  float noise_s;      // variance = s x + o, x in [0, 1]
+  float noise_o;
+  float scale;        // output code value for 1.0
+  int   flash_index;  // alignment frame of the flash
+  int   tiles_x;
+  int   tiles_y;
+  int   tile;
+  int   pad;
+  vec4  wbg;          // the develop's white balance multipliers per colour (r g b)
+} push;
+
+ivec2 size;
+
+float ambient_at(ivec2 p)
+{
+  p = clamp(p, ivec2(p & 1), size - 2 + (p & 1)); // stay on the same CFA colour
+  float b = push.a_black[(p.x & 1) + 2 * (p.y & 1)];
+  return (float(texelFetch(img_ambient, p, 0).r) - b) / (push.a_white - b);
+}
+
+float flash_at(ivec2 p)
+{
+  p = clamp(p, ivec2(p & 1), size - 2 + (p & 1));
+  float b = push.f_black[(p.x & 1) + 2 * (p.y & 1)];
+  return (float(texelFetch(img_flash, p, 0).r) - b) / (push.f_white - b);
+}
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  size = textureSize(img_ambient, 0);
+  if(any(greaterThanEqual(p, size))) return;
+  ivec2 t = min(p / push.tile, ivec2(push.tiles_x, push.tiles_y) - 1);
+  ivec2 q = p + offsets[push.flash_index * push.tiles_x * push.tiles_y + t.y * push.tiles_x + t.x];
+
+  float a = ambient_at(p);
+  float f = flash_at(q);
+  // 3x3 same-colour means: is the difference above the noise of both frames?
+  float ma = 0.0, mf = 0.0;
+  for(int y = -2; y <= 2; y += 2)
+    for(int x = -2; x <= 2; x += 2)
+    {
+      ma += ambient_at(p + ivec2(x, y));
+      mf += flash_at(q + ivec2(x, y));
+    }
+  ma /= 9.0;
+  mf /= 9.0;
+  float sigma = sqrt(max(2.0 * (push.noise_s * max(ma, 0.0) + push.noise_o), 1e-12) / 9.0);
+  float lit = smoothstep(1.0, 3.0, (mf - ma) / sigma);
+  // A clipped ambient sample cannot tell what the flash added.
+  if(a >= 0.98) lit = 0.0;
+  float added = lit * max(f - a, 0.0);
+  int colour = push.cfa[(p.x & 1) + 2 * (p.y & 1)];
+  float v = push.ambient_gain * a + push.flash_gain * push.wb[colour] * added;
+  // Channels clip one by one (green first): where the flash frame nears white in any
+  // sample of this quad, the differences have the wrong hue. Fade the quad to a neutral
+  // of the same brightness (equal after the develop's white balance).
+  ivec2 q0 = q & ~1, p0 = p & ~1;
+  float fmax = 0.0, level = 0.0;
+  for(int k = 0; k < 4; k++)
+  {
+    ivec2 o = ivec2(k & 1, k >> 1);
+    float fk = flash_at(q0 + o), ak = ambient_at(p0 + o);
+    int ck = push.cfa[k];
+    fmax = max(fmax, fk);
+    level += (push.ambient_gain * ak + push.flash_gain * push.wb[ck] * max(fk - ak, 0.0)) * push.wbg[ck];
+  }
+  float clip = smoothstep(0.85, 0.97, fmax);
+  v = mix(v, 0.25 * level / push.wbg[colour], clip);
+  imageStore(img_out, p, uvec4(uint(clamp(v, 0.0, 1.0) * push.scale + 0.5)));
+}

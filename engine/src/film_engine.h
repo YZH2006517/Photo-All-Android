@@ -35,6 +35,28 @@ struct SourceImage
   ColourSpace space = ColourSpace::Srgb;
 };
 
+// Flash / no-flash re-lighting (raw bursts only): the last burst frame was taken with
+// the flash at the same exposure as the others; the develop mixes ambient and flash light.
+struct FlashMix
+{
+  bool enabled = false;
+  float ambient = 1.0f;     // gain on the ambient light (0.25 = two stops darker)
+  float target = 0.3f;      // scene-linear level the brightest flash-lit areas (98th
+                            // percentile of the flash-only light) are brought to
+  float max_gain = 4.0f;    // limit on the flash gain (it also scales the flash's noise)
+  float wb[3] = {1, 1, 1};  // flash colour -> ambient white, per camera channel
+};
+
+// Single flash white balance (raw only): burst = {ambient frame, flash frame}. The flash
+// frame is developed alone; the ambient one tells where the flash lit, and the white is
+// blended per area between the two lights' neutrals (camera rgb, as DNG AsShotNeutral).
+struct FlashWhite
+{
+  bool enabled = false;
+  float ambient[3] = {1, 1, 1};
+  float flash[3] = {1, 1, 1};
+};
+
 struct DevelopOptions
 {
   int max_long_edge = 4096;   // working resolution; larger sources are area-resampled
@@ -47,6 +69,17 @@ struct DevelopOptions
   // exposure_ev is then an offset on top.
   float match_key = 0.0f;
   Stages stages;
+  // Local tone compression before the film, 0..1: large-scale brightness pulled towards
+  // mid grey (shadows lifted, highlights lowered), local contrast kept. For HDR merges.
+  float local_tone = 0.0f;
+  // Chroma noise reduction before the film, 0..1: colour smoothed, luminance kept.
+  float chroma_denoise = 0.0f;
+  // Raw sources: denoise of the mosaic before demosaicing (vkdt's wavelet denoise),
+  // driven by the DNG noise profile. Strength as in vkdt (0..1, about 0.3 for clean
+  // shadows that keep their detail; 0.5 starts to smear).
+  float raw_denoise = 0.0f;
+  FlashMix flash;
+  FlashWhite flash_white;
   bool calibrate = false; // internal: write log2 of the linear result (scan calibration)
 };
 
@@ -61,6 +94,8 @@ struct DevelopResult
   double gpu_ms = 0.0;            // 0 when the queue has no timestamps
   uint64_t peak_image_bytes = 0;  // GPU images alive at once for this frame
   int passes = 0;
+  // Every decision of the develop, one "section\tkey\tvalue" line each (the photo's record).
+  std::string note;
 };
 
 struct DeviceInfo

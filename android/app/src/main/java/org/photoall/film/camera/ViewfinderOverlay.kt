@@ -40,9 +40,7 @@ class ViewfinderOverlay(context: Context) : View(context) {
     /** Live histogram (bottom-left); null hides it. */
     var histogram: PreviewMeter.Histogram? = null
         set(value) { field = value; invalidate() }
-    private val histogramBack = Paint().apply { color = 0x66000000 }
-    private val lumaFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x99ffffff.toInt() }
-    private val channelLine = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val histogramPainter by lazy { HistogramPainter(density) } // after density is set
 
     private val density = resources.displayMetrics.density
     private val guidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -128,7 +126,7 @@ class ViewfinderOverlay(context: Context) : View(context) {
         val state = focus ?: return
         ringPaint.color = when (state) {
             Focus.Metering, Focus.Focusing -> Color.WHITE
-            Focus.Focused, Focus.Locked -> 0xffffd040.toInt()
+            Focus.Focused, Focus.Locked -> org.photoall.film.ui.Style.ACCENT
             Focus.Failed -> 0xffff5040.toInt()
         }
         ringPaint.alpha = (ringAlpha * 255).toInt()
@@ -161,38 +159,8 @@ class ViewfinderOverlay(context: Context) : View(context) {
      * right means clipped highlights.
      */
     private fun drawHistogram(canvas: Canvas, h: PreviewMeter.Histogram) {
-        val w = 120 * density
         val ht = 56 * density
-        val left = 10 * density
-        val bottom = height - 10 * density
-        val top = bottom - ht
-        canvas.drawRect(left, top, left + w, bottom, histogramBack)
-        val bins = h.luma.size
-        val peak = maxOf(1, (0 until bins).maxOf { maxOf(h.luma[it], h.r[it], h.g[it], h.b[it]) })
-        val scale = ht / Math.sqrt(peak.toDouble()).toFloat()
-        val step = w / bins
-        val path = android.graphics.Path().apply { moveTo(left, bottom) }
-        for (i in 0 until bins) {
-            val y = bottom - Math.sqrt(h.luma[i].toDouble()).toFloat() * scale
-            path.lineTo(left + i * step, y)
-            path.lineTo(left + (i + 1) * step, y)
-        }
-        path.lineTo(left + w, bottom)
-        path.close()
-        canvas.drawPath(path, lumaFill)
-        channelLine.strokeWidth = density
-        for ((values, colour) in listOf(h.r to 0xccff5050.toInt(), h.g to 0xcc50e070.toInt(), h.b to 0xcc5090ff.toInt())) {
-            channelLine.color = colour
-            var x0 = left
-            var y0 = bottom - Math.sqrt(values[0].toDouble()).toFloat() * scale
-            for (i in 1 until bins) {
-                val x1 = left + (i + 0.5f) * step
-                val y1 = bottom - Math.sqrt(values[i].toDouble()).toFloat() * scale
-                canvas.drawLine(x0, y0, x1, y1, channelLine)
-                x0 = x1
-                y0 = y1
-            }
-        }
+        histogramPainter.draw(canvas, h, 10 * density, height - 10 * density - ht, 120 * density, ht)
     }
 
     private fun grid(canvas: Canvas, w: Float, h: Float, a: Float, b: Float) {

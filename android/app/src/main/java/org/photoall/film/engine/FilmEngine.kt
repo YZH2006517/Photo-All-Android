@@ -19,6 +19,32 @@ data class DevelopOptions(
      * brightness; [exposureEv] is then an offset. 0 disables.
      */
     val matchKey: Float = 0f,
+    /** RAW only: local tone compression before the film, 0..1 (shadows up, highlights down). */
+    val localTone: Float = 0f,
+    /** RAW only: chroma noise reduction before the film, 0..1. */
+    val chromaDenoise: Float = 0f,
+    /** RAW only: vkdt's wavelet denoise on the mosaic, from the sensor noise model, 0..1. */
+    val rawDenoise: Float = 0f,
+    /**
+     * RAW only: the camera's as-shot neutral (camera rgb, like DNG AsShotNeutral) and noise
+     * model (variance = noiseScale x + noiseOffset) at the shot, replacing the DNG's own
+     * (CameraX can write stale ones). Null / 0 keeps the file's.
+     */
+    val neutral: FloatArray? = null,
+    val noiseScale: Float = 0f,
+    val noiseOffset: Float = 0f,
+    /**
+     * RAW bursts only: flash / no-flash mix, the last path being the flash frame taken at
+     * the same exposure. [ambient gain, flash target level, flash->ambient white r g b];
+     * null = no flash.
+     */
+    val flash: FloatArray? = null,
+    /**
+     * RAW single flash with per-area white: paths are {ambient frame, flash frame}; the
+     * flash frame is developed, the white blended per area between [ambient r g b] and
+     * [flash r g b] (camera rgb neutrals). Null = off.
+     */
+    val flashWhite: FloatArray? = null,
 )
 
 class Developed(
@@ -27,6 +53,8 @@ class Developed(
     val peakImageBytes: Long,
     /** GPU time from timestamps; 0 when the device has none. */
     val gpuMs: Double,
+    /** The develop's record: "section\tkey\tvalue" lines. */
+    val info: String = "",
 )
 
 /**
@@ -70,6 +98,8 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
         val info = FilmNative.developDng(
             checkOpen(), paths.toTypedArray(), params.keys.toTypedArray(), params.values.toFloatArray(),
             options.maxLongEdge, options.exposureEv, options.seed, options.displayP3, options.matchKey,
+            options.localTone, options.chromaDenoise, options.rawDenoise,
+            options.neutral, options.noiseScale, options.noiseOffset, options.flash, options.flashWhite,
         )
         val space = ColorSpace.get(if (options.displayP3) ColorSpace.Named.DISPLAY_P3 else ColorSpace.Named.SRGB)
         var out = Bitmap.createBitmap(info[0].toInt(), info[1].toInt(), Bitmap.Config.ARGB_8888, false, space)
@@ -79,7 +109,7 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
             val upright = android.graphics.Matrix().apply { postRotate(degrees) }
             out = Bitmap.createBitmap(out, 0, 0, out.width, out.height, upright, true)
         }
-        return Developed(out, info[2].toInt(), info[3], info[4] / 1000.0)
+        return Developed(out, info[2].toInt(), info[3], info[4] / 1000.0, FilmNative.lastNote(handle))
     }
 
     /**
@@ -130,10 +160,13 @@ internal object FilmNative {
         maxLongEdge: Int, exposureEv: Float, seed: Int, outputP3: Boolean,
     ): LongArray
     @JvmStatic external fun copyResult(handle: Long, bitmap: Bitmap)
+    @JvmStatic external fun lastNote(handle: Long): String
     @JvmStatic external fun setCreativeLut(handle: Long, rgb: ByteArray?, size: Int, strength: Float)
     @JvmStatic external fun developDng(
         handle: Long, paths: Array<String>, names: Array<String>, values: FloatArray,
-        maxLongEdge: Int, exposureEv: Float, seed: Int, outputP3: Boolean, matchKey: Float,
+        maxLongEdge: Int, exposureEv: Float, seed: Int, outputP3: Boolean, matchKey: Float, localTone: Float,
+        chromaDenoise: Float, rawDenoise: Float,
+        neutral: FloatArray?, noiseScale: Float, noiseOffset: Float, flash: FloatArray?, flashWhite: FloatArray?,
     ): LongArray
     @JvmStatic external fun previewLut(
         handle: Long, names: Array<String>, values: FloatArray, size: Int, outputP3: Boolean,

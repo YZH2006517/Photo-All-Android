@@ -21,6 +21,7 @@ import android.widget.GridView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import org.photoall.film.ui.Style
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
@@ -47,10 +48,16 @@ class GalleryActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        title = TextView(this).apply { textSize = 17f; setTextColor(Color.WHITE); gravity = Gravity.CENTER_VERTICAL }
+        title = TextView(this).apply {
+            textSize = 20f; typeface = Style.medium; setTextColor(Style.TEXT); gravity = Gravity.CENTER_VERTICAL
+            Style.numeric(this)
+        }
         filterButton = button("只看收藏") { favoritesOnly = !favoritesOnly; reload() }
         browseBar = bar(title, filterButton)
-        selectTitle = TextView(this).apply { textSize = 15f; setTextColor(Color.WHITE); gravity = Gravity.CENTER_VERTICAL }
+        selectTitle = TextView(this).apply {
+            textSize = 17f; typeface = Style.medium; setTextColor(Style.ACCENT); gravity = Gravity.CENTER_VERTICAL
+            Style.numeric(this)
+        }
         selectBar = bar(
             selectTitle,
             button("全选") { if (selected.size == photos.size) selected.clear() else selected += photos.map { it.uri }; refreshSelection() },
@@ -60,8 +67,8 @@ class GalleryActivity : Activity() {
         ).apply { visibility = View.GONE }
         grid = GridView(this).apply {
             numColumns = 3
-            horizontalSpacing = dp(2)
-            verticalSpacing = dp(2)
+            horizontalSpacing = 2
+            verticalSpacing = 2
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
             setOnItemClickListener { _, _, position, _ ->
                 val photo = photos[position]
@@ -78,9 +85,10 @@ class GalleryActivity : Activity() {
         }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(Style.BG)
             addView(browseBar)
             addView(selectBar)
+            addView(Style.hairline(this@GalleryActivity), LinearLayout.LayoutParams(-1, 1))
             addView(grid, LinearLayout.LayoutParams(-1, 0, 1f))
             setOnApplyWindowInsetsListener { view, insets ->
                 val bars = insets.getInsets(WindowInsets.Type.systemBars())
@@ -125,6 +133,7 @@ class GalleryActivity : Activity() {
                     else -> "已冲洗 ${list.size} 张"
                 }
                 filterButton.text = if (favoritesOnly) "全部照片" else "只看收藏"
+                filterButton.setTextColor(if (favoritesOnly) Style.ACCENT else Style.TEXT_2)
                 grid.adapter = Adapter()
                 refreshSelection()
             }
@@ -184,16 +193,16 @@ class GalleryActivity : Activity() {
         override fun getItemId(position: Int) = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val side = (parent.width - dp(4)) / 3
+            val side = (parent.width - 4) / 3
             val cell = (convertView as? FrameLayout) ?: FrameLayout(this@GalleryActivity).apply {
                 addView(ImageView(this@GalleryActivity).apply {
                     scaleType = ImageView.ScaleType.CENTER_CROP
-                    setBackgroundColor(0xff1a1a1a.toInt())
+                    setBackgroundColor(Style.SURFACE)
                 }, FrameLayout.LayoutParams(-1, -1))
                 addView(TextView(this@GalleryActivity).apply { // favourite / selection marks
                     textSize = 14f
-                    setTextColor(Color.WHITE)
-                    setShadowLayer(4f, 0f, 0f, Color.BLACK)
+                    setTextColor(Style.TEXT)
+                    setShadowLayer(6f, 0f, 0f, Color.BLACK)
                     setPadding(dp(6), dp(4), dp(6), dp(4))
                 }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
             }
@@ -202,13 +211,13 @@ class GalleryActivity : Activity() {
             val mark = cell.getChildAt(1) as TextView
             val photo = photos[position]
             val isSelected = photo.uri in selected
-            image.alpha = if (selecting && !isSelected) 0.55f else 1f
+            image.alpha = if (selecting && !isSelected) 0.45f else 1f
             mark.text = when {
                 selecting -> if (isSelected) "✓" else "○"
                 photo.favorite -> "♥"
                 else -> ""
             }
-            mark.setTextColor(if (!selecting && photo.favorite) 0xffff4060.toInt() else Color.WHITE)
+            mark.setTextColor(if (selecting && isSelected) Style.ACCENT else Style.TEXT)
             val key = photo.uri.toString()
             image.tag = key
             val cached = cache.get(key)
@@ -232,12 +241,14 @@ class GalleryActivity : Activity() {
         isSingleLine = true
         minHeight = 0; minimumHeight = 0; minWidth = 0; minimumWidth = 0
         setPadding(dp(10), 0, dp(10), 0)
+        Style.textButton(this)
+        setTextColor(Style.TEXT_2)
         setOnClickListener { onClick() }
     }
 
     private fun bar(lead: TextView, vararg buttons: Button) = LinearLayout(this).apply {
         gravity = Gravity.CENTER_VERTICAL
-        setPadding(dp(14), dp(6), dp(8), dp(6))
+        setPadding(dp(18), dp(8), dp(8), dp(8))
         addView(lead, LinearLayout.LayoutParams(0, dp(40), 1f))
         for (b in buttons) addView(b, LinearLayout.LayoutParams(-2, dp(40)).apply { marginStart = dp(4) })
     }

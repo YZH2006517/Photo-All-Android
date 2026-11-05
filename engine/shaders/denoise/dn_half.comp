@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+// Adapted from vkdt denoise/half.comp (c) johannes hanika, BSD 2-Clause; see README.md.
+// Half-size rgb of the mosaic: one pixel per 2x2 quad, greens averaged, a clipped
+// green replaced by the other. Reads the integer mosaic and normalises it.
+#include "localsize.h"
+layout(local_size_x = DT_LOCAL_SIZE_X, local_size_y = DT_LOCAL_SIZE_Y, local_size_z = 1) in;
+layout(push_constant) uniform push_t
+{
+  vec4  black; // per 2x2 position, code values
+  float white;
+  int   pad0, pad1, pad2;
+  ivec4 cfa;   // colour (0 r, 1 g, 2 b) per 2x2 position
+} push;
+layout(set = 1, binding = 0) uniform usampler2D img_in;
+layout(set = 1, binding = 1, rgba16f) uniform writeonly image2D img_out;
+
+void main()
+{
+  ivec2 ipos = ivec2(gl_GlobalInvocationID);
+  if(any(greaterThanEqual(ipos, imageSize(img_out)))) return;
+  vec3 rgb = vec3(0.0);
+  float g[2];
+  int ng = 0;
+  for(int k = 0; k < 4; k++)
+  {
+    float v = (float(texelFetch(img_in, 2 * ipos + ivec2(k & 1, k >> 1), 0).r) - push.black[k]) /
+              (push.white - push.black[k]);
+    if(push.cfa[k] == 1) g[min(ng++, 1)] = v;
+    else rgb[push.cfa[k]] = v;
+  }
+  // ignore a clipped green
+  if(g[0] >= 1.0) g[0] = g[1];
+  if(g[1] >= 1.0) g[1] = g[0];
+  rgb.g = 0.5 * (g[0] + g[1]);
+  imageStore(img_out, ipos, vec4(rgb, 1.0));
+}

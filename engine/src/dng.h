@@ -27,6 +27,9 @@ struct RawImage
   float noise_scale = 0.0f, noise_offset = 0.0f;
 };
 
-bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error);
+// `neutral` (camera rgb of a neutral, as DNG AsShotNeutral) replaces the file's own when
+// given: CameraX can write a stale one into its DNGs.
+bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error,
+               const float *neutral = nullptr);
 
 } // namespace film

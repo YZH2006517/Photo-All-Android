@@ -24,7 +24,10 @@ import kotlin.math.roundToInt
 /** Exposure split into sensor time and ISO. */
 data class Exposure(val timeNs: Long, val iso: Int) {
     val total: Double get() = timeNs.toDouble() * iso
+    fun label(): String = "1/%.0f s ISO %d".format(java.util.Locale.US, 1e9 / timeNs, iso)
 }
+
+private const val TAG = "FilmExposure"
 
 /**
  * Exposure and white balance on top of the phone's own 3A. The camera HAL meters at
@@ -72,6 +75,44 @@ class FilmExposure(
     @Volatile var live: Exposure? = null
         private set
     @Volatile var onLive: (Exposure) -> Unit = {}
+    /** The HAL's digital gain after the raw (100 = none) and AE mode / state, from the last result. */
+    @Volatile var liveBoost = 100
+        private set
+    @Volatile var liveAeMode = -1
+        private set
+    @Volatile var liveAeState = -1
+        private set
+    /** Sensor ISO (without digital boost), as-shot neutral and noise profile of the last result. */
+    @Volatile var liveSensorIso = 0
+        private set
+    @Volatile private var liveNeutral: FloatArray? = null
+    @Volatile private var liveNoise: Pair<Double, Double>? = null
+    // More of the last result, for the photo's record.
+    @Volatile private var liveGains: FloatArray? = null
+    @Volatile private var liveCcm: FloatArray? = null
+    @Volatile private var liveFocus: Float? = null
+    @Volatile private var liveAfState = -1
+    @Volatile private var liveAwbMode = -1
+    @Volatile private var liveAwbState = -1
+    @Volatile private var liveFrameNs = 0L
+    @Volatile private var liveAperture: Float? = null
+    @Volatile private var liveFocal: Float? = null
+
+    /**
+     * What a DNG of a still at [still] (null: as metered) should carry: the live as-shot
+     * neutral and the noise profile, scaled to that ISO (shot noise with the gain, read
+     * noise with its square). CameraX's DNG headers repeat one old capture result.
+     */
+    fun stillMetadata(still: Exposure?): Triple<FloatArray?, Float, Float> {
+        val noise = liveNoise
+        val base = liveSensorIso
+        if (noise == null || base <= 0) return Triple(liveNeutral, 0f, 0f)
+        val k = (still?.iso ?: base).toDouble() / base
+        return Triple(liveNeutral, (noise.first * k).toFloat(), (noise.second * k * k).toFloat())
+    }
+
+    /** The exposure currently frozen on the sensor (a still or burst in progress), or null. */
+    val held: Exposure? get() = hold
 
     private val activeArray: Rect? = chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
     private val isoRange = chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
@@ -80,6 +121,33 @@ class FilmExposure(
     private val compensationStep = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
         ?.toDouble()?.takeIf { it > 0 } ?: (1.0 / 3)
     private val maxAeRegions = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+    private val boostRange = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
+    /** The lens has a flash unit (its LED serves the flash frame as a torch at full strength). */
+    val hasFlash: Boolean = chars.getCameraCharacteristic(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+    private val torchMaxLevel: Int = if (Build.VERSION.SDK_INT >= 35)
+        chars.getCameraCharacteristic(CameraCharacteristics.FLASH_TORCH_STRENGTH_MAX_LEVEL) ?: 1 else 1
+    /** The next still fires the flash (AE meters with a pre-flash); single-frame flash. */
+    var flashShot = false
+        private set
+
+    fun armFlash(on: Boolean) {
+        android.util.Log.i(TAG, "flash armed $on (${describe()})")
+        flashShot = on; push()
+    }
+
+    /** The live as-shot neutral (camera rgb, g = 1): the room light the camera balanced for. */
+    val ambientNeutral: FloatArray? get() = liveNeutral
+
+    /** Camera rgb of a neutral under daylight at [kelvin] (a white LED flash), from the calibration. */
+    fun flashNeutral(kelvin: Double = 5500.0): FloatArray? {
+        val cal = calibration?.takeIf { it.valid } ?: return null
+        val (r, b) = cal.pointAt(kelvin)
+        return if (r > 0 && b > 0) floatArrayOf(r.toFloat(), 1f, b.toFloat()) else null
+    }
+
+    /** The flash LED is lit (for a flash frame); only together with a hold. */
+    var torch = false
+        private set
     /** Android 16 AE priority: the HAL keeps our ISO and meters with the shutter. */
     val isoPriority: Boolean = Build.VERSION.SDK_INT >= 36 &&
         chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_PRIORITY_MODES)
@@ -97,6 +165,38 @@ class FilmExposure(
             val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100
             val e = Exposure(time, iso * boost / 100)
             live = e
+            liveBoost = boost
+            liveSensorIso = iso
+            result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.takeIf { it.size == 3 }?.let { n ->
+                liveNeutral = FloatArray(3) { n[it].toFloat() }
+            }
+            result.get(CaptureResult.SENSOR_NOISE_PROFILE)?.takeIf { it.isNotEmpty() }?.let { p ->
+                liveNoise = p.sumOf { it.first } / p.size to p.sumOf { it.second } / p.size
+            }
+            result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { liveGains = floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) }
+            result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { t ->
+                liveCcm = FloatArray(9) { t.getElement(it % 3, it / 3).toFloat() }
+            }
+            liveFocus = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+            liveAfState = result.get(CaptureResult.CONTROL_AF_STATE) ?: -1
+            liveAwbMode = result.get(CaptureResult.CONTROL_AWB_MODE) ?: -1
+            liveAwbState = result.get(CaptureResult.CONTROL_AWB_STATE) ?: -1
+            liveFrameNs = result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L
+            liveAperture = result.get(CaptureResult.LENS_APERTURE)
+            liveFocal = result.get(CaptureResult.LENS_FOCAL_LENGTH)
+            val aeMode = result.get(CaptureResult.CONTROL_AE_MODE) ?: -1
+            if (aeMode != liveAeMode) android.util.Log.i(TAG, "AE mode $liveAeMode -> $aeMode (${describe()})")
+            liveAeMode = aeMode
+            liveAeState = result.get(CaptureResult.CONTROL_AE_STATE) ?: -1
+            // Still captures pass through this session callback too: log what each really got.
+            if (request.get(CaptureRequest.CONTROL_CAPTURE_INTENT) == CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE) {
+                val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                val neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
+                android.util.Log.i(TAG, "still result frame ${result.frameNumber}: ${e.label()} (sensor ISO $iso boost $boost)" +
+                    " ae mode $aeMode requested ${request.get(CaptureRequest.SENSOR_EXPOSURE_TIME)?.let { "1/%.0f".format(java.util.Locale.US, 1e9 / it) } ?: "-"}" +
+                    " gains ${gains?.let { "%.2f %.2f %.2f".format(java.util.Locale.US, it.red, it.greenEven, it.blue) } ?: "-"}" +
+                    " neutral ${neutral?.joinToString(" ") { "%.3f".format(java.util.Locale.US, it.toDouble()) } ?: "-"}")
+            }
             if (frames++ % 6 == 0) onLive(e)
         }
     }
@@ -132,10 +232,14 @@ class FilmExposure(
      * an HDR burst; without HAL ISO priority the film ISO is applied here, keeping the
      * metered total so the frame matches the viewfinder.
      */
-    fun stillExposure(underStops: Double): Exposure? {
+    fun stillExposure(underStops: Double, raw: Boolean = false): Exposure? {
         val metered = manual ?: live ?: return null
         val needsIso = filmRules && filmIso > 0 && !isoPriority && manual == null
-        if (underStops <= 0 && !needsIso) return null
+        // The HAL may meter with low sensor ISO plus digital gain after the raw: the preview
+        // looks right but a RAW would come out that much darker. Hold the metered total with
+        // the gain moved into real ISO instead.
+        val boosted = raw && manual == null && liveBoost > 100
+        if (underStops <= 0 && !needsIso && !boosted) return null
         val total = metered.total * 2.0.pow(-underStops)
         var iso = if (needsIso) filmIso else metered.iso
         var time = total / iso
@@ -146,9 +250,108 @@ class FilmExposure(
         return Exposure(time.toLong(), iso)
     }
 
+    /**
+     * The longer frame of an HDR bracket: [stops] more light than [base] (the burst's
+     * short exposure). Time grows up to 1/15 s (or the base's own time if longer) for
+     * hand-held sharpness; the rest goes to ISO. The merge measures the actual ratio.
+     */
+    fun longExposure(base: Exposure, stops: Double): Exposure {
+        val total = base.total * 2.0.pow(stops)
+        val longest = max(base.timeNs.toDouble(), 66_666_666.0)
+        val time = min(total / base.iso, longest).coerceAtMost((timeRange?.upper ?: Long.MAX_VALUE).toDouble())
+        val iso = (total / time).roundToInt().coerceIn(isoRange?.lower ?: 50, isoRange?.upper ?: 6400)
+        return Exposure(time.toLong(), iso)
+    }
+
     /** Freezes [e] on the sensor (for a still or a burst), then [release]s back to metering. */
-    fun hold(e: Exposure) { hold = e; push() }
-    fun release() { hold = null; push() }
+    fun hold(e: Exposure) {
+        android.util.Log.i(TAG, "hold ${e.label()} (${describe()})")
+        hold = e; push()
+    }
+    fun release() {
+        android.util.Log.i(TAG, "release (${describe()})")
+        hold = null; torch = false; flashShot = false; push()
+    }
+
+    /** Lights or puts out the flash LED for the next frames of a held exposure. */
+    fun lightTorch(on: Boolean) {
+        android.util.Log.i(TAG, "torch $on (${describe()})")
+        torch = on; push()
+    }
+
+    /**
+     * Per camera channel, what turns the flash's light into the ambient white: the live
+     * as-shot neutral over the calibrated neutral of daylight at [flashKelvin] (a white
+     * LED flash). Null without a calibration or a live neutral.
+     */
+    fun flashWhite(flashKelvin: Double = 5500.0): FloatArray? {
+        val cal = calibration?.takeIf { it.valid } ?: return null
+        val ambient = liveNeutral ?: return null
+        val (r, b) = cal.pointAt(flashKelvin)
+        if (r <= 0 || b <= 0) return null
+        return floatArrayOf((ambient[0] / ambient[1] / r).toFloat(), 1f, (ambient[2] / ambient[1] / b).toFloat())
+    }
+
+    /** The live camera state and the exposure rules, into a photo's record. */
+    fun record(log: org.photoall.film.gallery.ShotLog) {
+        val e = live
+        val ex = "曝光（拍摄瞬间的实时测光）"
+        log.put(ex, "实时曝光", e?.label())
+        log.put(ex, "传感器 ISO / 数字增益", "$liveSensorIso / ${liveBoost / 100.0}×")
+        log.put(ex, "总曝光量（秒·ISO）", e?.let { "%.4f".format(java.util.Locale.US, it.total / 1e9) })
+        log.put(ex, "帧时长", if (liveFrameNs > 0) "%.1f ms".format(java.util.Locale.US, liveFrameNs / 1e6) else null)
+        log.put(ex, "自动曝光模式 / 状态", "${aeModeName(liveAeMode)} / ${aeStateName(liveAeState)}")
+        log.put(ex, "曝光补偿", "%+.1f EV".format(java.util.Locale.US, evStops))
+        log.put(ex, "胶片测光规则", filmRules)
+        log.put(ex, "测光模式", listOf("手机智能测光", "中央重点", "点测光").getOrElse(metering) { "$metering" })
+        log.put(ex, "高光保护 / 当前压暗", "${if (highlightProtect) "开" else "关"} / %+.2f EV".format(java.util.Locale.US, highlightBias))
+        log.put(ex, "按胶片 ISO", if (filmIso > 0) "ISO $filmIso${if (isoPriority) "（HAL ISO 优先）" else "（重新分配快门/ISO）"}" else "关")
+        log.put(ex, "防频闪", listOf("50 Hz", "60 Hz", "关").getOrElse(antibanding) { "$antibanding" })
+        log.put(ex, "手动曝光", manual?.label() ?: "关")
+        log.put(ex, "锁定中的曝光", hold?.label() ?: "无")
+        log.put(ex, "传感器 ISO 范围 / 快门范围", "${isoRange?.lower}–${isoRange?.upper} / " +
+            "${timeRange?.let { "1/%.0f – %.2f s".format(java.util.Locale.US, 1e9 / it.lower, it.upper / 1e9) }}")
+        val wb = "白平衡（拍摄瞬间）"
+        log.put(wb, "自动白平衡模式 / 状态", "${awbModeName(liveAwbMode)} / ${awbStateName(liveAwbState)}")
+        log.put(wb, "实时中性点 (R G B)", liveNeutral)
+        log.put(wb, "实时增益 (R Gr Gb B)", liveGains)
+        log.put(wb, "实时增益折算色温参考", liveNeutral?.let { n -> "R/G %.3f  B/G %.3f".format(java.util.Locale.US, n[0] / n[1], n[2] / n[1]) })
+        log.put(wb, "色彩校正矩阵", liveCcm)
+        log.put(wb, "固定色温", fixedKelvin?.let { "%.0f K".format(java.util.Locale.US, it) } ?: "无（自动）")
+        log.put(wb, "HAL 白平衡预设", awbModeName(awbPreset))
+        log.put(wb, "传感器标定", if (calibration?.valid == true) "可用" else "不可用")
+        log.put(wb, "闪光（5500K）中性点", flashNeutral())
+        log.put(wb, "噪声模型（实时 s o）", liveNoise?.let { "%.4g %.4g".format(java.util.Locale.US, it.first, it.second) })
+        val af = "对焦"
+        log.put(af, "对焦距离", liveFocus?.let { if (it > 0) "%.2f 屈光度（约 %.2f m）".format(java.util.Locale.US, it, 1 / it) else "无穷远" })
+        log.put(af, "对焦状态", afStateName(liveAfState))
+        log.put(af, "手动对焦", focusDiopters?.let { "%.2f 屈光度".format(java.util.Locale.US, it) } ?: "关（自动对焦）")
+        log.put(af, "对焦点（取景框比例）", "%.2f, %.2f".format(java.util.Locale.US, focusX, focusY))
+        val lens = "相机与镜头"
+        log.put(lens, "实时光圈 / 焦距", "${liveAperture?.let { "f/%.2f".format(java.util.Locale.US, it) }} / ${liveFocal?.let { "%.2f mm".format(java.util.Locale.US, it) }}")
+        log.put(lens, "闪光灯 / 手电最高档", "${if (hasFlash) "有" else "无"} / $torchMaxLevel")
+        log.put(lens, "传感器方向（相对取景）", "$sensorRotation°")
+    }
+
+    private fun aeModeName(m: Int) = when (m) {
+        0 -> "关（手动）"; 1 -> "开"; 2 -> "开·自动闪光"; 3 -> "开·强制闪光"; 4 -> "开·防红眼"; 5 -> "开·外接闪光"; else -> "$m"
+    }
+    private fun aeStateName(s: Int) = when (s) {
+        0 -> "未启动"; 1 -> "搜索"; 2 -> "已收敛"; 3 -> "锁定"; 4 -> "需要闪光"; 5 -> "预闪中"; else -> "$s"
+    }
+    private fun awbModeName(m: Int) = when (m) {
+        0 -> "关（手动）"; 1 -> "自动"; 2 -> "白炽灯"; 3 -> "荧光灯"; 4 -> "暖荧光灯"; 5 -> "日光"; 6 -> "阴天"; 7 -> "黄昏"; 8 -> "阴影"; else -> "$m"
+    }
+    private fun awbStateName(s: Int) = when (s) { 0 -> "未启动"; 1 -> "搜索"; 2 -> "已收敛"; 3 -> "锁定"; else -> "$s" }
+    private fun afStateName(s: Int) = when (s) {
+        0 -> "未启动"; 1 -> "被动扫描"; 2 -> "被动对焦完成"; 3 -> "主动扫描"; 4 -> "对焦锁定"; 5 -> "未能对焦锁定"; 6 -> "被动未对焦"; else -> "$s"
+    }
+
+    /** Live state for the log: exposure, digital boost, AE mode and state, any hold. */
+    fun describe(): String = "live ${live?.label() ?: "-"} boost $liveBoost ae mode $liveAeMode state $liveAeState" +
+        " neutral ${liveNeutral?.joinToString(" ") { "%.3f".format(java.util.Locale.US, it) } ?: "-"}" +
+        " noise ${liveNoise?.let { "%.3g %.3g".format(java.util.Locale.US, it.first, it.second) } ?: "-"}" +
+        (hold?.let { " held ${it.label()}" } ?: "")
 
     fun options(): CaptureRequestOptions {
         val o = CaptureRequestOptions.Builder()
@@ -163,8 +366,18 @@ class FilmExposure(
                 .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, fixed.iso)
                 .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, fixed.timeNs)
                 .setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(fixed.timeNs, 33_333_333L))
+            // No digital gain after the raw: the sensor gets the whole requested exposure.
+            boostRange?.let { o.setCaptureRequestOption(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, it.lower) }
+            if (torch && hasFlash) {
+                o.setCaptureRequestOption(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+                if (Build.VERSION.SDK_INT >= 35 && torchMaxLevel > 1)
+                    o.setCaptureRequestOption(CaptureRequest.FLASH_STRENGTH_LEVEL, torchMaxLevel)
+            }
         } else {
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            // A flash shot lets the HAL fire the flash and meter it (pre-flash); CameraX runs
+            // the precapture sequence for it.
+            o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE,
+                if (flashShot && hasFlash) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH else CaptureRequest.CONTROL_AE_MODE_ON)
             val bias = evStops + if (filmRules) highlightBias else 0.0
             val range = compensationRange
             val index = (bias / compensationStep).roundToInt().let { if (range != null) it.coerceIn(range.lower, range.upper) else it }

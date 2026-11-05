@@ -1,0 +1,51 @@
+#version 450
+// Flash white balance, step 1: per 2x2 quad, the share of the light that came from the
+// flash. The flash frame and an ambient frame (taken just before, at its own exposure)
+// are compared after scaling the ambient frame by `ambient_scale` (the exposure ratio,
+// measured where the flash added nothing): share = (F - k A) / F. Written at half size;
+// it is blurred and only steers the white balance, so small misregistration is harmless.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform usampler2D img_flash;
+layout(set = 1, binding = 1) uniform usampler2D img_ambient;
+layout(set = 1, binding = 2, std430) readonly buffer offsets_t { ivec2 offsets[]; };
+layout(set = 1, binding = 3, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4  f_black;
+  vec4  a_black;
+  float f_white;
+  float a_white;
+  float ambient_scale;
+  int   ambient_index; // alignment frame of the ambient frame
+  int   tiles_x;
+  int   tiles_y;
+  int   tile;
+  int   pad;
+} push;
+
+float quad(usampler2D img, ivec2 p, vec4 black, float white)
+{
+  ivec2 size = textureSize(img, 0);
+  p = clamp(p & ~1, ivec2(0), size - 2);
+  float s = 0.0;
+  for(int k = 0; k < 4; k++)
+  {
+    float b = black[k];
+    s += (float(texelFetch(img, p + ivec2(k & 1, k >> 1), 0).r) - b) / (white - b);
+  }
+  return 0.25 * s;
+}
+
+void main()
+{
+  ivec2 h = ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(h, imageSize(img_out)))) return;
+  ivec2 p = 2 * h;
+  ivec2 t = min(p / push.tile, ivec2(push.tiles_x, push.tiles_y) - 1);
+  ivec2 q = p + offsets[push.ambient_index * push.tiles_x * push.tiles_y + t.y * push.tiles_x + t.x];
+  float f = quad(img_flash, p, push.f_black, push.f_white);
+  float a = push.ambient_scale * quad(img_ambient, q, push.a_black, push.a_white);
+  // Too dark to tell: count as ambient light (the scene's own white).
+  float share = f > 0.004 ? clamp((f - a) / f, 0.0, 1.0) : 0.0;
+  imageStore(img_out, h, vec4(share, 0.0, 0.0, 1.0));
+}
