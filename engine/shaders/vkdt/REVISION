@@ -1,0 +1,3 @@
+vkdt 938adb0d1ffb128b2dd76f4dc33859a1fa974246
+Copied by tools/sync_vkdt.py. Patch: write-only storage images declare rgba16f.
+filmsim implements spektrafilm by Andrea Volpato; profile data CC BY-SA 4.0.

@@ -1,0 +1,79 @@
+#version 450
+// Bayer sensor data -> scene-linear Rec.2020: black level, lens shading gain map,
+// white balance, highlight clip, Malvar-He-Cutler demosaic, camera matrix.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform usampler2D img_cfa;
+layout(set = 1, binding = 1) uniform sampler2D img_gain; // rgba = 2x2 positions, texelFetch only
+layout(set = 1, binding = 2, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4  black;     // per 2x2 position (x&1) + 2*(y&1)
+  vec4  wb_white;  // rgb multipliers, w = white level
+  vec4  row0;      // balanced camera -> Rec.2020 rows; row0.w = exposure gain
+  vec4  row1;
+  vec4  row2;
+  ivec4 cfa;       // colour index per 2x2 position
+  vec4  map;       // gain map origin x, y and spacing x, y relative to the image size
+  ivec4 map_size;  // points x, y, has map, unused
+} push;
+
+ivec2 size;
+
+float gain_at(ivec2 p, int position)
+{
+  if(push.map_size.z == 0) return 1.0;
+  vec2 rel = (vec2(p) + 0.5) / vec2(size);
+  vec2 g = clamp((rel - push.map.xy) / push.map.zw, vec2(0.0), vec2(push.map_size.xy - 1));
+  ivec2 i = min(ivec2(g), push.map_size.xy - 2);
+  vec2 f = g - vec2(i);
+  float a = texelFetch(img_gain, i, 0)[position];
+  float b = texelFetch(img_gain, i + ivec2(1, 0), 0)[position];
+  float c = texelFetch(img_gain, i + ivec2(0, 1), 0)[position];
+  float d = texelFetch(img_gain, i + ivec2(1, 1), 0)[position];
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Normalised, shading-corrected, white-balanced sensor value, clipped at the
+// lowest channel saturation so blown highlights stay neutral.
+float v(ivec2 p)
+{
+  p = clamp(p, ivec2(0), size - 1);
+  int position = (p.x & 1) + 2 * (p.y & 1);
+  float black = push.black[position];
+  float x = (float(texelFetch(img_cfa, p, 0).r) - black) / (push.wb_white.w - black);
+  x *= gain_at(p, position) * push.wb_white[push.cfa[position]];
+  return clamp(x, 0.0, 1.0);
+}
+
+int colour(ivec2 p) { return push.cfa[(p.x & 1) + 2 * (p.y & 1)]; }
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  size = textureSize(img_cfa, 0);
+  if(any(greaterThanEqual(p, size))) return;
+
+  float c0 = v(p);
+  float n = v(p + ivec2(0, -1)), s = v(p + ivec2(0, 1)), e = v(p + ivec2(1, 0)), w = v(p + ivec2(-1, 0));
+  float nn = v(p + ivec2(0, -2)), ss = v(p + ivec2(0, 2)), ee = v(p + ivec2(2, 0)), ww = v(p + ivec2(-2, 0));
+  float ne = v(p + ivec2(1, -1)), nw = v(p + ivec2(-1, -1)), se = v(p + ivec2(1, 1)), sw = v(p + ivec2(-1, 1));
+  float cross = n + s + e + w, far = nn + ss + ee + ww, diag = ne + nw + se + sw;
+
+  vec3 rgb;
+  int here = colour(p);
+  if(here != 1)
+  { // red or blue site
+    float g = (4.0 * c0 + 2.0 * cross - far) / 8.0;
+    float other = (6.0 * c0 + 2.0 * diag - 1.5 * far) / 8.0;
+    rgb = here == 0 ? vec3(c0, g, other) : vec3(other, g, c0);
+  }
+  else
+  { // green site: which colour sits left/right?
+    float horizontal = (5.0 * c0 - (ee + ww) - diag + 0.5 * (nn + ss) + 4.0 * (e + w)) / 8.0;
+    float vertical = (5.0 * c0 - (nn + ss) - diag + 0.5 * (ee + ww) + 4.0 * (n + s)) / 8.0;
+    rgb = colour(p + ivec2(1, 0)) == 0 ? vec3(horizontal, c0, vertical) : vec3(vertical, c0, horizontal);
+  }
+  rgb = max(rgb, vec3(0.0));
+  vec3 out_rgb = vec3(dot(push.row0.xyz, rgb), dot(push.row1.xyz, rgb), dot(push.row2.xyz, rgb));
+  imageStore(img_out, p, vec4(max(out_rgb * push.row0.w, vec3(0.0)), 1.0));
+}

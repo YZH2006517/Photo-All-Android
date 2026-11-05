@@ -1,0 +1,29 @@
+#version 450
+// One separable Gaussian pass. sigma is in pixels of this image.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  ivec2 dir;
+  float sigma;
+  int   radius;
+} push;
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(p, imageSize(img_out)))) return;
+  ivec2 last = textureSize(img_in, 0) - 1;
+  float k = -0.5 / (push.sigma * push.sigma);
+  vec4 sum = texelFetch(img_in, p, 0);
+  float weight = 1.0;
+  for(int i = 1; i <= push.radius; i++)
+  {
+    float w = exp(k * float(i * i));
+    sum += w * (texelFetch(img_in, clamp(p + i * push.dir, ivec2(0), last), 0) +
+                texelFetch(img_in, clamp(p - i * push.dir, ivec2(0), last), 0));
+    weight += 2.0 * w;
+  }
+  imageStore(img_out, p, sum / weight);
+}

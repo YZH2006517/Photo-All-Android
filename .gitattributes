@@ -1,0 +1,10 @@
+* text=auto
+
+# binary data: never touch line endings
+*.rgb binary
+*.lut binary
+*.jar binary
+*.png binary
+
+# shell script must keep LF to run on Linux/macOS
+gradlew text eol=lf

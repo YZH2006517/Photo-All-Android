@@ -1,0 +1,141 @@
+package org.photoall.film.engine
+
+import android.content.res.AssetManager
+import android.graphics.Bitmap
+import android.graphics.ColorSpace
+
+/** Camera-side options for one development. */
+data class DevelopOptions(
+    /** Working resolution; larger sources are area-resampled first. */
+    val maxLongEdge: Int = 4096,
+    /** Exposure compensation in stops, applied in scene-linear light before the film. */
+    val exposureEv: Float = 0f,
+    /** Grain and glare seed. Keep it with the frame to redevelop identically. */
+    val seed: Int = 1,
+    val displayP3: Boolean = true,
+    /**
+     * RAW only: the viewfinder's centre-weighted log-average linear luminance at the
+     * shot. The develop scales the raw to it so the result matches the preview's
+     * brightness; [exposureEv] is then an offset. 0 disables.
+     */
+    val matchKey: Float = 0f,
+)
+
+class Developed(
+    val bitmap: Bitmap,
+    val passes: Int,
+    val peakImageBytes: Long,
+    /** GPU time from timestamps; 0 when the device has none. */
+    val gpuMs: Double,
+)
+
+/**
+ * Spectral film development (vkdt filmsim, an implementation of spektrafilm) on
+ * the GPU. Parameters use filmsim's names, e.g. "film", "paper", "ev film",
+ * "cp amt", "radius", "size"; unset ones keep filmsim's defaults.
+ */
+class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
+
+    val deviceName: String get() = FilmNative.deviceName(checkOpen())
+
+    fun develop(
+        source: Bitmap,
+        params: Map<String, Float> = emptyMap(),
+        options: DevelopOptions = DevelopOptions(),
+    ): Developed {
+        val rgba = if (source.config == Bitmap.Config.ARGB_8888) source else source.copy(Bitmap.Config.ARGB_8888, false)
+        val sourceP3 = rgba.colorSpace?.let { it == ColorSpace.get(ColorSpace.Named.DISPLAY_P3) } ?: false
+        val info = FilmNative.develop(
+            checkOpen(), rgba, sourceP3,
+            params.keys.toTypedArray(), params.values.toFloatArray(),
+            options.maxLongEdge, options.exposureEv, options.seed, options.displayP3,
+        )
+        val space = ColorSpace.get(if (options.displayP3) ColorSpace.Named.DISPLAY_P3 else ColorSpace.Named.SRGB)
+        val out = Bitmap.createBitmap(info[0].toInt(), info[1].toInt(), Bitmap.Config.ARGB_8888, false, space)
+        FilmNative.copyResult(handle, out)
+        return Developed(out, info[2].toInt(), info[3], info[4] / 1000.0)
+    }
+
+    /**
+     * Develops camera DNGs from scene-linear sensor data (the path spektrafilm is
+     * built for). Several equally exposed frames are aligned and merged first
+     * (HDR+-style; the first is the reference, at most 6). The result is rotated
+     * upright from the DNG orientation tag.
+     */
+    fun developDng(
+        paths: List<String>,
+        params: Map<String, Float> = emptyMap(),
+        options: DevelopOptions = DevelopOptions(),
+    ): Developed {
+        val info = FilmNative.developDng(
+            checkOpen(), paths.toTypedArray(), params.keys.toTypedArray(), params.values.toFloatArray(),
+            options.maxLongEdge, options.exposureEv, options.seed, options.displayP3, options.matchKey,
+        )
+        val space = ColorSpace.get(if (options.displayP3) ColorSpace.Named.DISPLAY_P3 else ColorSpace.Named.SRGB)
+        var out = Bitmap.createBitmap(info[0].toInt(), info[1].toInt(), Bitmap.Config.ARGB_8888, false, space)
+        FilmNative.copyResult(handle, out)
+        val degrees = when (info[5].toInt()) { 6 -> 90f; 3 -> 180f; 8 -> 270f; else -> 0f }
+        if (degrees != 0f) {
+            val upright = android.graphics.Matrix().apply { postRotate(degrees) }
+            out = Bitmap.createBitmap(out, 0, 0, out.width, out.height, upright, true)
+        }
+        return Developed(out, info[2].toInt(), info[3], info[4] / 1000.0)
+    }
+
+    /**
+     * The per-pixel film look as a [size]^3 RGBA8 3D LUT (r fastest, then g, then b)
+     * for the live viewfinder. Input is the display-encoded camera frame.
+     */
+    fun previewLut(params: Map<String, Float> = emptyMap(), size: Int = 33, displayP3: Boolean = false): ByteArray =
+        FilmNative.previewLut(checkOpen(), params.keys.toTypedArray(), params.values.toFloatArray(), size, displayP3)
+
+    /**
+     * Creative look applied after the film (and so in previews too): RGB8 [size]^3,
+     * red fastest, sRGB in and out, blended at [strength]. Null clears it.
+     */
+    fun setCreativeLut(rgb: ByteArray?, size: Int, strength: Float) =
+        FilmNative.setCreativeLut(checkOpen(), rgb, size, strength)
+
+    override fun close() {
+        if (handle != 0L) FilmNative.destroy(handle)
+        handle = 0L
+    }
+
+    private fun checkOpen(): Long {
+        check(handle != 0L) { "FilmEngine is closed" }
+        return handle
+    }
+
+    companion object {
+        /** Loads filmsim/filmsim.lut and filmsim/spectra-em.lut from the app assets. */
+        fun create(assets: AssetManager) = FilmEngine(FilmNative.create(assets))
+
+        val filmStocks: List<String> by lazy { FilmNative.names(false).toList() }
+        val papers: List<String> by lazy { FilmNative.names(true).toList() }
+    }
+}
+
+internal object FilmNative {
+    init {
+        System.loadLibrary("filmjni")
+    }
+
+    @JvmStatic external fun create(assets: AssetManager): Long
+    @JvmStatic external fun destroy(handle: Long)
+    @JvmStatic external fun deviceName(handle: Long): String
+    @JvmStatic external fun names(papers: Boolean): Array<String>
+    @JvmStatic external fun develop(
+        handle: Long, source: Bitmap, sourceP3: Boolean,
+        names: Array<String>, values: FloatArray,
+        maxLongEdge: Int, exposureEv: Float, seed: Int, outputP3: Boolean,
+    ): LongArray
+    @JvmStatic external fun copyResult(handle: Long, bitmap: Bitmap)
+    @JvmStatic external fun setCreativeLut(handle: Long, rgb: ByteArray?, size: Int, strength: Float)
+    @JvmStatic external fun developDng(
+        handle: Long, paths: Array<String>, names: Array<String>, values: FloatArray,
+        maxLongEdge: Int, exposureEv: Float, seed: Int, outputP3: Boolean, matchKey: Float,
+    ): LongArray
+    @JvmStatic external fun previewLut(
+        handle: Long, names: Array<String>, values: FloatArray, size: Int, outputP3: Boolean,
+    ): ByteArray
+}

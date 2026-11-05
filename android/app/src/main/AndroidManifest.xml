@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Vulkan 1.1: compute subgroup arithmetic used by filmsim's setup pass -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <application
+        android:label="胶片相机"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/FilmTheme"
+        android:largeHeap="true">
+        <activity
+            android:name=".camera.CameraActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".settings.SettingsActivity" android:exported="false" />
+        <activity android:name=".gallery.GalleryActivity" android:exported="false" />
+        <activity android:name=".gallery.ViewerActivity" android:exported="false" />
+        <!-- engine test bench; also the adb benchmark entry point -->
+        <activity android:name=".MainActivity" android:exported="true" />
+    </application>
+</manifest>

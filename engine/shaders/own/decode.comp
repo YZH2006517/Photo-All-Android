@@ -1,0 +1,47 @@
+#version 450
+// Camera image -> scene-linear Rec.2020, the filmsim input. Resamples to the
+// working size with a 4x4 tap area filter after linearising each tap.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4 row0;     // input primaries -> Rec.2020, rows; w unused
+  vec4 row1;
+  vec4 row2;
+  int  srgb_eotf; // 1: decode sRGB/P3 transfer, 0: already linear
+  float gain;     // exposure multiplier applied in linear light
+} push;
+
+vec3 eotf(vec3 v)
+{
+  return mix(v / 12.92, pow((v + 0.055) / 1.055, vec3(2.4)), greaterThan(v, vec3(0.04045)));
+}
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(img_out);
+  if(any(greaterThanEqual(p, size))) return;
+  vec3 rgb;
+  if(textureSize(img_in, 0) == size)
+  { // 1:1 must not blend neighbours (preview LUT grids rely on it)
+    vec3 v = texelFetch(img_in, p, 0).rgb;
+    rgb = push.srgb_eotf != 0 ? eotf(clamp(v, 0.0, 1.0)) : v;
+  }
+  else
+  {
+    vec2 texel = 1.0 / vec2(size);
+    vec3 sum = vec3(0.0);
+    for(int y = 0; y < 4; y++)
+      for(int x = 0; x < 4; x++)
+      {
+        vec2 tc = (vec2(p) + (vec2(x, y) + 0.5) * 0.25) * texel;
+        vec3 v = textureLod(img_in, tc, 0.0).rgb;
+        sum += push.srgb_eotf != 0 ? eotf(clamp(v, 0.0, 1.0)) : v;
+      }
+    rgb = sum / 16.0;
+  }
+  rgb = vec3(dot(push.row0.xyz, rgb), dot(push.row1.xyz, rgb), dot(push.row2.xyz, rgb));
+  imageStore(img_out, p, vec4(max(rgb * push.gain, vec3(0.0)), 1.0));
+}
