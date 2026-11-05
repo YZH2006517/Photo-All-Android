@@ -7,6 +7,8 @@
 
 #include "burst.h"
 #include "film_shaders.h"
+#include <cstdarg>
+#include <cstdio>
 #include "vk_api.h"
 #include "vkdt/constants.h"
 
@@ -31,7 +33,7 @@ namespace {
 enum Kernel
 {
   kSetup, kDirlut, kFast, kExpose, kDevelop, kHalin, kHalout, kScatter, kNegprint,
-  kBlur, kDownsample, kDecode, kEncode, kRaw, kMerge, kKernelCount
+  kBlur, kDownsample, kDecode, kEncode, kRaw, kMerge, kLtm, kChroma, kDnHalf, kDnDowncov, kDnDown, kDnAssemble, kDnDoub, kFlashmix, kFlashfrac, kFlashwb, kKernelCount
 };
 
 struct KernelSpec
@@ -46,9 +48,19 @@ constexpr KernelSpec kKernels[kKernelCount] = {
     {"expose", "SSBII", 0},    {"develop", "SBSSI", 0},   {"halin", "SBSI", 0},
     {"halout", "SBSISSSSSS", 0}, {"scatter", "SISSSS", 0}, {"negprint", "SSBI", 0},
     {"blur", "SI", 16},        {"downsample", "SI", 4},   {"decode", "SI", 56},
-    {"encode", "SIS", 112},     {"raw", "SSI", 128},       {"merge", "SSSSSSBI", 48},
+    {"encode", "SIS", 112},     {"raw", "SSI", 128},       {"merge", "SSSSSSBI", 80},
+    {"ltm", "SSI", 16},        {"chroma", "SSSI", 16},
+    {"dn_half", "SI", 48},     {"dn_downcov", "SII", 16}, {"dn_down", "SI", 16},
+    {"dn_assemble", "SSSSSI", 32}, {"dn_doub", "SSSI", 64},  {"flashmix", "SSBI", 128},
+    {"flashfrac", "SSBI", 64},  {"flashwb", "SSI", 80},
 };
 constexpr int kMaxBurst = 6;
+// Code value of 1.0 in the merged mosaic: 20 bits, so shadows lifted from a longer
+// bracket frame keep their precision below the reference's own quantisation.
+constexpr float kMergeScale = 1048575.0f;
+// vkdt denoise's luma blend (its default): how much of the denoised luminance replaces
+// the original; colour is always fully denoised.
+constexpr float kDenoiseLuma = 0.6f;
 
 // Row-major 3x3 primaries conversions between D65 RGB spaces.
 constexpr float kSrgbToRec2020[9] = {0.627404f, 0.329283f, 0.043313f, 0.069097f, 0.919540f,
@@ -257,6 +269,24 @@ struct FilmEngine::Impl
   int creative_size = 0;
   float creative_strength = 0.0f;
   BurstAlignment alignment; // of the frame being developed
+  float flash_gain = 0.0f;  // flash mix: gain on the flash-only light of the frame being developed
+  float flash_ambient_k = 1.0f; // flash white: flash frame exposure over the ambient frame's
+  // The develop's record: "section\tkey\tvalue" lines, filled by develop() and build_graph().
+  std::string record;
+  void note(const char *section, const char *key, const char *format, ...)
+  {
+    char value[256];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(value, sizeof(value), format, args);
+    va_end(args);
+    record += section;
+    record += '\t';
+    record += key;
+    record += '\t';
+    record += value;
+    record += '\n';
+  }
 
   ~Impl()
   {
@@ -725,6 +755,120 @@ struct FilmEngine::Impl
 
   // ----- frame --------------------------------------------------------------
 
+  // Raw denoise on the mosaic before demosaicing, adapted from vkdt's denoise module
+  // (shaders/denoise): half-size rgb, four levels of edge-aware a-trous wavelets with
+  // noise-normalised soft shrinkage, then the finest band on the full mosaic. Values are
+  // normalised with `black` / `white` on read; the noise model is variance a + b x in
+  // those units. Returns the denoised mosaic as integers spanning 0..kMergeScale.
+  int raw_denoise(Graph &g, Ref mosaic, uint32_t mw, uint32_t mh, const float black[4], float white,
+                  const int cfa[4], const float wb[3], float noise_a, float noise_b, float strength)
+  {
+    const uint32_t hw = mw / 2, hh = mh / 2;
+    struct
+    {
+      float black[4];
+      float white;
+      int32_t pad[3];
+      int32_t cfa[4];
+    } half_push{};
+    std::memcpy(half_push.black, black, sizeof(half_push.black));
+    half_push.white = white;
+    for(int i = 0; i < 4; i++) half_push.cfa[i] = cfa[i];
+    const int half = g.image(hw, hh);
+    g.pixels(kDnHalf, {mosaic, img(half)}, half, half_push);
+
+    struct
+    {
+      float noise_a, noise_b;
+      int32_t level, block;
+    } down_push{noise_a, noise_b, 0, 2};
+    int level[4];
+    level[0] = g.image(hw, hh);
+    const int cov = g.image(hw, hh); // structure tensor, unused further on
+    g.pixels(kDnDowncov, {img(half), img(level[0]), img(cov)}, level[0], down_push);
+    for(int i = 1; i < 4; i++)
+    {
+      down_push.level = i;
+      level[i] = g.image(hw, hh);
+      g.pixels(kDnDown, {img(level[i - 1]), img(level[i])}, level[i], down_push);
+    }
+
+    struct
+    {
+      float wb[4];
+      float noise_a, noise_b, strength, luma;
+    } assemble_push{{wb[0], wb[1], wb[2], 1.0f}, noise_a, noise_b, strength, kDenoiseLuma};
+    const int assembled = g.image(hw, hh);
+    g.pixels(kDnAssemble, {img(half), img(level[0]), img(level[1]), img(level[2]), img(level[3]), img(assembled)},
+             assembled, assemble_push);
+
+    struct
+    {
+      float black[4];
+      float white, noise_a, noise_b, strength;
+      int32_t cfa[4];
+      float luma, detail, scale, pad;
+    } doub_push{};
+    std::memcpy(doub_push.black, black, sizeof(doub_push.black));
+    doub_push.white = white;
+    doub_push.noise_a = noise_a;
+    doub_push.noise_b = noise_b;
+    doub_push.strength = strength;
+    for(int i = 0; i < 4; i++) doub_push.cfa[i] = cfa[i];
+    doub_push.luma = kDenoiseLuma;
+    doub_push.detail = 1.0f;
+    doub_push.scale = kMergeScale;
+    static_assert(sizeof(doub_push) == 64, "dn_doub push constants");
+    const int out = g.image(mw, mh, VK_FORMAT_R32_UINT);
+    g.pixels(kDnDoub, {mosaic, img(assembled), img(half), img(out)}, out, doub_push);
+    return out;
+  }
+
+  // Chroma noise reduction of the scene-linear `input` (see chroma.comp): colour from a
+  // Gaussian blur of 0.3% of the long edge (12 px at 4000), at luminance edges from one
+  // of 0.05% (2 px); luminance untouched.
+  int chroma_denoise(Graph &g, int input, uint32_t w, uint32_t h, float strength)
+  {
+    struct
+    {
+      float strength, floor_, edge_lo, edge_hi;
+    } push{strength, 0.02f, 0.8f, 2.0f};
+    const float sigma_frac = 0.003f;
+    const float long_edge = static_cast<float>(std::max(w, h));
+    const int blurred = g.blur(input, sigma_frac * long_edge, true);
+    const int narrow = g.blur(input, 0.0005f * long_edge, false);
+    const int out = g.image(w, h);
+    g.pixels(kChroma, {img(input), img(blurred), img(narrow), img(out)}, out, push);
+    return out;
+  }
+
+  // Local tone compression of the scene-linear `input` (see ltm.comp): guided filter
+  // of log luminance at 1/4 resolution with a radius of about 2% of the long edge.
+  int local_tone(Graph &g, int input, uint32_t w, uint32_t h, float strength)
+  {
+    struct
+    {
+      int32_t mode;
+      float strength, eps, anchor;
+    } push{0, strength, 0.3f, std::log2(0.18f)};
+    const int factor = 4;
+    const int small = g.image((w + factor - 1) / factor, (h + factor - 1) / factor);
+    const int32_t f = factor;
+    g.pixels(kDownsample, {img(input), img(small)}, small, f);
+    const int stats = g.image(g.images[small].width, g.images[small].height);
+    g.pixels(kLtm, {img(small), img(small), img(stats)}, stats, push);
+    const float sigma = 0.02f * static_cast<float>(std::max(w, h)) / factor;
+    const int mean_stats = g.blur(stats, sigma, true);
+    const int coef = g.image(g.images[mean_stats].width, g.images[mean_stats].height);
+    push.mode = 1;
+    g.pixels(kLtm, {img(mean_stats), img(mean_stats), img(coef)}, coef, push);
+    const int mean_coef = g.blur(coef, sigma * g.images[coef].width / g.images[small].width, true);
+    const int out = g.image(w, h);
+    push.mode = 2;
+    g.pixels(kLtm, {img(input), img(mean_coef), img(out)}, out, push);
+    return out;
+  }
+
   // filmsim_make_plan(): the film (and, unless scanning, the print) as compute passes.
   int develop_film(Graph &g, const FilmParams &params, int input, uint32_t w, uint32_t h)
   {
@@ -841,16 +985,25 @@ struct FilmEngine::Impl
       push.map_size[1] = raw.map_height;
       push.map_size[2] = map && raw.map_width >= 2 && raw.map_height >= 2;
       Ref sensor = upload(0);
-      if(source.burst_count > 1)
-      { // merge first; the merged mosaic is black-subtracted and spans 0..65535
-        const int frames = std::min(source.burst_count, kMaxBurst);
+      // With a flash mix the last frame is the flash frame: only the others are merged.
+      const bool flash = options.flash.enabled && source.burst_count >= 2;
+      // Flash white balance: frame 0 is the flash frame, frame 1 the ambient one (not merged).
+      const bool white_map = options.flash_white.enabled && !flash && source.burst_count == 2;
+      const int ambient_frames = white_map ? 1 : std::min(source.burst_count, kMaxBurst) - (flash ? 1 : 0);
+      if(ambient_frames > 1)
+      { // merge first; the merged mosaic is black-subtracted, at frame 0's exposure, and spans 0..kMergeScale
+        const int frames = ambient_frames;
+        note("合并", "合并帧数", "%d", frames);
         const int merged = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
         struct
         {
           float black[4];
           float white, noise_s, noise_o, strength;
           int32_t frames, tiles_x, tiles_y, tile;
+          float gain[6];
+          float scale, pad;
         } merge{};
+        static_assert(sizeof(merge) == 80, "merge push constants");
         std::memcpy(merge.black, raw.black, sizeof(merge.black));
         merge.white = raw.white;
         // Without a NoiseProfile assume a typical phone sensor at mid ISO.
@@ -861,6 +1014,9 @@ struct FilmEngine::Impl
         merge.tiles_x = alignment.tiles_x;
         merge.tiles_y = alignment.tiles_y;
         merge.tile = alignment.tile;
+        for(int i = 0; i < 6; i++)
+          merge.gain[i] = i < frames && i < static_cast<int>(alignment.gain.size()) ? alignment.gain[i] : 1.0f;
+        merge.scale = kMergeScale;
         std::vector<Ref> bindings;
         for(int i = 0; i < kMaxBurst; i++) bindings.push_back(upload(i < frames ? i : 0));
         bindings.push_back(kOffsets);
@@ -868,7 +1024,125 @@ struct FilmEngine::Impl
         g.pixels(kMerge, bindings, merged, merge);
         sensor = img(merged);
         for(float &b : push.black) b = 0.0f;
-        push.wb_white[3] = 65535.0f;
+        push.wb_white[3] = kMergeScale;
+      }
+      float noise_gain = 1.0f; // how much the mixes scaled the signal (and so its noise)
+      if(white_map)
+      {
+        const RawImage &amb = *source.burst[1];
+        struct
+        {
+          float f_black[4], a_black[4];
+          float f_white, a_white, ambient_scale;
+          int32_t ambient_index, tiles_x, tiles_y, tile, pad;
+        } frac{};
+        static_assert(sizeof(frac) == 64, "flashfrac push constants");
+        std::memcpy(frac.f_black, push.black, sizeof(frac.f_black));
+        std::memcpy(frac.a_black, amb.black, sizeof(frac.a_black));
+        frac.f_white = push.wb_white[3];
+        frac.a_white = amb.white;
+        frac.ambient_scale = flash_ambient_k;
+        frac.ambient_index = 1;
+        frac.tiles_x = alignment.tiles_x;
+        frac.tiles_y = alignment.tiles_y;
+        frac.tile = alignment.tile;
+        const int share = g.image(raw.width / 2, raw.height / 2);
+        g.pixels(kFlashfrac, {sensor, upload(1), kOffsets, img(share)}, share, frac);
+        // Smooth: the white changes with the lighting, not with texture or misregistration.
+        const int smooth = g.blur(share, 0.015f * static_cast<float>(std::max(raw.width, raw.height)) / 2.0f, true);
+        struct
+        {
+          float black[4], n_ambient[4], n_flash[4];
+          int32_t cfa[4];
+          float white, scale, pad0, pad1;
+        } wbp{};
+        static_assert(sizeof(wbp) == 80, "flashwb push constants");
+        std::memcpy(wbp.black, push.black, sizeof(wbp.black));
+        for(int c = 0; c < 3; c++)
+        {
+          wbp.n_ambient[c] = options.flash_white.ambient[c];
+          wbp.n_flash[c] = options.flash_white.flash[c];
+        }
+        for(int i = 0; i < 4; i++) wbp.cfa[i] = raw.cfa_colour[i];
+        wbp.white = push.wb_white[3];
+        wbp.scale = 0.5f * kMergeScale;
+        const int balanced = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
+        g.pixels(kFlashwb, {sensor, img(smooth), img(balanced)}, balanced, wbp);
+        sensor = img(balanced);
+        for(float &b : push.black) b = 0.0f;
+        push.wb_white[3] = 0.5f * kMergeScale;
+      }
+      if(flash)
+      {
+        const RawImage &fr = *source.burst[ambient_frames];
+        struct
+        {
+          float a_black[4], f_black[4], wb[4];
+          float a_white, f_white, ambient_gain, flash_gain;
+          int32_t cfa[4];
+          float noise_s, noise_o, scale;
+          int32_t flash_index, tiles_x, tiles_y, tile, pad;
+          float wbg[4];
+        } mix{};
+        static_assert(sizeof(mix) == 128, "flashmix push constants");
+        for(int c = 0; c < 3; c++) mix.wbg[c] = raw.wb[c];
+        std::memcpy(mix.a_black, push.black, sizeof(mix.a_black));
+        std::memcpy(mix.f_black, fr.black, sizeof(mix.f_black));
+        for(int c = 0; c < 3; c++) mix.wb[c] = options.flash.wb[c];
+        mix.a_white = push.wb_white[3];
+        mix.f_white = fr.white;
+        mix.ambient_gain = options.flash.ambient;
+        mix.flash_gain = flash_gain;
+        for(int i = 0; i < 4; i++) mix.cfa[i] = raw.cfa_colour[i];
+        mix.noise_s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
+        mix.noise_o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
+        mix.scale = kMergeScale;
+        mix.flash_index = ambient_frames;
+        mix.tiles_x = alignment.tiles_x;
+        mix.tiles_y = alignment.tiles_y;
+        mix.tile = alignment.tile;
+        const int mixed = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
+        g.pixels(kFlashmix, {sensor, upload(ambient_frames), kOffsets, img(mixed)}, mixed, mix);
+        sensor = img(mixed);
+        for(float &b : push.black) b = 0.0f;
+        push.wb_white[3] = kMergeScale;
+        noise_gain = std::max(options.flash.ambient, flash_gain);
+      }
+      if(options.raw_denoise > 0.0f && raw.width >= 64 && raw.height >= 64)
+      {
+        // Noise model of the reference frame (DNG NoiseProfile, normalised units). A merge
+        // averages frames: the variance drops by the frames' total light relative to the
+        // reference (sum of 1 / gain), counted at half since robust weights and alignment
+        // keep a real merge from reaching it.
+        const float s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
+        const float o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
+        float frames = 1.0f;
+        if(source.burst_count > 1)
+        {
+          float light = 0.0f;
+          for(int i = 0; i < ambient_frames; i++)
+            light += i < static_cast<int>(alignment.gain.size()) && alignment.gain[i] > 0 ? 1.0f / alignment.gain[i] : 1.0f;
+          frames = 1.0f + 0.5f * (light - 1.0f);
+        }
+        const float o_gain = noise_gain;
+        const float wb[3] = {raw.wb[0], raw.wb[1], raw.wb[2]};
+        // vkdt fits its noise profile on values normalised to [0, 1] but compares it with
+        // coefficients in 16-bit units, so its sigma is effectively 65535 / (white - black)
+        // times the normalised one, and the shrinkage threshold and detail test are tuned at
+        // that scale. Scaling the variance the same way keeps vkdt's behaviour for a strength.
+        const float range = raw.white - 0.25f * (raw.black[0] + raw.black[1] + raw.black[2] + raw.black[3]);
+        const float kappa = range > 0.0f ? 65535.0f / range : 1.0f;
+        // Scaling the signal by k scales the noise variance s x + o into k s x + k^2 o.
+        const float kappa2 = kappa * kappa;
+        frames /= noise_gain;
+        note("降噪", "RAW 降噪 (vkdt)", "强度 %.2f，σ 刻度 κ %.1f，合并等效帧 %.2f，信号增益 %.2f", options.raw_denoise, kappa,
+             frames * noise_gain, noise_gain);
+        note("降噪", "使用的噪声模型 (s o)", "%.4g %.4g", s, o);
+        const int denoised = raw_denoise(g, sensor, raw.width, raw.height, push.black, push.wb_white[3], raw.cfa_colour,
+                                         wb, kappa2 * o * o_gain / frames, kappa2 * s / frames, std::min(options.raw_denoise, 1.0f));
+        sensor = img(denoised);
+        for(float &b : push.black) b = 0.0f;
+        push.wb_white[3] = kMergeScale;
       }
       const bool native = static_cast<uint32_t>(raw.width) == w && static_cast<uint32_t>(raw.height) == h;
       const int developed = native ? input : g.image(raw.width, raw.height);
@@ -883,12 +1157,20 @@ struct FilmEngine::Impl
     }
     else g.pixels(kDecode, {kUpload, img(input)}, input, decode);
 
+    int scene = input;
+    note("降噪", "彩色降噪", options.chroma_denoise > 0 ? "%.2f" : "关", options.chroma_denoise);
+    note("影调", "HDR 影调压缩", options.local_tone > 0 ? "%.2f" : "关", options.local_tone);
+    note("冲洗曝光", "工作尺寸", "%ux%u（长边上限 %d）", w, h, options.max_long_edge);
+    if(options.chroma_denoise > 0.0f)
+      scene = chroma_denoise(g, scene, w, h, std::min(options.chroma_denoise, 1.0f));
+    if(options.local_tone > 0.0f) scene = local_tone(g, scene, w, h, std::min(options.local_tone, 1.0f));
+
     // Film off: the scene itself under a neutral curve (raw) or as shot (display-referred).
-    int developed = input;
+    int developed = scene;
     int mode = source.raw ? 1 : 0;
     if(options.stages.film)
     {
-      developed = develop_film(g, params, input, w, h);
+      developed = develop_film(g, params, scene, w, h);
       // Print off: slides are positive already; negatives get the lab-scan inversion.
       mode = !options.stages.print && !is_positive_film(params.film) ? 2 : 0;
     }
@@ -915,6 +1197,17 @@ struct FilmEngine::Impl
   {
     SourceImage src = source;
     alignment = {};
+    record.clear();
+    // Flash white balance: develop the flash frame (given last), compare the ambient one.
+    const RawImage *white_order[2] = {nullptr, nullptr};
+    const bool white_map = options.flash_white.enabled && !options.flash.enabled && source.burst &&
+                           source.burst_count == 2;
+    if(white_map)
+    {
+      white_order[0] = source.burst[1];
+      white_order[1] = source.burst[0];
+      src.burst = white_order;
+    }
     if(src.burst && src.burst_count > 0)
     {
       if(src.raw)
@@ -933,10 +1226,32 @@ struct FilmEngine::Impl
             error = "burst frames differ in size";
             return false;
           }
-        if(!align_burst(frames, alignment, error)) return false;
+        // A flash frame shares the ambient frames' exposure but not their light: it is
+        // matched by structure. So is the ambient frame against a flash reference.
+        std::vector<char> same(frames.size(), 0);
+        if(options.flash.enabled || white_map) same.back() = 2;
+        if(!align_burst(frames, alignment, error, &same)) return false;
       }
     }
     else src.burst_count = 0;
+    const bool flash = options.flash.enabled && src.burst_count >= 2;
+    if((flash || white_map) && !alignment.offsets.empty())
+    { // The flash re-lights the scene, which misleads per-tile matching: tiles of one
+      // frame then disagree and the flash-only light shows their seams. The frames are
+      // a fraction of a second apart, so one global shift (the tiles' median) is used.
+      const int tiles = alignment.tiles_x * alignment.tiles_y;
+      int32_t *o = &alignment.offsets[static_cast<size_t>(src.burst_count - 1) * tiles * 2];
+      std::vector<int32_t> xs, ys;
+      for(int t = 0; t < tiles; t++) { xs.push_back(o[2 * t]); ys.push_back(o[2 * t + 1]); }
+      std::nth_element(xs.begin(), xs.begin() + tiles / 2, xs.end());
+      std::nth_element(ys.begin(), ys.begin() + tiles / 2, ys.end());
+      const int32_t mx = xs[tiles / 2] & ~1, my = ys[tiles / 2] & ~1; // keep the CFA phase
+      for(int t = 0; t < tiles; t++) { o[2 * t] = mx; o[2 * t + 1] = my; }
+    }
+    flash_ambient_k = 1.0f;
+    if(white_map && src.burst_count == 2) flash_ambient_k = flash_ambient_scale(*src.burst[0], *src.burst[1], alignment, 1);
+    float level = 0.0f;
+    if(flash) level = flash_level(*src.burst[0], *src.burst[src.burst_count - 1], alignment, src.burst_count - 1);
     if(src.raw)
     {
       src.width = src.raw->width;
@@ -958,7 +1273,93 @@ struct FilmEngine::Impl
       const float key = raw_key(*src.raw);
       if(key > 0.0f) opts.exposure_ev += std::clamp(std::log2(opts.match_key / key), -6.0f, 6.0f);
     }
-    return develop_source(src, raw_params, opts, result, error);
+    // Flash gain: the develop scales the raw by 2^ev, so the flash-only light at its 98th
+    // percentile lands on the target with this gain.
+    flash_gain = 0.0f;
+    if(flash && level > 0.0f)
+      flash_gain = std::clamp(opts.flash.target / (level * std::exp2(opts.exposure_ev)), 0.0f, opts.flash.max_gain);
+    opts.flash.enabled = flash;
+    // The record: what each raw frame carried, how the frames were registered, exposure.
+    const int frame_count = src.raw ? std::max(1, src.burst_count) : 0;
+    for(int i = 0; i < frame_count; i++)
+    {
+      const RawImage &r = src.burst_count > 0 ? *src.burst[i] : *src.raw;
+      char k[64];
+      std::snprintf(k, sizeof(k), "帧 %d 尺寸 / 白电平 / 黑电平", i);
+      note("RAW 数据", k, "%dx%d / %.0f / %.0f %.0f %.0f %.0f", r.width, r.height, r.white, r.black[0], r.black[1], r.black[2], r.black[3]);
+      std::snprintf(k, sizeof(k), "帧 %d 白平衡增益 (R G B)", i);
+      note("RAW 数据", k, "%.4f %.4f %.4f", r.wb[0], r.wb[1], r.wb[2]);
+      std::snprintf(k, sizeof(k), "帧 %d 噪声模型 (s o)", i);
+      note("RAW 数据", k, "%.4g %.4g", r.noise_scale, r.noise_offset);
+      std::snprintf(k, sizeof(k), "帧 %d 画面亮度 key", i);
+      note("RAW 数据", k, "%.5f", raw_key(r));
+      if(i == 0)
+      {
+        static const char rgb[] = "RGB";
+        note("RAW 数据", "CFA 排列", "%c%c%c%c", rgb[r.cfa_colour[0]], rgb[r.cfa_colour[1]], rgb[r.cfa_colour[2]], rgb[r.cfa_colour[3]]);
+        note("RAW 数据", "方向 (TIFF)", "%d", r.orientation);
+        note("RAW 数据", "镜头阴影图", r.gain_map.empty() ? "无" : "%dx%d", r.map_width, r.map_height);
+        const float *m = r.camera_to_rec2020;
+        note("RAW 数据", "相机 → Rec.2020 矩阵", "%.3f %.3f %.3f / %.3f %.3f %.3f / %.3f %.3f %.3f", m[0], m[1], m[2], m[3], m[4],
+             m[5], m[6], m[7], m[8]);
+      }
+    }
+    if(!alignment.offsets.empty())
+    {
+      const int tiles = alignment.tiles_x * alignment.tiles_y;
+      note("对齐", "分块", "%dx%d 块，每块 %d px", alignment.tiles_x, alignment.tiles_y, alignment.tile);
+      for(int f = 1; f < src.burst_count; f++)
+      {
+        // median tile offset and spread: what registered the frame
+        std::vector<int32_t> xs, ys;
+        for(int t = 0; t < tiles; t++)
+        {
+          xs.push_back(alignment.offsets[(static_cast<size_t>(f) * tiles + t) * 2]);
+          ys.push_back(alignment.offsets[(static_cast<size_t>(f) * tiles + t) * 2 + 1]);
+        }
+        const auto [x0, x1] = std::minmax_element(xs.begin(), xs.end());
+        const auto [y0, y1] = std::minmax_element(ys.begin(), ys.end());
+        std::nth_element(xs.begin(), xs.begin() + tiles / 2, xs.end());
+        std::nth_element(ys.begin(), ys.begin() + tiles / 2, ys.end());
+        const float g = f < static_cast<int>(alignment.gain.size()) ? alignment.gain[f] : 1.0f;
+        char k[48];
+        std::snprintf(k, sizeof(k), "帧 %d", f);
+        note("对齐", k, "位移中位 (%d, %d) px，范围 x %d…%d y %d…%d，曝光比 %.3f", xs[tiles / 2], ys[tiles / 2], *x0, *x1, *y0,
+             *y1, g > 0 ? 1.0f / g : 0.0f);
+      }
+    }
+    if(src.raw)
+    {
+      const float key = raw_key(*src.raw);
+      note("冲洗曝光", "取景器亮度 key", "%.5f", options.match_key);
+      note("冲洗曝光", "参考帧亮度 key", "%.5f", key);
+      note("冲洗曝光", "对齐取景器提亮", options.match_key > 0 && key > 0 ? "%+.2f EV" : "未对齐（%.0f）",
+           options.match_key > 0 && key > 0 ? std::clamp(std::log2(options.match_key / key), -6.0f, 6.0f) : 0.0f);
+      note("冲洗曝光", "最终曝光", "%+.2f EV", opts.exposure_ev);
+    }
+    if(flash)
+    {
+      note("闪光", "合成", "环境光增益 %.3f，目标 %.3f，上限 %.2f", opts.flash.ambient, opts.flash.target, opts.flash.max_gain);
+      note("闪光", "闪光单独亮度 (98%)", "%.4f", level);
+      note("闪光", "闪光增益", "%.3f", flash_gain);
+      note("闪光", "闪光 → 环境白 (R G B)", "%.3f %.3f %.3f", opts.flash.wb[0], opts.flash.wb[1], opts.flash.wb[2]);
+    }
+    if(white_map)
+    {
+      note("闪光", "分区白平衡", "环境 %.3f %.3f %.3f / 闪光 %.3f %.3f %.3f", options.flash_white.ambient[0],
+           options.flash_white.ambient[1], options.flash_white.ambient[2], options.flash_white.flash[0],
+           options.flash_white.flash[1], options.flash_white.flash[2]);
+      note("闪光", "闪光帧 / 环境帧曝光比", "%.3f", flash_ambient_k);
+    }
+    const bool ok = develop_source(src, raw_params, opts, result, error);
+    if(ok)
+    {
+      note("冲洗结果", "输出尺寸", "%dx%d", result.width, result.height);
+      note("冲洗结果", "GPU 计算", "%d 个 pass，GPU %.1f ms，显存峰值 %.1f MB", result.passes, result.gpu_ms,
+           result.peak_image_bytes / 1048576.0);
+    }
+    result.note = record;
+    return ok;
   }
 
   // Negative scan calibration: unexposed, mid grey and two stops over, developed and

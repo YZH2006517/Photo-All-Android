@@ -1,0 +1,46 @@
+#version 450
+// Chroma noise reduction of scene-linear light: luminance stays per pixel, colour
+// (rgb / luminance) is taken from a Gaussian-blurred copy. Demosaiced sensor noise is
+// mostly coarse colour blotches that luminance detail does not need. Where luminance
+// itself steps (an edge) the colour comes from a small-radius blur instead, so hues do
+// not bleed across the edge but its pixels still lose their single-pixel colour noise.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1) uniform sampler2D img_blur;   // wide
+layout(set = 1, binding = 2) uniform sampler2D img_small;  // narrow, full resolution
+layout(set = 1, binding = 3, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  float strength; // 0 off, 1 full blurred colour away from edges
+  float floor_;   // luminance added before ratios, keeps near-black stable
+  float edge_lo;  // stops of luminance difference to the wide blur where the
+  float edge_hi;  //   colour starts / fully comes from the narrow blur
+} push;
+
+float luminance(vec3 rgb) { return dot(rgb, vec3(0.2627, 0.6780, 0.0593)); } // Rec.2020
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(img_out);
+  if(any(greaterThanEqual(p, size))) return;
+  vec4 c = texelFetch(img_in, p, 0);
+  vec3 b = texture(img_blur, (vec2(p) + 0.5) / vec2(size)).rgb;
+  vec3 n = texelFetch(img_small, p, 0).rgb;
+  float y = max(luminance(c.rgb), 0.0);
+  float yb = max(luminance(b), 0.0);
+  float yn = max(luminance(n), 0.0);
+  float edge = abs(log2((y + push.floor_) / (yb + push.floor_)));
+  float near = smoothstep(push.edge_lo, push.edge_hi, edge);
+  // Colour as a ratio to luminance: the output keeps this pixel's luminance exactly.
+  vec3 rgb = c.rgb;
+  if(y > 1e-7 && yb > 1e-7 && yn > 1e-7)
+  {
+    vec3 smooth_ = mix(b / yb, n / yn, near);
+    // Near black the colour is mostly noise: fade it to neutral (a ratio of 1 keeps the
+    // luminance), fully below a tenth of the floor, not at all above 0.75 floors.
+    smooth_ = mix(vec3(1.0), smooth_, smoothstep(0.1 * push.floor_, 0.75 * push.floor_, yb));
+    rgb = y * mix(c.rgb / y, smooth_, push.strength);
+  }
+  imageStore(img_out, p, vec4(rgb, c.a));
+}

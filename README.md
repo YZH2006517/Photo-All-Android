@@ -26,19 +26,25 @@
   - **LUT 关**：保留所选 LUT，暂时不用
 - 滤色方式：默认「保留胶片本色」（所有胶片用同一套参考滤色，各自的色彩差异都在），也可以选逐卷自动中性或手动
 - 347 个开源创意 LUT（HaldCLUT，可调强度），在胶片之后叠加
+- RAW 降噪：去马赛克之前按 DNG 噪声模型做小波降噪（移植自 vkdt 的 denoise 模块），之后再做一遍只动颜色的彩色降噪
 
 **拍摄**
 - RAW（DNG）拍摄后从 RAW 冲洗，默认冲洗成 JPG 后删掉 RAW（可选保留）
-- HDR：多帧 RAW 连拍，对齐后合成（HDR+ 风格的鲁棒合并）
+- HDR：多帧短曝光 RAW 加一帧长曝光（包围），按实测曝光比在 RAW 线性空间合并（HDR+ 风格的鲁棒合并），之后可选局部影调压缩
+- 闪光：
+  - **闪光**：单张真闪光（手机预闪测光）；拍 RAW 时先补一帧环境光，按闪光照到的区域分别校正白平衡
+  - **补光 / 平衡 / 压光**：一帧环境光加一帧闪光（同一曝光），在 RAW 里算出闪光单独的光，再按模式重新配比；闪光和室内光各自校正色温
 - 取景器实时预览胶片效果（33³ 3D LUT），预览和成片亮度、色彩对齐
 - 多镜头识别和切换（例如 S23 Ultra 的 0.6× / 1× / 3× / 10×），双指变焦
 - 对焦：AF-C、AF-L（点按锁定）、MF（距离滑块 + 峰值对焦）
 - 曝光：±EV（1/3 档），手动 ISO / 快门；可选的「胶片测光规则」（测光模式、高光保护、按胶片 ISO 曝光、标定白平衡）
 - 实时直方图（按胶片效果计算）、构图辅助线（三分、黄金比例、对角线、中心）
 - 竖屏为主；把手机横过来时，角落会出现一个小按钮，点了才切到横屏布局，几秒后自动消失
+- HDR、闪光、对焦模式、引导线收在一个可折叠的汇总条里
 
 **相册**
-- 应用内查看照片：滑动、缩放，查看每张的冲洗配方（胶片 · 相纸 · LUT）
+- 应用内查看照片：滑动、缩放；上滑看直方图，再上滑看「拍摄档案」
+- 拍摄档案：每张照片记录相机、拍摄瞬间的曝光 / 白平衡 / 对焦、每一帧、冲洗引擎的每个决定和全部设置，按类别折叠，可一键复制
 - 收藏（红心）、只看收藏、多选分享、移到系统回收站（同时移走对应的 RAW）
 
 ## 项目结构
@@ -101,6 +107,7 @@ build/desktop/filmsim_cli --filmsim android/app/src/main/assets/filmsim/filmsim.
 | 内容 | 来源 | 许可 |
 | --- | --- | --- |
 | filmsim 着色器、白平衡表 | [vkdt](https://github.com/hanatos/vkdt)，hanatos | BSD 2-Clause（个别标注的文件为 GPLv3，见 `engine/shaders/vkdt/LICENCE.*`） |
+| RAW 降噪着色器（`engine/shaders/denoise/`） | 改写自 vkdt 的 denoise 模块，hanatos | BSD 2-Clause，改动见该目录的 `README.md` |
 | 胶片 / 相纸光谱数据（`assets/filmsim/filmsim.lut`） | [spektrafilm](https://github.com/andreavolpato/spektrafilm)，Andrea Volpato | CC BY-SA 4.0（经 vkdt 打包，未修改） |
 | 光谱上采样表（`assets/filmsim/spectra-em.lut`） | 用 vkdt 的 mkspectra 生成 | 同 vkdt |
 | 创意 LUT（`assets/luts/`） | [NatronGitHub/clut](https://github.com/NatronGitHub/clut)，Pat David、Juan Melara、Marc Roovers 等 | CC BY-SA 4.0，已从 HaldCLUT 8 级转换为 33³，见 `assets/luts/CREDITS.md` |

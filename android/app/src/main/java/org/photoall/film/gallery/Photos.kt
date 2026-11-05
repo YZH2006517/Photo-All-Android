@@ -34,6 +34,7 @@ object Photos {
         var selection = "${MediaStore.Images.Media.RELATIVE_PATH} = ? AND ${MediaStore.Images.Media.MIME_TYPE} = ?"
         if (favoritesOnly) selection += " AND ${MediaStore.Images.Media.IS_FAVORITE} = 1"
         val photos = mutableListOf<Photo>()
+        val recipes = recipes(context)
         context.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, selection,
             arrayOf(FOLDER, "image/jpeg"), "${MediaStore.Images.Media.DATE_ADDED} DESC",
@@ -42,23 +43,46 @@ object Photos {
                 photos += Photo(
                     ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0)),
                     c.getString(1), c.getInt(2), c.getInt(3), c.getLong(4), c.getLong(5),
-                    c.getInt(6) == 1, c.getString(7) ?: "",
+                    // MediaStore drops descriptions apps write (it reads them from the file),
+                    // so the recipe saved with the photo lives in the app's own store.
+                    c.getInt(6) == 1, c.getString(7)?.takeIf { it.isNotEmpty() } ?: recipes.getString(c.getString(1), "") ?: "",
                 )
             }
         }
         return photos
     }
 
-    fun saveJpeg(context: Context, bitmap: Bitmap, name: String, quality: Int, description: String = ""): Uri {
-        val uri = insert(context, name, "image/jpeg", FOLDER, description)
-        context.contentResolver.openOutputStream(uri).use { out ->
-            check(out != null && bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)) { "保存失败" }
+    fun saveJpeg(context: Context, bitmap: Bitmap, name: String, quality: Int, description: String = "",
+                 shot: ShotInfo? = null): Uri {
+        // Encode, add the shooting data (EXIF) in a cache file, then copy in one write: a
+        // file changed after insertion is rescanned, which clears the description.
+        val temp = File.createTempFile("save", ".jpg", context.cacheDir)
+        try {
+            temp.outputStream().use { out ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)) { "保存失败" }
+            }
+            if (shot != null) runCatching {
+                android.media.ExifInterface(temp.path).apply { shot.writeTo(this, SOFTWARE) }.saveAttributes()
+            }
+            val uri = insert(context, name, "image/jpeg", FOLDER, description)
+            if (description.isNotEmpty()) recipes(context).edit().putString(name, description).apply()
+            context.contentResolver.openOutputStream(uri).use { out ->
+                checkNotNull(out) { "保存失败" }
+                temp.inputStream().use { it.copyTo(out) }
+            }
+            publish(context, uri)
+            return uri
+        } finally {
+            temp.delete()
         }
-        publish(context, uri)
-        return uri
     }
 
     /** Copies a camera DNG into the shared RAW folder so other editors can open it. */
+    /** Recipe text per saved file name (film · paper · LUT · source). */
+    private fun recipes(context: Context) = context.getSharedPreferences("photo_recipes", Context.MODE_PRIVATE)
+
+    const val SOFTWARE = "Photo All Film Camera" // EXIF ASCII
+
     fun saveDng(context: Context, file: File, name: String): Uri {
         val uri = insert(context, name, "image/x-adobe-dng", RAW_FOLDER)
         context.contentResolver.openOutputStream(uri).use { out ->

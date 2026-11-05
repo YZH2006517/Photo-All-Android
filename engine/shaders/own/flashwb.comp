@@ -1,0 +1,34 @@
+#version 450
+// Flash white balance, step 2: each mosaic sample of the flash frame is rebalanced for
+// the light that lit it. The develop applies the flash's white globally; here the
+// samples get n_flash / n_mix, n_mix being the as-shot neutral blended between ambient
+// and flash by the (blurred) flash share. Written with 2x headroom (white = scale).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform usampler2D img_flash;
+layout(set = 1, binding = 1) uniform sampler2D img_share;
+layout(set = 1, binding = 2, r32ui) uniform writeonly restrict uimage2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4  black;     // flash frame, per 2x2 position
+  vec4  n_ambient; // camera rgb neutral of the ambient light (g = 1)
+  vec4  n_flash;   // of the flash
+  ivec4 cfa;
+  float white;
+  float scale;     // output code value for 1.0 (values reach 2.0)
+  float pad0, pad1;
+} push;
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(img_out);
+  if(any(greaterThanEqual(p, size))) return;
+  int position = (p.x & 1) + 2 * (p.y & 1);
+  int colour = push.cfa[position];
+  float b = push.black[position];
+  float v = (float(texelFetch(img_flash, p, 0).r) - b) / (push.white - b);
+  float share = texture(img_share, (vec2(p) + 0.5) / vec2(size)).r;
+  vec3 n = mix(push.n_ambient.rgb, push.n_flash.rgb, share);
+  v *= push.n_flash[colour] / max(n[colour], 1e-4);
+  imageStore(img_out, p, uvec4(uint(clamp(v, 0.0, 2.0) * push.scale + 0.5)));
+}

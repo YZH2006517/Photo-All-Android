@@ -216,7 +216,7 @@ void read_gain_maps(const uint8_t *p, size_t size, RawImage &out)
 
 } // namespace
 
-bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error)
+bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override)
 {
   Tiff tiff(data, size);
   uint32_t first = 0;
@@ -312,6 +312,7 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
 
   // White balance from the as-shot neutral, normalised so the smallest gain is 1.
   auto neutral = tag(50728);
+  if(neutral_override) neutral = {neutral_override[0], neutral_override[1], neutral_override[2]};
   if(neutral.size() != 3 || neutral[0] <= 0 || neutral[1] <= 0 || neutral[2] <= 0) neutral = {1, 1, 1};
   const double inv_min = std::min({1 / neutral[0], 1 / neutral[1], 1 / neutral[2]});
   for(int c = 0; c < 3; c++) out.wb[c] = static_cast<float>((1 / neutral[c]) / inv_min);

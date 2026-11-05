@@ -31,6 +31,16 @@ object Settings {
     const val HDR = "app.hdr"
     const val HDR_FRAMES = "app.hdrframes"
     const val HDR_UNDER = "app.hdrunder"
+    const val HDR_LONG = "app.hdrlong"
+    const val HDR_TONE = "app.hdrtone"
+    const val FLASH = "app.flash"
+    const val FLASH_UNDER = "app.flashunder"
+    const val FLASH_FILL = "app.flashfill"
+    const val FLASH_WHITE = "app.flashwhite" // 0 per area (auto), 1 the flash's (daylight), 2 the room's
+    /** 0 off, 1 a real flash in one frame, 2-4 an ambient frame plus a flash frame, mixed. */
+    val flashModes = listOf("关", "闪光", "补光", "平衡", "压光")
+    const val CHROMA_NR = "app.chromanr"
+    const val RAW_DENOISE = "app.rawdenoise"
     const val LONG_EDGE = "app.longedge"
     const val JPEG_QUALITY = "app.jpegq"
     const val MANUAL = "app.manual"
@@ -90,8 +100,18 @@ object Settings {
             Setting.Toggle(KEEP_RAW, "冲洗后保留 RAW 原片（关闭则只留 JPG）", "相机", false),
             Setting.Slider(RAW_EV, "RAW 冲洗曝光 EV", "相机", -3f, 3f, 0f),
             Setting.Toggle(HDR, "HDR 连拍合成（需 RAW）", "相机", false),
-            Setting.Slider(HDR_FRAMES, "HDR 帧数", "相机", 2f, 8f, 5f, integer = true, format = "%.0f"),
+            Setting.Slider(HDR_FRAMES, "HDR 短曝光帧数（加长曝光共最多 6 帧）", "相机", 2f, 6f, 5f, integer = true, format = "%.0f"),
             Setting.Slider(HDR_UNDER, "HDR 欠曝档数（保护高光）", "相机", 0f, 3f, 1.7f, format = "%.1f"),
+            Setting.Slider(HDR_LONG, "HDR 包围长曝光：比短曝光亮几档（暗部细节，0 = 不拍）", "相机", 0f, 4f, 2f, format = "%.1f"),
+            Setting.Slider(HDR_TONE, "HDR 影调压缩：提亮暗部、压低高光（0 = 关）", "相机", 0f, 1f, 0.5f, format = "%.2f"),
+            Setting.Choice(FLASH, "闪光", "闪光",
+                listOf("关", "闪光（单张，真闪光）", "补光（两帧合成，需 RAW）", "平衡（两帧合成，需 RAW）", "压光（两帧合成，需 RAW）"), 0),
+            Setting.Slider(FLASH_UNDER, "压光：环境光压暗档数", "闪光", 0.5f, 4f, 2f, format = "%.1f"),
+            Setting.Slider(FLASH_FILL, "补光强度", "闪光", 0.1f, 1f, 0.5f, format = "%.2f"),
+            Setting.Choice(FLASH_WHITE, "闪光白平衡", "闪光",
+                listOf("自动（闪光照到的地方按闪光，其余按室内光）", "统一按闪光（日光）", "统一按室内光"), 0),
+            Setting.Slider(CHROMA_NR, "RAW 彩色降噪（只平滑颜色，不动亮度细节；0 = 关）", "相机", 0f, 1f, 1f, format = "%.2f"),
+            Setting.Slider(RAW_DENOISE, "RAW 降噪（vkdt 小波降噪，去马赛克前按传感器噪声模型；0 = 关）", "相机", 0f, 0.6f, 0.3f, format = "%.2f"),
             Setting.Choice(LONG_EDGE, "冲洗尺寸（长边）", "相机", longEdges.map { if (it >= 8192) "原尺寸" else "$it" }, 2),
             Setting.Slider(JPEG_QUALITY, "JPEG 质量", "相机", 70f, 100f, 95f, integer = true, format = "%.0f"),
             Setting.Toggle(SOFT_3A, "胶片测光规则（手机测光引擎 + 测光模式/高光保护/胶片 ISO/标定白平衡）", "相机", false),
@@ -193,6 +213,10 @@ class SettingsStore(context: Context) {
         if (prefs.getInt(SCHEMA, 1) < 3) {
             val scanned = prefs.getFloat("process", 0f) >= 0.5f
             prefs.edit().remove("process").apply { if (scanned) putFloat(Settings.PRINT_ON, 0f) }.putInt(SCHEMA, 3).apply()
+        }
+        if (prefs.getInt(SCHEMA, 1) < 4) { // a single-frame flash mode came in at index 1
+            val flash = prefs.getFloat(Settings.FLASH, 0f)
+            prefs.edit().apply { if (flash >= 1f) putFloat(Settings.FLASH, flash + 1f) }.putInt(SCHEMA, 4).apply()
         }
     }
 

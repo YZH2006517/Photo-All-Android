@@ -11,9 +11,11 @@ import android.graphics.Matrix
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
+import android.graphics.ImageFormat
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -54,13 +56,19 @@ import org.photoall.film.engine.FilmEngine
 import org.photoall.film.gallery.GalleryActivity
 import org.photoall.film.gallery.Photos
 import org.photoall.film.settings.LutLibrary
+import org.photoall.film.settings.Setting
+import org.photoall.film.ui.Style
 import org.photoall.film.settings.Settings
 import org.photoall.film.settings.SettingsStore
 import java.io.File
+import org.photoall.film.gallery.ShotInfo
+import org.photoall.film.gallery.ShotLog
+import java.io.ByteArrayInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.random.Random
 
@@ -84,6 +92,10 @@ class CameraActivity : ComponentActivity() {
     private lateinit var recipeSummary: TextView
     private lateinit var recipeRows: List<LinearLayout>
     private var recipeExpanded = false
+    /** HDR / flash / focus mode / guides, folded behind one summary chip. */
+    private lateinit var modesSummary: TextView
+    private var modesRow: LinearLayout? = null
+    private var modesExpanded = false
     private lateinit var controls: LinearLayout
     private lateinit var viewfinderFrame: ViewfinderFrame
     private lateinit var settingsButton: Button
@@ -105,6 +117,7 @@ class CameraActivity : ComponentActivity() {
     private lateinit var lensRow: LinearLayout
     private lateinit var facingButton: Button
     private lateinit var hdrButton: Button
+    private lateinit var flashButton: Button
     private lateinit var focusButton: Button
     private lateinit var guideButton: Button
     private lateinit var peakButton: Button
@@ -146,16 +159,19 @@ class CameraActivity : ComponentActivity() {
 
         // One grid for every control row: same side padding, same row height, and
         // each row split into equal cells, so columns line up from row to row.
-        status = label(13f).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
-        modeLabel = label(13f).apply { gravity = Gravity.END }
-        stockLabel = label(16f).apply { gravity = Gravity.CENTER }
-        paperLabel = label(14f).apply { gravity = Gravity.CENTER; setTextColor(0xffbbbbbb.toInt()) }
-        evLabel = label(14f).apply { gravity = Gravity.CENTER }
+        status = label(12f).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setTextColor(Style.TEXT_2) }
+        modeLabel = label(12f).apply { gravity = Gravity.END; setTextColor(Style.TEXT_2); typeface = Style.medium }
+        stockLabel = label(15f).apply { gravity = Gravity.CENTER; typeface = Style.medium }
+        paperLabel = label(14f).apply { gravity = Gravity.CENTER; setTextColor(Style.TEXT_2) }
+        evLabel = label(14f).apply { gravity = Gravity.CENTER; typeface = Style.medium }
         zoomLabel = label(14f).apply { gravity = Gravity.CENTER; minWidth = dp(48) }
         distanceLabel = label(13f).apply { gravity = Gravity.CENTER; minWidth = dp(64) }
         lensRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         facingButton = button("前置") { front = !front; lensId = null; pendingZoom = null; bindCamera() }
         hdrButton = button("HDR") { store[Settings.HDR] = if (store.flag(Settings.HDR)) 0f else 1f }
+        flashButton = button("闪关") {
+            store[Settings.FLASH] = ((store[Settings.FLASH].toInt() + 1) % Settings.flashModes.size).toFloat()
+        }
         focusButton = button("AF-C") { cycleFocusMode() }
         guideButton = button("网格") { stepSetting(Settings.GUIDES, 1) }
         peakButton = button("峰值") { store[Settings.PEAKING] = if (store.flag(Settings.PEAKING)) 0f else 1f }
@@ -171,22 +187,19 @@ class CameraActivity : ComponentActivity() {
         }
         thumbnail = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(0xff222222.toInt())
+            background = GradientDrawable().apply { cornerRadius = dp(10).toFloat(); setColor(Style.SURFACE); setStroke(1, Style.HAIRLINE) }
+            clipToOutline = true
             setOnClickListener { startActivity(Intent(this@CameraActivity, GalleryActivity::class.java)) }
         }
         shutter = View(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(0xffeeeeee.toInt())
-                setStroke(dp(4), 0xff777777.toInt())
-            }
+            background = Style.shutter(this@CameraActivity)
             setOnClickListener { takePicture() }
         }
 
         mfRow = gridRow(
-            cell(label(13f).apply { text = "∞"; gravity = Gravity.CENTER }, 0.6f),
-            cell(focusSeek, 3.4f),
-            cell(label(13f).apply { text = "近"; gravity = Gravity.CENTER }, 0.6f),
+            cell(label(13f).apply { text = "∞"; gravity = Gravity.CENTER; setTextColor(Style.TEXT_2) }, 0.6f),
+            cell(focusSeek.also { Style.slider(it) }, 3.4f),
+            cell(label(13f).apply { text = "近"; gravity = Gravity.CENTER; setTextColor(Style.TEXT_2) }, 0.6f),
             cell(distanceLabel, 1.2f),
             cell(peakButton, 1.2f),
         )
@@ -196,10 +209,18 @@ class CameraActivity : ComponentActivity() {
         recipeSummary = label(14f).apply {
             gravity = Gravity.CENTER
             ellipsize = android.text.TextUtils.TruncateAt.END
-            setBackgroundColor(0xff262626.toInt())
+            typeface = Style.medium
+            background = Style.surface(this@CameraActivity, radiusDp = 10f)
             setOnClickListener { recipeExpanded = !recipeExpanded; updateLabels() }
         }
-        lutLabel = label(14f).apply { gravity = Gravity.CENTER; setTextColor(0xffbbbbbb.toInt()) }
+        lutLabel = label(14f).apply { gravity = Gravity.CENTER; setTextColor(Style.TEXT_2) }
+        modesSummary = label(13f).apply {
+            gravity = Gravity.CENTER
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            typeface = Style.medium
+            background = Style.surface(this@CameraActivity, radiusDp = 10f)
+            setOnClickListener { modesExpanded = !modesExpanded; updateLabels() }
+        }
         stockLabel.setOnClickListener { pickFrom("选择胶片", FilmEngine.filmStocks, store["film"].toInt()) { store["film"] = it.toFloat() } }
         paperLabel.setOnClickListener { pickFrom("选择相纸", FilmEngine.papers, store["paper"].toInt()) { store["paper"] = it.toFloat() } }
         lutLabel.setOnClickListener { pickFrom("选择 LUT（${LutLibrary.count - 1} 款）", LutLibrary.entries(), store[Settings.LUT].toInt()) { pickLut(it) } }
@@ -208,10 +229,10 @@ class CameraActivity : ComponentActivity() {
         printToggle = button("相纸") { store[Settings.PRINT_ON] = if (store.flag(Settings.PRINT_ON)) 0f else 1f }
         lutToggle = button("LUT") { store[Settings.LUT_ON] = if (store.flag(Settings.LUT_ON)) 0f else 1f }
         recipeRows = listOf(
-            gridRow(cell(filmToggle, 1.2f), cell(button("‹") { stepSetting("film", -1) }, 1f), cell(stockLabel, 4f), cell(button("›") { stepSetting("film", 1) }, 1f)),
-            gridRow(cell(printToggle, 1.2f), cell(button("‹") { stepSetting("paper", -1) }, 1f), cell(paperLabel, 4f), cell(button("›") { stepSetting("paper", 1) }, 1f)),
+            gridRow(cell(filmToggle, 1.2f), cell(arrow("‹") { stepSetting("film", -1) }, 1f), cell(stockLabel, 4f), cell(arrow("›") { stepSetting("film", 1) }, 1f)),
+            gridRow(cell(printToggle, 1.2f), cell(arrow("‹") { stepSetting("paper", -1) }, 1f), cell(paperLabel, 4f), cell(arrow("›") { stepSetting("paper", 1) }, 1f)),
             gridRow(cell(lutToggle, 1.2f),
-                cell(button("‹") { stepLut(-1) }, 1f), cell(lutLabel, 4f), cell(button("›") { stepLut(1) }, 1f)),
+                cell(arrow("‹") { stepLut(-1) }, 1f), cell(lutLabel, 4f), cell(arrow("›") { stepLut(1) }, 1f)),
         )
         lensScroll = android.widget.HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -229,8 +250,8 @@ class CameraActivity : ComponentActivity() {
             textSize = 13f
             isSingleLine = false
             maxLines = 2
-            setBackgroundColor(0xcc000000.toInt())
-            setTextColor(0xffe0b060.toInt())
+            background = Style.surface(this@CameraActivity, fill = Style.SCRIM, radiusDp = 14f, stroke = Style.HAIRLINE)
+            setTextColor(Style.ACCENT)
             visibility = View.GONE
         }
         viewfinderFrame = ViewfinderFrame(this).apply {
@@ -268,6 +289,7 @@ class CameraActivity : ComponentActivity() {
     private fun attachLayout() {
         val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         fillControls(landscape)
+        if (provider != null) buildZoomButtons() // lens button widths follow the orientation
         (viewfinderFrame.parent as? android.view.ViewGroup)?.removeView(viewfinderFrame)
         (controls.parent as? android.view.ViewGroup)?.removeView(controls)
         viewfinderFrame.landscape = landscape
@@ -284,9 +306,9 @@ class CameraActivity : ComponentActivity() {
                 addView(android.widget.ScrollView(this@CameraActivity).apply {
                     isVerticalScrollBarEnabled = false
                     isFillViewport = true
-                    setBackgroundColor(0xff0c0c0c.toInt())
+                    setBackgroundColor(Style.BG)
                     addView(controls)
-                }, LinearLayout.LayoutParams(dp(280), -1))
+                }, LinearLayout.LayoutParams(landscapeColumnWidth(), -1))
                 addView(LinearLayout(this@CameraActivity).apply {
                     orientation = LinearLayout.VERTICAL
                     gravity = Gravity.CENTER_HORIZONTAL
@@ -295,16 +317,16 @@ class CameraActivity : ComponentActivity() {
                     addView(View(this@CameraActivity), LinearLayout.LayoutParams(1, 0, 1f))
                     addView(shutter, LinearLayout.LayoutParams(dp(72), dp(72)))
                     addView(View(this@CameraActivity), LinearLayout.LayoutParams(1, 0, 1f))
-                    addView(settingsButton, LinearLayout.LayoutParams(dp(64), dp(40)))
-                }, LinearLayout.LayoutParams(dp(96), -1))
+                    addView(settingsButton, LinearLayout.LayoutParams(dp(64), dp(36)))
+                }, LinearLayout.LayoutParams(dp(LANDSCAPE_RAIL_DP), -1))
             } else {
                 addView(finderHost, LinearLayout.LayoutParams(-1, 0, 1f))
                 addView(controls, LinearLayout.LayoutParams(-1, -2))
                 addView(gridRow(
-                    cell(thumbnail, 1f, dp(56)),
-                    cell(shutter, 1f, dp(68)),
-                    cell(settingsButton, 1f, dp(72), dp(40)),
-                    height = dp(84),
+                    cell(thumbnail, 1f, dp(52)),
+                    cell(shutter, 1f, dp(72)),
+                    cell(settingsButton, 1f, dp(68), dp(36)),
+                    height = dp(92),
                 ).apply { setPadding(dp(12), 0, dp(12), dp(4)) })
             }
             setOnApplyWindowInsetsListener { view, insets ->
@@ -324,26 +346,46 @@ class CameraActivity : ComponentActivity() {
     private fun fillControls(landscape: Boolean) {
         // Rows wrap each view in a fresh cell: release the views from the old ones.
         val shared = listOf(status, modeLabel, lensScroll, zoomLabel, facingButton, recipeSummary,
-            evMinus, evLabel, evPlus, hdrButton, focusButton, guideButton)
+            evMinus, evLabel, evPlus, modesSummary, hdrButton, flashButton, focusButton, guideButton)
         for (v in shared) (v.parent as? android.view.ViewGroup)?.removeView(v)
         controls.removeAllViews()
+        // narrower side margins in the landscape column
+        controls.setPadding(dp(if (landscape) 6 else 12), dp(6), dp(if (landscape) 6 else 12), dp(4))
         controls.apply {
-            addView(gridRow(cell(status, 1f), cell(modeLabel, 1f), height = dp(28)))
+            if (landscape) { // the column is narrow: status and mode get a line each
+                addView(gridRow(cell(status, 1f), height = dp(24)))
+                addView(gridRow(cell(modeLabel, 1f), height = dp(24)))
+            } else addView(gridRow(cell(status, 1f), cell(modeLabel, 1f), height = dp(28)))
             if (landscape) {
                 addView(gridRow(cell(lensScroll, 1f)))
-                addView(gridRow(cell(zoomLabel, 1f), cell(facingButton, 1f), cell(guideButton, 1f)))
+                addView(gridRow(cell(zoomLabel, 1f), cell(facingButton, 1f)))
             } else addView(gridRow(cell(lensScroll, 4f), cell(zoomLabel, 1f), cell(facingButton, 1f)))
             addView(gridRow(cell(recipeSummary, 1f)))
             recipeRows.forEach { addView(it) }
             if (landscape) {
                 addView(gridRow(cell(evMinus, 1f), cell(evLabel, 1.6f), cell(evPlus, 1f)))
-                addView(gridRow(cell(hdrButton, 1f), cell(focusButton, 1f)))
+                addView(gridRow(cell(modesSummary, 1f)))
             } else addView(gridRow(
-                cell(evMinus, 1f), cell(evLabel, 1.4f), cell(evPlus, 1f),
-                cell(hdrButton, 1.1f), cell(focusButton, 1.1f), cell(guideButton, 1.1f),
+                cell(evMinus, 1f), cell(evLabel, 1.4f), cell(evPlus, 1f), cell(modesSummary, 3.6f),
             ))
+            // The folded modes: one row of four, shown when the summary is opened.
+            modesRow = gridRow(cell(hdrButton, 1f), cell(flashButton, 1f), cell(focusButton, 1f), cell(guideButton, 1f))
+                .also { it.visibility = if (modesExpanded) View.VISIBLE else View.GONE; addView(it) }
             addView(mfRow)
         }
+    }
+
+    /**
+     * Landscape: the viewfinder gets the full height (4:3, so 4/3 of it in width) and the
+     * control column what is left beside it and the shutter rail, within 196-280 dp.
+     */
+    private fun landscapeColumnWidth(): Int {
+        val dm = resources.displayMetrics
+        val long = maxOf(dm.widthPixels, dm.heightPixels)
+        val short = minOf(dm.widthPixels, dm.heightPixels)
+        val finder = short * 4 / 3
+        val spare = long - finder - dp(LANDSCAPE_RAIL_DP) - dp(40) // cutout and gaps
+        return spare.coerceIn(dp(196), dp(280))
     }
 
     /** Full screen at the top: status bar hidden, swipe down to peek at it. */
@@ -743,7 +785,7 @@ class CameraActivity : ComponentActivity() {
         focusSeek.isEnabled = adjustable
         focusSeek.progress = (store[Settings.FOCUS_DISTANCE] * 1000).roundToInt()
         distanceLabel.text = if (adjustable) focusLabel() else "定焦镜头"
-        peakButton.alpha = if (store.flag(Settings.PEAKING)) 1f else 0.45f
+        Style.active(peakButton, store.flag(Settings.PEAKING))
         viewfinder.peaking = mode == 2 && store.flag(Settings.PEAKING)
     }
 
@@ -828,7 +870,9 @@ class CameraActivity : ComponentActivity() {
         options = lensOptions(provider)
         for (option in options) {
             val b = button(zoomText(option.ratio)) { selectLens(option) }
-            lensRow.addView(b, LinearLayout.LayoutParams(dp(52), dp(38)).apply { marginEnd = dp(4) })
+            // four lenses must fit the narrow landscape column
+            val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+            lensRow.addView(b, LinearLayout.LayoutParams(dp(if (landscape) 43 else 46), dp(36)).apply { marginEnd = dp(if (landscape) 1 else 2) })
             lensButtons += option to b
         }
         facingButton.text = if (front) "后置" else "前置"
@@ -861,7 +905,7 @@ class CameraActivity : ComponentActivity() {
         val active = mine.lastOrNull { it.first.zoom <= zoom * 1.01f } ?: mine.firstOrNull()
         val scale = active?.let { it.first.ratio / it.first.zoom } ?: 1f
         zoomLabel.text = zoomText(zoom * scale)
-        for ((option, b) in lensButtons) b.alpha = if (option === active?.first) 1f else 0.5f
+        for ((option, b) in lensButtons) Style.selected(b, option === active?.first)
     }
 
     private fun zoomText(ratio: Float) =
@@ -927,31 +971,52 @@ class CameraActivity : ComponentActivity() {
         val filmOn = store.flag(Settings.FILM_ON)
         val printOn = store.flag(Settings.PRINT_ON)
         val paper = FilmEngine.papers[store["paper"].toInt().coerceIn(0, FilmEngine.papers.lastIndex)]
-        filmToggle.alpha = if (filmOn) 1f else 0.45f
-        printToggle.alpha = if (filmOn && printOn) 1f else 0.45f
+        Style.active(filmToggle, filmOn)
+        Style.active(printToggle, filmOn && printOn)
         stockLabel.text = filmName()
-        stockLabel.alpha = if (filmOn) 1f else 0.45f
+        Style.enabled(stockLabel, filmOn)
         // Papers only matter when the negative is printed, not for a straight scan.
         paperLabel.text = paper
-        paperLabel.alpha = if (filmOn && printOn) 1f else 0.45f
+        Style.enabled(paperLabel, filmOn && printOn, Style.TEXT_2)
         val lut = currentLut()
         val chosen = chosenLut()
         lutLabel.text = if (chosen == 0) "无 LUT" else "${LutLibrary.name(chosen)} · %.0f%%".format(lut.second * 100)
-        lutToggle.alpha = if (lut.first != 0) 1f else 0.45f
-        lutLabel.alpha = if (lut.first != 0 || chosen == 0) 1f else 0.45f
-        recipeSummary.text = (if (recipeExpanded) "▴  " else "▾  ") +
+        Style.active(lutToggle, lut.first != 0)
+        Style.enabled(lutLabel, lut.first != 0 || chosen == 0, Style.TEXT_2)
+        recipeSummary.text = (if (recipeExpanded) "▴   " else "▾   ") +
             recipeText(filmOn, printOn, filmName(), paper, lut.first)
         for (row in recipeRows) row.visibility = if (recipeExpanded) View.VISIBLE else View.GONE
         val guides = store[Settings.GUIDES].toInt().coerceIn(0, Settings.guideNames.lastIndex)
         overlay.guides = guides
         guideButton.text = if (guides == 0) "网格" else Settings.guideNames[guides].take(2)
-        guideButton.alpha = if (guides == 0) 0.5f else 1f
+        Style.active(guideButton, guides != 0)
         meter?.let { applyHistogram(it) }
         evLabel.text = if (store.flag(Settings.MANUAL)) "手动" else "%+.1f EV".format(evStops)
-        val hdr = store.flag(Settings.HDR) && rawCapture
-        hdrButton.alpha = if (hdr) 1f else 0.45f
+        evLabel.setTextColor(if (store.flag(Settings.MANUAL) || evStops != 0.0) Style.ACCENT else Style.TEXT)
+        val flashMode = flashMode()
+        val hdr = store.flag(Settings.HDR) && rawCapture && flashMode == 0
+        Style.active(hdrButton, hdr)
+        flashButton.text = if (flashMode == 0) "闪关" else Settings.flashModes[flashMode]
+        Style.active(flashButton, flashMode != 0)
+        // Summary of the folded modes: what is on, plus the focus mode; the accent when
+        // HDR or the flash is on, as the buttons themselves show.
+        val modeParts = listOfNotNull(
+            if (hdr) "HDR" else null,
+            if (flashMode != 0) Settings.flashModes[flashMode] else null,
+            Settings.focusModes[focusMode()],
+            if (guides != 0) Settings.guideNames[guides].take(2) else null,
+        )
+        modesSummary.text = (if (modesExpanded) "▴   " else "▾   ") + modeParts.joinToString(" · ")
+        modesSummary.setTextColor(if (hdr || flashMode != 0) Style.ACCENT else Style.TEXT)
+        modesRow?.visibility = if (modesExpanded) View.VISIBLE else View.GONE
         modeLabel.text = buildString {
-            append(if (hdr) "HDR" else if (rawCapture) "RAW" else "JPEG")
+            if (flashMode != 0) append("闪光${Settings.flashModes[flashMode]}")
+            else if (hdr) {
+                // Same frame split as takePicture: shorts, plus one longer frame when bracketing.
+                val bracket = store[Settings.HDR_LONG] >= 0.1f
+                val shorts = store[Settings.HDR_FRAMES].toInt().coerceIn(2, if (bracket) 5 else 6)
+                append(if (bracket) "HDR 包围 $shorts+1" else "HDR $shorts 帧")
+            } else append(if (rawCapture) "RAW" else "JPEG")
             if (rawCapture && !store.flag(Settings.KEEP_RAW)) append("→JPG")
             if (store.flag(Settings.SOFT_3A)) append(" · 胶片测光")
             val wb = store[Settings.WHITE_BALANCE].toInt().coerceIn(0, Settings.whiteBalances.lastIndex)
@@ -964,8 +1029,23 @@ class CameraActivity : ComponentActivity() {
 
     // ----- capture ----------------------------------------------------------
 
+    /** A capture (single frame or burst) is running; the shutter waits for it. */
+    private var capturing = false
+
     private fun takePicture() {
         val capture = capture ?: return
+        if (capturing) {
+            status.text = "上一张还在拍摄…"
+            return
+        }
+        // A hold left on the sensor would make this shot meter from a frozen exposure.
+        exposure?.held?.let { stale ->
+            Log.w(TAG, "stale hold ${stale.label()} before a shot: released")
+            exposure?.release()
+            status.text = "曝光已恢复自动测光，请再按一次快门"
+            return
+        }
+        capturing = true
         shutter.animate().scaleX(0.85f).scaleY(0.85f).setDuration(70).withEndAction {
             shutter.animate().scaleX(1f).scaleY(1f).setDuration(120)
         }
@@ -983,14 +1063,95 @@ class CameraActivity : ComponentActivity() {
         // survive; merging cleans the shadows; the develop lifts them back) or the film ISO
         // re-splits the metered exposure. A held exposure needs a few frames to land.
         val controller = exposure
-        val hdr = rawCapture && store.flag(Settings.HDR)
+        // Flash: 1 is a real flash in one frame (the HAL meters it with a pre-flash); 2-4 mix
+        // an ambient frame and one lit by the flash LED, both held 1.5 stops under the meter.
+        val flashMode = flashMode()
+        val singleFlash = flashMode == 1
+        val flashPair = flashMode >= 2
+        val flashWhiteChoice = store[Settings.FLASH_WHITE].toInt()
+        // A single RAW flash with auto white: an ambient frame first, only to see where the
+        // flash lit (it steers a smooth white map; the pixels are the flash frame's).
+        val ambientNeutral = controller?.ambientNeutral
+        val flashNeutral = controller?.flashNeutral()
+        val whiteMap = if (singleFlash && rawCapture && flashWhiteChoice == 0 && ambientNeutral != null && flashNeutral != null)
+            floatArrayOf(*ambientNeutral, *flashNeutral) else null
+        val hdr = rawCapture && store.flag(Settings.HDR) && flashMode == 0
         val metered = controller?.live
-        val still = controller?.stillExposure(if (hdr) store[Settings.HDR_UNDER].toDouble() else 0.0)
-        if (still != null) controller.hold(still)
-        val release = { if (still != null) main.post { controller.release() } }
+        // 35 mm equivalent of the lens at the current zoom, for the photo's EXIF.
+        val focal35 = camera?.cameraInfo?.let { info ->
+            (equivalentMm(info) * (info.zoomState.value?.zoomRatio ?: 1f)).roundToInt().takeIf { it > 0 }
+        }
+        val under = when {
+            flashPair -> 1.5 // headroom for what the flash adds: a flash frame clipping loses its colour
+            hdr -> store[Settings.HDR_UNDER].toDouble()
+            else -> 0.0
+        }
+        // A single flash leaves the exposure to the HAL's flash metering: nothing is held.
+        val still = if (singleFlash) null else controller?.stillExposure(under, raw = rawCapture)
+        if (still != null) controller?.hold(still)
+        // Without an ambient frame first the flash is armed now, else just before its frame.
+        val armFlash = {
+            controller?.armFlash(true)
+            runCatching { capture.flashMode = ImageCapture.FLASH_MODE_ON }.onFailure { Log.w(TAG, "flash mode", it) }
+            Unit
+        }
+        if (singleFlash && whiteMap == null) armFlash()
+        // Exposure bracket: one longer frame after the short ones lifts the shadows; the
+        // merge brings it to the short frames' exposure and drops what it clipped.
+        val longStops = if (hdr) store[Settings.HDR_LONG].toDouble() else 0.0
+        // The flash mix: [ambient gain, flash target, flash->ambient white r g b].
+        val flashMix = if (flashPair && still != null) {
+            // Per light (auto), or one white for the whole frame: the flash's or the room's.
+            val white = (if (flashWhiteChoice == 0) controller?.flashWhite() else null) ?: floatArrayOf(1f, 1f, 1f)
+            when (flashMode) {
+                2 -> floatArrayOf(1f, 0.18f * store[Settings.FLASH_FILL], *white)            // fill
+                3 -> floatArrayOf(1f, 0.35f, *white)                                          // balanced
+                else -> floatArrayOf(Math.pow(2.0, -store[Settings.FLASH_UNDER].toDouble()).toFloat(), 0.35f, *white)
+            }
+        } else null
+        val bracketBase = still ?: metered
+        val longExposure = if (longStops >= 0.1 && bracketBase != null && controller != null)
+            controller.longExposure(bracketBase, longStops) else null
+        Log.i(TAG, "shot $stamp ${if (hdr) "hdr" else if (rawCapture) "raw" else "jpeg"} still ${still?.label() ?: "auto"}" +
+            " long ${longExposure?.label() ?: "-"} (${controller?.describe() ?: "no meter"})")
+        // The photo's record: camera, capture plan, live exposure / white balance / focus,
+        // recipe and every setting at the shot; the develop and the result are added later.
+        val log = ShotLog()
+        log.put("拍摄", "时间", stamp)
+        log.put("拍摄", "格式", if (rawCapture) "RAW（DNG）冲洗" else "JPEG 冲洗")
+        log.put("拍摄", "模式", when {
+            singleFlash -> "单张闪光"
+            flashPair -> "闪光${Settings.flashModes[flashMode]}（两帧合成）"
+            hdr -> "HDR"
+            else -> "普通"
+        })
+        log.put("拍摄", "拍摄前压暗", if (under > 0) "%.1f 档".format(Locale.US, under) else "无")
+        log.put("拍摄", "锁定曝光", still?.label() ?: "无（自动曝光）")
+        log.put("拍摄", "长曝光帧", longExposure?.label())
+        log.put("拍摄", "取景器亮度 key", meter?.key)
+        recordCamera(log, focal35)
+        controller?.record(log)
+        recordRecipe(log, recipe)
+        val release = {
+            main.post {
+                capturing = false
+                if (singleFlash) runCatching { capture.flashMode = ImageCapture.FLASH_MODE_OFF }
+                if (still != null || longExposure != null || singleFlash) controller?.release()
+            }
+        }
         val settle = if (still != null) 250L else 0L
         if (rawCapture) {
-            val count = if (hdr) store[Settings.HDR_FRAMES].toInt().coerceIn(2, 6) else 1
+            val shorts = when {
+                whiteMap != null -> 1 // the ambient frame; the flash frame follows
+                flashMix != null -> 1 // one ambient frame: the less time between the two, the less ghosting
+                hdr -> store[Settings.HDR_FRAMES].toInt().coerceIn(2, if (longExposure != null) 5 else 6)
+                else -> 1
+            }
+            val count = shorts + if (longExposure != null || flashMix != null || whiteMap != null) 1 else 0
+            val flashFrame = if (whiteMap != null) count - 1 else -1
+            val developed = if (whiteMap != null) count - 1 else 0 // the frame whose pixels are kept
+            val exposures = List<Exposure?>(shorts) { null } + listOfNotNull(longExposure ?: if (flashMix != null) still else null)
+            val torchFrame = if (flashMix != null) count - 1 else -1
             val keepRaw = store.flag(Settings.KEEP_RAW)
             val files = (0 until count).map { File(cacheDir, "FILM_${stamp}_$it.dng") }
             // The viewfinder's brightness at the shot: the develop matches it, which also
@@ -998,12 +1159,51 @@ class CameraActivity : ComponentActivity() {
             val key = meter?.key ?: 0f
             val pushBack = if (still != null && metered != null)
                 (Math.log(metered.total / still.total) / Math.log(2.0)).toFloat() else 0f
+            // The DNG headers CameraX writes repeat an old capture result (exposure, white
+            // balance, noise model); take them from the live camera state at the shot instead.
+            // A single flash: its exposure and colour are the flash's (HAL-metered); the
+            // white is the calibrated flash light, the noise model the file's own.
+            val (neutral, noiseS, noiseO) = when {
+                singleFlash -> Triple(if (flashWhiteChoice == 2) ambientNeutral else flashNeutral, 0f, 0f)
+                flashPair && flashWhiteChoice == 1 -> Triple(flashNeutral, 0f, 0f).let { (n, _, _) ->
+                    val m = controller?.stillMetadata(still); Triple(n ?: m?.first, m?.second ?: 0f, m?.third ?: 0f)
+                }
+                else -> controller?.stillMetadata(still) ?: Triple(null, 0f, 0f)
+            }
             val developOptions = options.copy(
-                exposureEv = rawEv + if (key > 0f) 0f else pushBack,
-                matchKey = key,
+                exposureEv = rawEv + if (key > 0f || singleFlash) 0f else pushBack,
+                // a flash frame is brighter than the viewfinder showed: keep the HAL's exposure
+                matchKey = if (singleFlash) 0f else key,
+                localTone = if (hdr) store[Settings.HDR_TONE] else 0f,
+                chromaDenoise = store[Settings.CHROMA_NR],
+                rawDenoise = store[Settings.RAW_DENOISE],
+                neutral = neutral,
+                noiseScale = noiseS,
+                noiseOffset = noiseO,
+                flash = flashMix,
+                flashWhite = whiteMap,
             )
+            for (i in 0 until count) {
+                val what = when (i) {
+                    torchFrame -> "闪光帧（LED 常亮），锁定 ${exposures.getOrNull(i)?.label() ?: still?.label() ?: "自动"}"
+                    flashFrame -> "闪光帧（真闪光，曝光由手机预闪测光决定）"
+                    else -> exposures.getOrNull(i)?.label()?.let { "锁定 $it" } ?: still?.label()?.let { "锁定 $it" } ?: "自动曝光"
+                }
+                log.put("每帧（拍摄计划）", "帧 $i", what + if (i == developed) "（成片取自这一帧）" else "")
+            }
+            val dev = "冲洗参数（传给引擎）"
+            log.put(dev, "曝光补偿 (RAW EV)", "%+.2f EV".format(Locale.US, developOptions.exposureEv))
+            log.put(dev, "对齐取景器亮度", if (developOptions.matchKey > 0) "%.5f".format(Locale.US, developOptions.matchKey) else "不对齐")
+            log.put(dev, "白平衡中性点", developOptions.neutral ?: "用 DNG 自带")
+            log.put(dev, "噪声模型 (s o)", if (developOptions.noiseScale > 0) "%.4g %.4g".format(Locale.US, developOptions.noiseScale, developOptions.noiseOffset) else "用 DNG 自带")
+            log.put(dev, "RAW 降噪 / 彩色降噪", "%.2f / %.2f".format(Locale.US, developOptions.rawDenoise, developOptions.chromaDenoise))
+            log.put(dev, "HDR 影调压缩", developOptions.localTone)
+            log.put(dev, "闪光合成 [环境增益 目标 白R G B]", developOptions.flash)
+            log.put(dev, "分区白平衡 [环境R G B 闪光R G B]", developOptions.flashWhite)
+            log.put(dev, "工作尺寸长边", developOptions.maxLongEdge)
+            log.put(dev, "颗粒种子", developOptions.seed)
             val shoot = {
-                captureBurst(capture, files, 0) { error ->
+                captureBurst(capture, files, exposures, 0, torchFrame, flashFrame, armFlash) { error ->
                     release()
                     if (error != null) {
                         files.forEach { it.delete() }
@@ -1011,10 +1211,29 @@ class CameraActivity : ComponentActivity() {
                         return@captureBurst
                     }
                     engineThread.execute {
-                        finish(stamp, recipe, quality, if (count > 1) "HDR $count 帧" else "RAW") {
+                        // What each frame really got, against what was asked (the diagnosis
+                        // for exposures that do not land).
+                        Log.i(TAG, "shot $stamp metadata neutral ${neutral?.joinToString(" ") ?: "dng"} noise $noiseS $noiseO")
+                        // Shooting data from the reference DNG (and the long frame's exposure).
+                        // Lens data from the DNG; the exposure from what was held or metered.
+                        val taken = still ?: metered
+                        val shot = ShotInfo.fromDng(files[developed].path)?.let {
+                            // a flash frame's exposure is the HAL's own and unknown here
+                            if (singleFlash) it.copy(focal35 = it.focal35 ?: focal35, exposureNs = null, iso = null)
+                            else it.copy(focal35 = it.focal35 ?: focal35,
+                                exposureNs = taken?.timeNs ?: it.exposureNs, iso = taken?.iso ?: it.iso)
+                        }
+                        val kind = when {
+                            singleFlash -> if (whiteMap != null) "闪光 · 分区白平衡" else "闪光"
+                            flashMix != null -> "闪光${Settings.flashModes[flashMode]}"
+                            longExposure != null -> "HDR 包围 $shorts+1 帧 · 长曝光 ${longExposure.label().replace("ISO", "· ISO")}" 
+                            count > 1 -> "HDR $count 帧"
+                            else -> "RAW"
+                        }
+                        finish(stamp, recipe, quality, kind, shot, log) {
                             try {
                                 engine().developDng(files.map { it.path }, params, developOptions).also {
-                                    if (keepRaw) Photos.saveDng(this@CameraActivity, files[0], "FILM_$stamp.dng")
+                                    if (keepRaw) Photos.saveDng(this@CameraActivity, files[developed], "FILM_$stamp.dng")
                                 }
                             } finally {
                                 files.forEach { it.delete() }
@@ -1029,7 +1248,10 @@ class CameraActivity : ComponentActivity() {
                 capture.takePicture(engineThread, object : ImageCapture.OnImageCapturedCallback() {
                     override fun onCaptureSuccess(image: ImageProxy) {
                         release()
-                        finish(stamp, recipe, quality, "JPEG") { engine().develop(upright(image), params, options) }
+                        val shot = jpegShot(image)?.let { it.copy(focal35 = it.focal35 ?: focal35) }
+                        finish(stamp, recipe, quality, if (singleFlash) "JPEG · 闪光" else "JPEG", shot, log) {
+                            engine().develop(upright(image), params, options)
+                        }
                     }
                     override fun onError(exception: ImageCaptureException) {
                         release()
@@ -1040,18 +1262,112 @@ class CameraActivity : ComponentActivity() {
         }
     }
 
-    /** Captures DNGs one after another into [files], then reports (null = success). */
-    private fun captureBurst(capture: ImageCapture, files: List<File>, index: Int, done: (ImageCaptureException?) -> Unit) {
+    /**
+     * Captures DNGs one after another into [files], then reports (null = success). A
+     * non-null [exposures] entry is held on the sensor first, and the frame is taken once
+     * the viewfinder reports it (or after a timeout).
+     */
+    private fun captureBurst(capture: ImageCapture, files: List<File>, exposures: List<Exposure?>, index: Int,
+                             torchFrame: Int, flashFrame: Int = -1, armFlash: () -> Unit = {},
+                             done: (ImageCaptureException?) -> Unit) {
+        if (index == flashFrame) armFlash()
         if (index >= files.size) return done(null)
-        if (files.size > 1) status.text = "HDR 连拍 ${index + 1}/${files.size}…"
-        capture.takePicture(ImageCapture.OutputFileOptions.Builder(files[index]).build(), mainExecutor,
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(result: ImageCapture.OutputFileResults) = captureBurst(capture, files, index + 1, done)
-                override fun onError(exception: ImageCaptureException) = done(exception)
-            })
+        if (files.size > 1) status.text = (if (torchFrame >= 0) "闪光 " else "HDR 连拍 ") + "${index + 1}/${files.size}…"
+        val shoot = {
+            capture.takePicture(ImageCapture.OutputFileOptions.Builder(files[index]).build(), mainExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                        if (index == torchFrame) exposure?.lightTorch(false)
+                        captureBurst(capture, files, exposures, index + 1, torchFrame, flashFrame, armFlash, done)
+                    }
+                    override fun onError(exception: ImageCaptureException) = done(exception)
+                })
+        }
+        val target = exposures.getOrNull(index)
+        val controller = exposure
+        if (target == null || controller == null) return shoot()
+        if (index == torchFrame) {
+            // The LED needs a couple of frames to light fully at the held exposure.
+            controller.lightTorch(true)
+            main.postDelayed(shoot, 200 + 2 * target.timeNs / 1_000_000)
+            return
+        }
+        controller.hold(target)
+        // A few frames at the new exposure: the time it takes to land plus margin.
+        val deadline = SystemClock.uptimeMillis() + 400 + 4 * target.timeNs / 1_000_000
+        awaitExposure(controller, target, deadline, shoot)
+    }
+
+    private fun awaitExposure(controller: FilmExposure, target: Exposure, deadline: Long, then: () -> Unit) {
+        val live = controller.live
+        val landed = live != null && abs(live.timeNs - target.timeNs) <= target.timeNs / 20 &&
+            abs(live.iso - target.iso) <= target.iso / 20 + 1
+        if (landed) main.postDelayed(then, 2 * target.timeNs / 1_000_000 + 30) // one more frame for the still
+        else if (SystemClock.uptimeMillis() >= deadline) then()
+        else main.postDelayed({ awaitExposure(controller, target, deadline, then) }, 20)
+    }
+
+    /** The flash mode in use: 0 off; a lens with a flash; the mixed modes (2-4) need RAW. */
+    private fun flashMode(): Int {
+        if (exposure?.hasFlash != true) return 0
+        val mode = store[Settings.FLASH].toInt().coerceIn(0, Settings.flashModes.lastIndex)
+        return if (mode >= 2 && !rawCapture) 0 else mode
     }
 
     private fun engine() = checkNotNull(engine) { "引擎未就绪" }
+
+    /** The phone, the lens in use and its sensor, into a photo's record. */
+    private fun recordCamera(log: ShotLog, focal35: Int?) {
+        val sec = "相机与镜头"
+        log.put(sec, "手机", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}（${android.os.Build.DEVICE}）")
+        log.put(sec, "Android", "${android.os.Build.VERSION.RELEASE}（API ${android.os.Build.VERSION.SDK_INT}）")
+        log.put(sec, "应用版本", runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull())
+        val info = camera?.cameraInfo ?: return
+        val c = Camera2CameraInfo.from(info)
+        fun <T> ch(key: CameraCharacteristics.Key<T>): T? = runCatching { c.getCameraCharacteristic(key) }.getOrNull()
+        log.put(sec, "摄像头 ID", c.cameraId)
+        log.put(sec, "朝向", when (ch(CameraCharacteristics.LENS_FACING)) { 0 -> "前置"; 1 -> "后置"; 2 -> "外接"; else -> "?" })
+        log.put(sec, "镜头按钮", zoomLabel.text)
+        log.put(sec, "变焦倍数", info.zoomState.value?.zoomRatio)
+        log.put(sec, "焦距（可用）", ch(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString(" ") { "%.2f mm".format(Locale.US, it) })
+        log.put(sec, "等效焦距（当前变焦）", focal35?.let { "$it mm" })
+        log.put(sec, "光圈（可用）", ch(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.joinToString(" ") { "f/%.2f".format(Locale.US, it) })
+        log.put(sec, "传感器物理尺寸", ch(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.let { "%.2f × %.2f mm".format(Locale.US, it.width, it.height) })
+        log.put(sec, "像素阵列 / 有效区域", "${ch(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)} / ${ch(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.flattenToString()}")
+        log.put(sec, "传感器白电平", ch(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL))
+        log.put(sec, "CFA 排列", when (ch(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)) {
+            0 -> "RGGB"; 1 -> "GRBG"; 2 -> "GBRG"; 3 -> "BGGR"; 4 -> "RGB"; 5 -> "单色"; 6 -> "NIR"; else -> "?" })
+        log.put(sec, "硬件级别", when (ch(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
+            0 -> "LIMITED"; 1 -> "FULL"; 2 -> "LEGACY"; 3 -> "LEVEL_3"; 4 -> "EXTERNAL"; else -> "?" })
+        log.put(sec, "最短对焦距离", ch(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)?.let { if (it > 0) "%.2f m".format(Locale.US, 1 / it) else "定焦" })
+    }
+
+    /** The film recipe and every setting at the shot. */
+    private fun recordRecipe(log: ShotLog, recipe: Map<String, Float>) {
+        val sec = "胶片配方"
+        val filmOn = recipe["stage film"] != 0f
+        log.put(sec, "胶片", if (filmOn) FilmEngine.filmStocks.getOrNull(recipe["film"]?.toInt() ?: -1) else "关（直出）")
+        log.put(sec, "相纸", if (recipe["stage print"] != 0f) FilmEngine.papers.getOrNull(recipe["paper"]?.toInt() ?: -1) else "关（直接扫描）")
+        log.put(sec, "LUT", "编号 ${(recipe[LUT_KEY] ?: 0f).toInt()}（0 = 无），强度 %.2f".format(Locale.US, recipe[LUT_STRENGTH_KEY] ?: 0f))
+        for ((k, v) in recipe) if (k != LUT_KEY && k != LUT_STRENGTH_KEY) log.put("胶片参数（引擎）", k, "%.4g".format(Locale.US, v))
+        for (setting in Settings.all) {
+            val v = store[setting.key]
+            val text = when (setting) {
+                is Setting.Toggle -> if (v >= 0.5f) "开" else "关"
+                is Setting.Slider -> setting.format.format(Locale.US, v)
+                is Setting.Choice -> setting.options.getOrElse(v.toInt()) { "%.0f".format(Locale.US, v) }
+            }
+            log.put("全部设置", "[${setting.group}] ${setting.label}", text)
+        }
+    }
+
+    /** EXIF of a JPEG still, before it is decoded. */
+    private fun jpegShot(image: ImageProxy): ShotInfo? {
+        if (image.format != ImageFormat.JPEG) return null
+        val buffer = image.planes[0].buffer.duplicate()
+        val bytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
+        return ShotInfo.fromStream(ByteArrayInputStream(bytes))
+    }
 
     private fun upright(image: ImageProxy): Bitmap {
         val rotation = image.imageInfo.rotationDegrees
@@ -1061,7 +1377,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     // Engine thread: develop, save, report.
-    private fun finish(stamp: String, recipe: Map<String, Float>, quality: Int, source: String, develop: () -> Developed) {
+    private fun finish(stamp: String, recipe: Map<String, Float>, quality: Int, source: String, shot: ShotInfo?,
+                       log: ShotLog?, develop: () -> Developed) {
         val start = System.nanoTime()
         val message = try {
             // The creative LUT chosen at the shot (the engine may have moved on since).
@@ -1074,7 +1391,28 @@ class CameraActivity : ComponentActivity() {
             val paper = FilmEngine.papers[recipe.getValue("paper").toInt().coerceIn(0, FilmEngine.papers.lastIndex)]
             // What the gallery shows as the photo's recipe.
             val text = recipeText(filmOn, recipe["stage print"] != 0f, stock, paper, lut.first)
-            Photos.saveJpeg(this, developed.bitmap, name, quality, "$text · $source")
+            Photos.saveJpeg(this, developed.bitmap, name, quality, "$text · $source", shot)
+            if (log != null) {
+                log.put("拍摄", "类型", source)
+                log.put("胶片配方", "配方", text)
+                log.putEngine(developed.info)
+                val res = "冲洗结果"
+                log.put(res, "文件", name)
+                log.put(res, "成片尺寸", "${developed.bitmap.width}x${developed.bitmap.height}")
+                log.put(res, "JPEG 质量", quality)
+                log.put(res, "冲洗用时", "%.2f 秒".format(Locale.US, (System.nanoTime() - start) / 1e9))
+                log.put(res, "GPU 时间", "%.1f ms".format(Locale.US, developed.gpuMs))
+                log.put(res, "GPU", runCatching { engine().deviceName }.getOrNull())
+                shot?.let {
+                    val exif = "写入照片的 EXIF"
+                    log.put(exif, "快门", it.shutterText ?: "未写入")
+                    log.put(exif, "ISO", it.iso ?: "未写入")
+                    log.put(exif, "光圈", it.fNumber?.let { f -> "f/%.2f".format(Locale.US, f) })
+                    log.put(exif, "焦距 / 等效", "${it.focalMm?.let { f -> "%.2f mm".format(Locale.US, f) }} / ${it.focal35?.let { f -> "$f mm" }}")
+                    log.put(exif, "机型", listOfNotNull(it.make, it.model).joinToString(" "))
+                }
+                log.save(this, name)
+            }
             val bitmap = developed.bitmap
             val thumb = Bitmap.createScaledBitmap(bitmap, 300, 300 * bitmap.height / bitmap.width, true)
             runOnUiThread { thumbnail.setImageBitmap(thumb) }
@@ -1109,8 +1447,15 @@ class CameraActivity : ComponentActivity() {
 
     private fun label(size: Float) = TextView(this).apply {
         textSize = size
-        setTextColor(0xffdddddd.toInt())
+        setTextColor(Style.TEXT)
         gravity = Gravity.CENTER_VERTICAL
+        Style.numeric(this)
+    }
+
+    /** A step arrow: a bare glyph, no fill. */
+    private fun arrow(text: String, onClick: () -> Unit) = button(text, onClick).apply {
+        Style.textButton(this, 18f)
+        setTextColor(Style.TEXT_2)
     }
 
     // Compact buttons: the platform default (48dp tall, 88dp wide) overflows the controls.
@@ -1124,6 +1469,7 @@ class CameraActivity : ComponentActivity() {
         minWidth = 0
         minimumWidth = 0
         setPadding(0, 0, 0, 0)
+        Style.button(this)
         setOnClickListener { onClick() }
     }
 
@@ -1146,6 +1492,7 @@ class CameraActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "FilmCamera"
+        private const val LANDSCAPE_RAIL_DP = 88
         // Recipe-only entries next to the engine parameters (never sent to the engine).
         private const val LUT_KEY = "app.lut"
         private const val LUT_STRENGTH_KEY = "app.lutstrength"

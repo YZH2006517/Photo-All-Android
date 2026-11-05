@@ -1,0 +1,54 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+// Adapted from vkdt denoise/doub.comp (c) johannes hanika, BSD 2-Clause; see README.md.
+// The finest band on the full mosaic: each sample against the noisy and the denoised
+// half-size image, soft shrinkage, written as integers (value * scale) for the raw pass.
+#include "localsize.h"
+#include "dn_noise.glsl"
+layout(local_size_x = DT_LOCAL_SIZE_X, local_size_y = DT_LOCAL_SIZE_Y, local_size_z = 1) in;
+layout(push_constant) uniform push_t
+{
+  vec4  black;    // per 2x2 position, code values of the input
+  float white;
+  float noise_a;
+  float noise_b;
+  float strength;
+  ivec4 cfa;      // colour (0 r, 1 g, 2 b) per 2x2 position
+  float luma;
+  float detail;   // 0 protects detail fully, 1 not at all
+  float scale;    // output code value for 1.0
+  float pad;
+} push;
+layout(set = 1, binding = 0) uniform usampler2D img_in; // input mosaic
+layout(set = 1, binding = 1) uniform sampler2D img_crs0; // denoised coarse
+layout(set = 1, binding = 2) uniform sampler2D img_crs1; // noisy coarse from input
+layout(set = 1, binding = 3, r32ui) uniform writeonly uimage2D img_out;
+
+void main()
+{
+  ivec2 ipos = ivec2(gl_GlobalInvocationID);
+  if(any(greaterThanEqual(ipos, imageSize(img_out)))) return;
+
+  // denoised and noisy coarse image by bilinear interpolation
+  vec4 upsm = texture(img_crs0, (ipos + 0.5) / vec2(imageSize(img_out)));
+  vec4 down = texture(img_crs1, (ipos + 0.5) / vec2(imageSize(img_out)));
+
+  int position = (ipos.x & 1) + 2 * (ipos.y & 1);
+  int colour = push.cfa[position];
+  float crs = upsm[colour], crs1 = down[colour];
+  float T = 0.5 * push.strength * upsm.w;
+  float blendw = colour == 1 ? push.luma : 1.0;
+  const vec3 sigma = noise_sigma(push.noise_a, push.noise_b, crs);
+  float val = (float(texelFetch(img_in, ipos, 0).r) - push.black[position]) / (push.white - push.black[position]);
+
+  blendw = 0.5 * (blendw + 1.0);
+  if(val < 1.0)
+  {
+    float wav = (val - crs1) / max(sigma.r + sigma.b, 1e-8);
+    float tt = min(1.0, wav / max(2.0 * T, 1e-8));
+    upsm.w = pow(min(1.0, upsm.w), 4.0);
+    upsm.w = 1.0 - (1.0 - upsm.w) * push.detail; // 0: protect full, 1: protect nothing
+    val = mix(val, max(0.0, crs + sigma.g * sign(wav) * mix(max(0.0, abs(wav) - T), abs(wav), tt)), upsm.w * blendw);
+  }
+  imageStore(img_out, ipos, uvec4(uint(clamp(val, 0.0, 1.0) * push.scale + 0.5)));
+}

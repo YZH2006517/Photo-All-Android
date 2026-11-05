@@ -1,9 +1,14 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
-// HDR+-style robust burst merge in the Bayer domain. Each frame is shifted by its
-// tile offset (even pixels, CFA phase kept) and weighted by how well a same-colour
-// 3x3 mean agrees with the reference, relative to the sensor noise:
-// w = c s^2 / (c s^2 + d^2), the spatial-domain form of HDR+'s merge weight.
+// HDR+-style robust burst merge in the Bayer domain, also for exposure brackets.
+// Each frame is shifted by its tile offset (even pixels, CFA phase kept) and scaled by
+// its gain to the reference's exposure. Its weight is the product of
+//  - robustness: how well a same-colour 3x3 mean agrees with the reference, relative
+//    to the noise of both, w = c s^2 / (c s^2 + d^2) (HDR+'s merge weight, spatially),
+//  - noise: inverse variance at the reference's exposure relative to the reference's
+//    own (1 for equal exposures, about 1/gain for a longer exposure),
+//  - clipping: faded out where any of the 3x3 samples nears that frame's white.
+// The result is in the reference's exposure, so highlights end where the reference clips.
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 1, binding = 0) uniform usampler2D f0;
 layout(set = 1, binding = 1) uniform usampler2D f1;
@@ -24,7 +29,17 @@ layout(push_constant) uniform push_t
   int   tiles_x;
   int   tiles_y;
   int   tile;
+  vec4  gain0;      // frames 0..3: multiplier to the reference's exposure
+  vec2  gain1;      // frames 4..5
+  float scale;      // output code value for 1.0
+  float pad;
 } push;
+
+float gain(int i)
+{
+  if(i < 4) return push.gain0[i];
+  return push.gain1[i - 4];
+}
 
 ivec2 size;
 
@@ -47,12 +62,22 @@ float sample_frame(int i, ivec2 p)
   return norm(v, p);
 }
 
-float local_mean(int i, ivec2 p)
+// Mean and maximum over the 3x3 Bayer quads around p's quad, all colours together
+// (36 samples). Every pixel of a quad gets the same statistics and so the same merge
+// weight: weighting colours separately would mix R, G and B from different frames in
+// different proportions, which turns into colour noise after demosaicing.
+vec2 quad_stats(int i, ivec2 p)
 {
-  float s = 0.0;
-  [[unroll]] for(int y = -2; y <= 2; y += 2)
-    [[unroll]] for(int x = -2; x <= 2; x += 2) s += sample_frame(i, p + ivec2(x, y));
-  return s / 9.0;
+  ivec2 q0 = p & ~1;
+  float s = 0.0, m = 0.0;
+  [[unroll]] for(int y = -2; y <= 3; y++)
+    [[unroll]] for(int x = -2; x <= 3; x++)
+    {
+      float v = sample_frame(i, q0 + ivec2(x, y));
+      s += v;
+      m = max(m, v);
+    }
+  return vec2(s / 36.0, m);
 }
 
 void main()
@@ -62,9 +87,9 @@ void main()
   if(any(greaterThanEqual(p, size))) return;
 
   float reference = sample_frame(0, p);
-  float reference_mean = local_mean(0, p);
-  // Difference of two 9-sample means of independent frames.
-  float sigma2 = max(push.noise_s * max(reference_mean, 0.0) + push.noise_o, 1e-8) * (2.0 / 9.0);
+  float reference_mean = quad_stats(0, p).x;
+  float x = max(reference_mean, 0.0);
+  float var_ref = max(push.noise_s * x + push.noise_o, 1e-10);
   ivec2 t = min(p / push.tile, ivec2(push.tiles_x, push.tiles_y) - 1);
   int tile_index = t.y * push.tiles_x + t.x;
 
@@ -74,11 +99,21 @@ void main()
   {
     if(i >= push.frames) break;
     ivec2 q = p + offsets[i * push.tiles_x * push.tiles_y + tile_index];
-    float d = local_mean(i, q) - reference_mean;
-    float w = push.strength * sigma2 / (push.strength * sigma2 + d * d);
-    sum += w * sample_frame(i, q);
+    float g = gain(i);
+    vec2 st = quad_stats(i, q);
+    // Equal exposures clip together, so only a longer frame needs the fade.
+    float unclipped = g < 0.97 ? 1.0 - smoothstep(0.85, 0.95, st.y) : 1.0;
+    if(unclipped <= 0.0) continue;
+    // Frame i's noise at the reference's exposure: g^2 var(x / g).
+    float var_i = max(g * push.noise_s * x + g * g * push.noise_o, 1e-10);
+    // Difference of two 36-sample means of independent frames.
+    float sigma2 = (var_ref + var_i) / 36.0;
+    float d = g * st.x - reference_mean;
+    float robust = push.strength * sigma2 / (push.strength * sigma2 + d * d);
+    float w = robust * unclipped * (var_ref / var_i);
+    sum += w * g * sample_frame(i, q);
     weight += w;
   }
   float merged = clamp(sum / weight, 0.0, 1.0);
-  imageStore(img_out, p, uvec4(uint(merged * 65535.0 + 0.5)));
+  imageStore(img_out, p, uvec4(uint(merged * push.scale + 0.5)));
 }
