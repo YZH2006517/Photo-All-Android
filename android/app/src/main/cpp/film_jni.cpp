@@ -4,12 +4,14 @@
 #include <android/log.h>
 #include <jni.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "film_engine.h"
@@ -78,6 +80,42 @@ bool read_params(JNIEnv *env, jobjectArray names, jfloatArray values, film::Film
 } // namespace
 
 extern "C" {
+
+// Native byte buffers for DNGs written in memory: outside the Java heap (a burst is
+// ~25 MB a frame), freed explicitly.
+JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_bufferCreate(JNIEnv *, jclass, jlong capacity)
+{
+  auto *b = new std::vector<uint8_t>();
+  b->reserve(static_cast<size_t>(capacity));
+  return reinterpret_cast<jlong>(b);
+}
+
+JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferWrite(JNIEnv *env, jclass, jlong handle,
+                                                                             jbyteArray data, jint offset, jint length)
+{
+  auto *b = reinterpret_cast<std::vector<uint8_t> *>(handle);
+  const size_t at = b->size();
+  b->resize(at + static_cast<size_t>(length));
+  env->GetByteArrayRegion(data, offset, length, reinterpret_cast<jbyte *>(b->data() + at));
+}
+
+JNIEXPORT jboolean JNICALL Java_org_photoall_film_engine_FilmNative_bufferSave(JNIEnv *env, jclass, jlong handle,
+                                                                                jstring path)
+{
+  auto *b = reinterpret_cast<std::vector<uint8_t> *>(handle);
+  const char *chars = env->GetStringUTFChars(path, nullptr);
+  FILE *f = std::fopen(chars, "wb");
+  env->ReleaseStringUTFChars(path, chars);
+  if(!f) return JNI_FALSE;
+  const bool ok = std::fwrite(b->data(), 1, b->size(), f) == b->size();
+  std::fclose(f);
+  return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferRelease(JNIEnv *, jclass, jlong handle)
+{
+  delete reinterpret_cast<std::vector<uint8_t> *>(handle);
+}
 
 JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *env, jclass, jobject asset_manager)
 {
@@ -183,14 +221,17 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_develop(
   return result;
 }
 
-// Develops one DNG, or a burst of DNGs merged HDR+-style (first = reference).
+// Develops one DNG, or a burst of DNGs merged HDR+-style (first = reference). Each
+// source is a file path (String) or a direct ByteBuffer holding the DNG up to its limit
+// (frames written in memory, no file in between). frame_exposure: the frames' relative
+// exposures as asked of the camera, or null.
 // Returns {width, height, passes, peak bytes, gpu us, TIFF orientation}.
 JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng(
     JNIEnv *env, jclass, jlong handle_value, jobjectArray paths, jobjectArray names, jfloatArray values,
     jint max_long_edge, jfloat exposure_ev, jint seed, jboolean output_p3, jfloat match_key, jfloat local_tone,
     jfloat chroma_denoise, jfloat raw_denoise,
     jfloatArray neutral_override, jfloat noise_s, jfloat noise_o, jfloatArray flash_mix,
-    jfloatArray flash_white)
+    jfloatArray flash_white, jfloatArray frame_exposure)
 {
   Handle *handle = handle_of(handle_value);
   film::FilmParams params;
@@ -202,31 +243,71 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
   const bool has_neutral = neutral_override && env->GetArrayLength(neutral_override) == 3;
   if(has_neutral) env->GetFloatArrayRegion(neutral_override, 0, 3, neutral);
   const jsize count = env->GetArrayLength(paths);
+  const auto parse_start = std::chrono::steady_clock::now();
   std::vector<film::RawImage> raws(static_cast<size_t>(count));
   std::string error;
+  jclass string_class = env->FindClass("java/lang/String");
+  jclass long_class = env->FindClass("java/lang/Long");
+  jmethodID long_value = env->GetMethodID(long_class, "longValue", "()J");
+  jclass buffer_class = env->FindClass("java/nio/Buffer");
+  jmethodID limit = env->GetMethodID(buffer_class, "limit", "()I");
+  // Where each DNG is (a file read into memory, a native buffer or a direct ByteBuffer),
+  // then the frames parsed on several threads at once.
+  std::vector<std::vector<uint8_t>> files(static_cast<size_t>(count));
+  std::vector<const uint8_t *> datas(static_cast<size_t>(count), nullptr);
+  std::vector<size_t> sizes(static_cast<size_t>(count), 0);
   for(jsize i = 0; i < count && error.empty(); i++)
   {
-    auto path = static_cast<jstring>(env->GetObjectArrayElement(paths, i));
-    const char *chars = env->GetStringUTFChars(path, nullptr);
-    const std::string file = chars;
-    env->ReleaseStringUTFChars(path, chars);
-    env->DeleteLocalRef(path);
-    std::vector<uint8_t> bytes;
-    if(FILE *f = std::fopen(file.c_str(), "rb"))
+    jobject item = env->GetObjectArrayElement(paths, i);
+    if(env->IsInstanceOf(item, string_class))
     {
-      std::fseek(f, 0, SEEK_END);
-      bytes.resize(static_cast<size_t>(std::ftell(f)));
-      std::fseek(f, 0, SEEK_SET);
-      if(std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-      std::fclose(f);
+      auto path = static_cast<jstring>(item);
+      const char *chars = env->GetStringUTFChars(path, nullptr);
+      const std::string file = chars;
+      env->ReleaseStringUTFChars(path, chars);
+      std::vector<uint8_t> &bytes = files[i];
+      if(FILE *f = std::fopen(file.c_str(), "rb"))
+      {
+        std::fseek(f, 0, SEEK_END);
+        bytes.resize(static_cast<size_t>(std::ftell(f)));
+        std::fseek(f, 0, SEEK_SET);
+        if(std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
+        std::fclose(f);
+      }
+      if(bytes.empty()) error = "cannot read " + file;
+      datas[i] = bytes.data();
+      sizes[i] = bytes.size();
     }
-    if(bytes.empty()) error = "cannot read " + file;
-    else if(film::parse_dng(bytes.data(), bytes.size(), raws[i], error, has_neutral ? neutral : nullptr) &&
-            noise_s > 0.0f)
+    else if(env->IsInstanceOf(item, long_class))
+    { // a native buffer (bufferCreate)
+      auto *b = reinterpret_cast<std::vector<uint8_t> *>(env->CallLongMethod(item, long_value));
+      datas[i] = b ? b->data() : nullptr;
+      sizes[i] = b ? b->size() : 0;
+      if(!datas[i] || sizes[i] == 0) error = "empty DNG buffer";
+    }
+    else
     {
-      raws[i].noise_scale = noise_s;
-      raws[i].noise_offset = noise_o;
+      datas[i] = static_cast<const uint8_t *>(env->GetDirectBufferAddress(item));
+      sizes[i] = static_cast<size_t>(env->CallIntMethod(item, limit));
+      if(!datas[i] || sizes[i] == 0) error = "DNG buffer is not a direct ByteBuffer";
     }
+    env->DeleteLocalRef(item);
+  }
+  if(error.empty())
+  {
+    std::vector<std::string> errors(static_cast<size_t>(count));
+    std::vector<std::thread> workers;
+    for(jsize i = 0; i < count; i++)
+      workers.emplace_back([&, i] {
+        if(film::parse_dng(datas[i], sizes[i], raws[i], errors[i], has_neutral ? neutral : nullptr) && noise_s > 0.0f)
+        {
+          raws[i].noise_scale = noise_s;
+          raws[i].noise_offset = noise_o;
+        }
+      });
+    for(std::thread &t : workers) t.join();
+    for(const std::string &e : errors)
+      if(!e.empty() && error.empty()) error = e;
   }
   if(count == 0) error = "no DNG given";
   if(!error.empty())
@@ -251,6 +332,11 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
   options.local_tone = local_tone;
   options.chroma_denoise = chroma_denoise;
   options.raw_denoise = raw_denoise;
+  if(frame_exposure && env->GetArrayLength(frame_exposure) == count)
+  {
+    options.frame_exposure.resize(static_cast<size_t>(count));
+    env->GetFloatArrayRegion(frame_exposure, 0, count, options.frame_exposure.data());
+  }
   if(flash_mix && env->GetArrayLength(flash_mix) == 5)
   {
     float f[5];
@@ -282,12 +368,17 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
                         i, key, match_key, key > 0 && match_key > 0 ? std::log2(match_key / key) : 0.0f, r.wb[0],
                         r.wb[1], r.wb[2], r.noise_scale, r.noise_offset);
   }
+  const double parse_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - parse_start).count();
   std::lock_guard<std::mutex> lock(handle->mutex);
   if(!handle->engine->develop(source, params, options, handle->last, error))
   {
     throw_java(env, error);
     return nullptr;
   }
+  char line[96];
+  std::snprintf(line, sizeof(line), "冲洗结果\t读取 DNG\t%zu 个，%.0f ms\n", raws.size(), parse_ms);
+  handle->last.note += line;
   const jlong out[6] = {handle->last.width, handle->last.height, handle->last.passes,
                         static_cast<jlong>(handle->last.peak_image_bytes),
                         static_cast<jlong>(handle->last.gpu_ms * 1000.0), raw.orientation};

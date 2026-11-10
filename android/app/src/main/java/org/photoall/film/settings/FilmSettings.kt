@@ -28,6 +28,16 @@ object Settings {
     const val RAW = "app.raw"
     const val RAW_EV = "app.rawev"
     const val KEEP_RAW = "app.keepraw"
+    const val PRIVATE_PHOTOS = "app.privatephotos" // photos only in the app's own gallery
+    const val THEME = "app.theme"     // index into ui.Style.palettes
+    const val HAPTICS = "app.haptics" // 0 off, 1 light, 2 standard
+    const val FRAME = "app.frame"           // index into gallery.Frames.Kind
+    const val FRAME_TEXT = "app.frametext"  // 0 the film's name on the edge, 1 nothing
+    const val FRAME_DATE = "app.framedate"  // a date-back stamp
+    const val FRAME_AUTO = "app.frameauto"  // every shot also saved with the border
+    const val FRAME_INFO = "app.frameinfo"  // white borders: the shooting data
+    const val FRAME_DEVICE = "app.framedevice" // white borders: the phone's make and model
+    const val FRAME_RECIPE = "app.framerecipe" // white borders: film, paper and LUT
     const val HDR = "app.hdr"
     const val HDR_FRAMES = "app.hdrframes"
     const val HDR_UNDER = "app.hdrunder"
@@ -35,10 +45,15 @@ object Settings {
     const val HDR_TONE = "app.hdrtone"
     const val FLASH = "app.flash"
     const val FLASH_UNDER = "app.flashunder"
-    const val FLASH_FILL = "app.flashfill"
+    const val FLASH_FILL = "app.flashfill" // the steady fill light's share of the LED's strength
     const val FLASH_WHITE = "app.flashwhite" // 0 per area (auto), 1 the flash's (daylight), 2 the room's
-    /** 0 off, 1 a real flash in one frame, 2-4 an ambient frame plus a flash frame, mixed. */
-    val flashModes = listOf("关", "闪光", "补光", "平衡", "压光")
+    /**
+     * 0 off; 1 a real flash in one frame; 2 a steady fill light (the LED lit as a torch
+     * while the mode is on); 3 overpower: an ambient frame plus a flash frame, mixed.
+     */
+    val flashModes = listOf("关", "闪光", "补光", "压光")
+    const val FLASH_STEADY = 2
+    const val FLASH_OVERPOWER = 3
     const val CHROMA_NR = "app.chromanr"
     const val RAW_DENOISE = "app.rawdenoise"
     const val LONG_EDGE = "app.longedge"
@@ -88,54 +103,75 @@ object Settings {
     }
     // 1/8000 s .. 1 s in third stops for the shutter slider
     fun shutterSeconds(v: Float): Double = Math.pow(2.0, v.toDouble() / 3.0) / 8000.0
-    fun shutterLabel(v: Float): String = secondsLabel(shutterSeconds(v))
+    /** The marking a camera's dial shows for a third-stop step (1/60, not 1/63). */
+    fun shutterLabel(v: Float): String = NOMINAL_SHUTTER.getOrNull(Math.round(v)) ?: secondsLabel(shutterSeconds(v))
+    private val NOMINAL_SHUTTER = listOf(
+        "1/8000", "1/6400", "1/5000", "1/4000", "1/3200", "1/2500", "1/2000", "1/1600", "1/1250", "1/1000",
+        "1/800", "1/640", "1/500", "1/400", "1/320", "1/250", "1/200", "1/160", "1/125", "1/100",
+        "1/80", "1/60", "1/50", "1/40", "1/30", "1/25", "1/20", "1/15", "1/13", "1/10",
+        "1/8", "1/6", "1/5", "1/4", "0.3″", "0.4″", "0.5″", "0.6″", "0.8″", "1″")
     fun secondsLabel(s: Double): String = if (s >= 0.3) "%.1f s".format(s) else "1/%d".format(Math.round(1 / s))
-    fun iso(v: Float): Int = Math.round(100 * Math.pow(2.0, v.toDouble() / 3.0)).toInt()
+    /** ISO for a third-stop step: the standard markings (320, not 317), as sent to the sensor. */
+    fun iso(v: Float): Int = NOMINAL_ISO.getOrNull(Math.round(v)) ?: Math.round(100 * Math.pow(2.0, v.toDouble() / 3.0)).toInt()
+    private val NOMINAL_ISO = listOf(100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400)
 
     val all: List<Setting> by lazy {
         val films = FilmEngine.filmStocks
         val papers = FilmEngine.papers
         listOf(
+            Setting.Choice(THEME, "主题", "界面", listOf("暗盒（暖黑 · 片盒黄）", "暗房红灯（夜拍，只用红光）",
+                "相纸（白天户外，浅色）", "黄铜（旁轴蒙皮与黄铜）", "冷银（冷灰 · 冰蓝）"), 0),
+            Setting.Choice(HAPTICS, "震动反馈（快门、拨盘、对焦确认）", "界面", listOf("关", "轻", "标准"), 2),
+            Setting.Choice(FRAME, "边框样式", "边框", org.photoall.film.gallery.Frames.Kind.entries.map { it.label }, 1),
+            Setting.Choice(FRAME_TEXT, "片边文字", "边框", listOf("跟随胶片", "不印"), 0),
+            Setting.Toggle(FRAME_DATE, "日期印（橙色数码）", "边框", false),
+            Setting.Toggle(FRAME_AUTO, "拍摄时另存一张带边框的照片（原图照常保存）", "", false),
+            Setting.Toggle(FRAME_INFO, "白边印拍摄信息（光圈 · 快门 · ISO · 焦距）", "边框", false),
+            Setting.Toggle(FRAME_DEVICE, "白边印手机型号", "边框", false),
+            Setting.Toggle(FRAME_RECIPE, "白边印胶片配方（胶卷 · 相纸 · LUT）", "边框", false),
             Setting.Toggle(RAW, "RAW（DNG）拍摄并从 RAW 冲洗", "相机", true),
-            Setting.Toggle(KEEP_RAW, "冲洗后保留 RAW 原片（关闭则只留 JPG）", "相机", false),
+            Setting.Toggle(KEEP_RAW, "冲洗后保留 RAW 原片（关闭则只留 JPG）", "", false),
+            Setting.Toggle(PRIVATE_PHOTOS, "照片只存在本应用相册（不出现在手机相册；卸载或清除应用数据会一起删除）", "相机", false),
             Setting.Slider(RAW_EV, "RAW 冲洗曝光 EV", "相机", -3f, 3f, 0f),
             Setting.Toggle(HDR, "HDR 连拍合成（需 RAW）", "相机", false),
             Setting.Slider(HDR_FRAMES, "HDR 短曝光帧数（加长曝光共最多 6 帧）", "相机", 2f, 6f, 5f, integer = true, format = "%.0f"),
-            Setting.Slider(HDR_UNDER, "HDR 欠曝档数（保护高光）", "相机", 0f, 3f, 1.7f, format = "%.1f"),
+            Setting.Slider(HDR_UNDER, "HDR 最多欠曝档数（按取景器高光自动决定，不超过这个值）", "相机", 0f, 3f, 2f, format = "%.1f"),
             Setting.Slider(HDR_LONG, "HDR 包围长曝光：比短曝光亮几档（暗部细节，0 = 不拍）", "相机", 0f, 4f, 2f, format = "%.1f"),
-            Setting.Slider(HDR_TONE, "HDR 影调压缩：提亮暗部、压低高光（0 = 关）", "相机", 0f, 1f, 0.5f, format = "%.2f"),
-            Setting.Choice(FLASH, "闪光", "闪光",
-                listOf("关", "闪光（单张，真闪光）", "补光（两帧合成，需 RAW）", "平衡（两帧合成，需 RAW）", "压光（两帧合成，需 RAW）"), 0),
+            Setting.Slider(HDR_TONE, "HDR 影调：提亮暗部、收住高光（曝光融合，0 = 关）", "相机", 0f, 1f, 0.5f, format = "%.2f"),
+            Setting.Choice(FLASH, "闪光", "",
+                listOf("关", "闪光（单张，真闪光）", "补光（闪光灯常亮）", "压光（两帧合成，需 RAW）"), 0),
             Setting.Slider(FLASH_UNDER, "压光：环境光压暗档数", "闪光", 0.5f, 4f, 2f, format = "%.1f"),
-            Setting.Slider(FLASH_FILL, "补光强度", "闪光", 0.1f, 1f, 0.5f, format = "%.2f"),
+            Setting.Slider(FLASH_FILL, "补光亮度（常亮档位，部分机型不可调）", "闪光", 0.1f, 1f, 1f, format = "%.2f"),
             Setting.Choice(FLASH_WHITE, "闪光白平衡", "闪光",
                 listOf("自动（闪光照到的地方按闪光，其余按室内光）", "统一按闪光（日光）", "统一按室内光"), 0),
             Setting.Slider(CHROMA_NR, "RAW 彩色降噪（只平滑颜色，不动亮度细节；0 = 关）", "相机", 0f, 1f, 1f, format = "%.2f"),
             Setting.Slider(RAW_DENOISE, "RAW 降噪（vkdt 小波降噪，去马赛克前按传感器噪声模型；0 = 关）", "相机", 0f, 0.6f, 0.3f, format = "%.2f"),
             Setting.Choice(LONG_EDGE, "冲洗尺寸（长边）", "相机", longEdges.map { if (it >= 8192) "原尺寸" else "$it" }, 2),
             Setting.Slider(JPEG_QUALITY, "JPEG 质量", "相机", 70f, 100f, 95f, integer = true, format = "%.0f"),
-            Setting.Toggle(SOFT_3A, "胶片测光规则（手机测光引擎 + 测光模式/高光保护/胶片 ISO/标定白平衡）", "相机", false),
+            Setting.Toggle(SOFT_3A, "胶片测光规则（手机测光引擎 + 测光模式/高光保护/胶片 ISO/标定白平衡）", "", false),
             Setting.Choice(METERING, "测光模式", "相机", listOf("手机智能测光", "中央重点", "点测光（跟随点按）"), 0),
-            Setting.Toggle(HIGHLIGHT, "高光保护", "相机", false),
+            Setting.Toggle(HIGHLIGHT, "高光保护", "", false),
             Setting.Choice(FLICKER, "防频闪", "相机", listOf("50 Hz", "60 Hz", "关"), 0),
-            Setting.Toggle(FILM_ISO, "按胶片 ISO 曝光", "相机", false),
-            Setting.Choice(GUIDES, "取景参考线", "相机", guideNames, 1),
-            Setting.Toggle(HISTOGRAM, "实时直方图（按胶片效果）", "相机", true),
+            Setting.Toggle(FILM_ISO, "按胶片 ISO 曝光", "", false),
+            Setting.Choice(GUIDES, "取景参考线", "", guideNames, 1),
+            Setting.Toggle(HISTOGRAM, "实时直方图（按胶片效果）", "", true),
             Setting.Choice(FOCUS, "对焦", "相机", listOf("连续自动对焦 AF-C", "点按锁定 AF-L", "手动对焦 MF"), 0),
             Setting.Slider(FOCUS_DISTANCE, "手动对焦距离（0 = 无穷远）", "相机", 0f, 1f, 0f),
-            Setting.Toggle(PEAKING, "手动对焦时显示峰值", "相机", true),
+            Setting.Toggle(PEAKING, "手动对焦时显示峰值", "", true),
             Setting.Toggle(MANUAL, "手动曝光", "相机", false),
             Setting.Slider(ISO, "ISO", "相机", 0f, 18f, 3f, integer = true),
             Setting.Slider(SHUTTER, "快门", "相机", 0f, 39f, 15f, integer = true),
             Setting.Choice(WHITE_BALANCE, "白平衡", "相机", whiteBalances, 0),
 
             // Chosen from the camera screen's selector (hidden here: 348 entries).
+            // Hidden here (group ""): set on the camera screen, in its shooting sheet, or by the
+            // film card and the LUT list. They keep their values and defaults.
             Setting.Slider(LUT, "LUT", "", 0f, 1000f, 0f, integer = true),
-            Setting.Toggle(LUT_ON, "使用 LUT", "LUT（在胶片之后）", true),
-            Setting.Slider(LUT_STRENGTH, "LUT 强度", "LUT（在胶片之后）", 0f, 1f, 0.8f),
+            Setting.Toggle(LUT_ON, "使用 LUT", "", true),
+            Setting.Slider(LUT_STRENGTH, "LUT 强度", "", 0f, 1f, 0.8f),
 
-            Setting.Toggle(FILM_ON, "胶片模拟（关闭则直出，只保留 LUT）", "胶片", true),
-            Setting.Choice("film", "胶片", "胶片", films, 4),
+            Setting.Toggle(FILM_ON, "胶片模拟（关闭则直出，只保留 LUT）", "", true),
+            Setting.Choice("film", "胶片", "", films, 4),
             Setting.Slider("ev film", "胶片曝光 EV", "胶片", -5f, 5f, 0f),
             Setting.Slider("g film", "胶片反差", "胶片", 0.5f, 1.5f, 1f),
             Setting.Slider("f base", "片基密度", "胶片", 0f, 1.5f, 1f),
@@ -144,8 +180,8 @@ object Settings {
             Setting.Slider("exhaust", "显影液衰竭", "胶片", 0f, 1f, 0f),
             Setting.Slider("hl boost", "高光增强", "胶片", 0f, 10f, 0f),
 
-            Setting.Toggle(PRINT_ON, "印放到相纸（关闭则直接扫描底片）", "冲印", true),
-            Setting.Choice("paper", "相纸", "冲印", papers, 3),
+            Setting.Toggle(PRINT_ON, "印放到相纸（关闭则直接扫描底片）", "", true),
+            Setting.Choice("paper", "相纸", "", papers, 3),
             Setting.Slider("ev paper", "印放曝光 EV", "冲印", -5f, 5f, 0f),
             Setting.Slider("g paper", "相纸反差", "冲印", 0.5f, 1.5f, 1f),
             Setting.Slider("p base", "相纸片基", "冲印", 0f, 1.5f, 1f),
@@ -155,7 +191,7 @@ object Settings {
             Setting.Slider("glare", "眩光", "冲印", 0f, 0.5f, 0f),
 
             Setting.Choice(BALANCE, "滤色方式", "放大机滤色",
-                listOf("保留胶片本色（统一滤色）", "自动中性（逐卷校正）", "手动"), 0),
+                listOf("保留胶片本色（统一滤色）", "自动中性（逐卷校正）", "手动"), 1),
             Setting.Slider("filter c", "青滤色（手动）", "放大机滤色", 0f, 1f, 0f),
             Setting.Slider("filter m", "品滤色（手动）", "放大机滤色", 0f, 1f, 0f),
             Setting.Slider("filter y", "黄滤色（手动）", "放大机滤色", 0f, 1f, 0f),
@@ -199,42 +235,13 @@ object Settings {
     val byKey: Map<String, Setting> by lazy { all.associateBy { it.key } }
 }
 
-/** Current values, persisted on the device. */
-class SettingsStore(context: Context) {
-    private val prefs = context.getSharedPreferences("film-settings", Context.MODE_PRIVATE)
-    private val listeners = mutableListOf<(String) -> Unit>()
-
-    init {
-        // Schema 2: system 3A by default, RAW capture developed to JPG without keeping the DNG.
-        // Earlier builds may have stored other choices for these; reset them once.
-        if (prefs.getInt(SCHEMA, 1) < 2)
-            prefs.edit().remove(Settings.SOFT_3A).remove(Settings.RAW).remove(Settings.KEEP_RAW).putInt(SCHEMA, 2).apply()
-        // Schema 3: the "scan negative" process choice became the print switch.
-        if (prefs.getInt(SCHEMA, 1) < 3) {
-            val scanned = prefs.getFloat("process", 0f) >= 0.5f
-            prefs.edit().remove("process").apply { if (scanned) putFloat(Settings.PRINT_ON, 0f) }.putInt(SCHEMA, 3).apply()
-        }
-        if (prefs.getInt(SCHEMA, 1) < 4) { // a single-frame flash mode came in at index 1
-            val flash = prefs.getFloat(Settings.FLASH, 0f)
-            prefs.edit().apply { if (flash >= 1f) putFloat(Settings.FLASH, flash + 1f) }.putInt(SCHEMA, 4).apply()
-        }
-    }
-
-    operator fun get(key: String): Float = prefs.getFloat(key, Settings.byKey.getValue(key).default)
-
-    operator fun set(key: String, value: Float) {
-        prefs.edit().putFloat(key, value).apply()
-        listeners.forEach { it(key) }
-    }
-
+/** Values for the settings, wherever they are kept (the device's, or an import's own copy). */
+interface SettingValues {
+    operator fun get(key: String): Float
+    operator fun set(key: String, value: Float)
     fun flag(key: String) = get(key) >= 0.5f
-
-    fun resetAll() {
-        prefs.edit().clear().apply()
-        listeners.forEach { it("") }
-    }
-
-    fun onChange(listener: (String) -> Unit) { listeners += listener }
+    /** Every setting back to its default. */
+    fun resetAll()
 
     /** filmsim parameters for the engine, with the enlarger filter mode resolved. */
     fun filmParams(): Map<String, Float> {
@@ -252,6 +259,56 @@ class SettingsStore(context: Context) {
         params["stage print"] = if (flag(Settings.PRINT_ON)) 1f else 0f
         return params
     }
+}
+
+/** Current values, persisted on the device. */
+class SettingsStore(context: Context) : SettingValues {
+    private val prefs = context.getSharedPreferences("film-settings", Context.MODE_PRIVATE)
+    private val listeners = mutableListOf<(String) -> Unit>()
+
+    init {
+        // Schema 2: system 3A by default, RAW capture developed to JPG without keeping the DNG.
+        // Earlier builds may have stored other choices for these; reset them once.
+        if (prefs.getInt(SCHEMA, 1) < 2)
+            prefs.edit().remove(Settings.SOFT_3A).remove(Settings.RAW).remove(Settings.KEEP_RAW).putInt(SCHEMA, 2).apply()
+        // Schema 3: the "scan negative" process choice became the print switch.
+        if (prefs.getInt(SCHEMA, 1) < 3) {
+            val scanned = prefs.getFloat("process", 0f) >= 0.5f
+            prefs.edit().remove("process").apply { if (scanned) putFloat(Settings.PRINT_ON, 0f) }.putInt(SCHEMA, 3).apply()
+        }
+        if (prefs.getInt(SCHEMA, 1) < 4) { // a single-frame flash mode came in at index 1
+            val flash = prefs.getFloat(Settings.FLASH, 0f)
+            prefs.edit().apply { if (flash >= 1f) putFloat(Settings.FLASH, flash + 1f) }.putInt(SCHEMA, 4).apply()
+        }
+        if (prefs.getInt(SCHEMA, 1) < 5) { // balanced went; fill became a steady light; overpower moved to 3
+            val flash = prefs.getFloat(Settings.FLASH, 0f).toInt()
+            prefs.edit().apply {
+                when (flash) {
+                    3 -> putFloat(Settings.FLASH, 0f)
+                    4 -> putFloat(Settings.FLASH, 3f)
+                }
+            }.putInt(SCHEMA, 5).apply()
+        }
+        if (prefs.getInt(SCHEMA, 1) < 6) { // the HDR tone step became exposure fusion: start from its default
+            prefs.edit().remove(Settings.HDR_TONE).putInt(SCHEMA, 6).apply()
+        }
+    }
+
+    override operator fun get(key: String): Float = prefs.getFloat(key, Settings.byKey.getValue(key).default)
+
+    override operator fun set(key: String, value: Float) {
+        prefs.edit().putFloat(key, value).apply()
+        listeners.forEach { it(key) }
+    }
+
+    override fun flag(key: String) = get(key) >= 0.5f
+
+    override fun resetAll() {
+        prefs.edit().clear().apply()
+        listeners.forEach { it("") }
+    }
+
+    fun onChange(listener: (String) -> Unit) { listeners += listener }
 
     val longEdge: Int get() = Settings.longEdges[get(Settings.LONG_EDGE).toInt().coerceIn(0, Settings.longEdges.lastIndex)]
 

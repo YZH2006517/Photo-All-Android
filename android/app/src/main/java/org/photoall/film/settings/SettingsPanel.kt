@@ -16,12 +16,21 @@ import android.widget.TextView
 import org.photoall.film.ui.Slider
 import org.photoall.film.ui.Style
 
-/** Scrolling list of every setting, grouped, separated by hairlines. Long-press a row to reset it. */
+/**
+ * Scrolling list of the settings, grouped, separated by hairlines. Long-press a row to reset it.
+ * By default every setting of the device; [only] narrows it (an import's engine parameters,
+ * kept in [store] of its own), [onBench] null leaves the test bench out.
+ */
 class SettingsPanel(
     context: Context,
-    private val store: SettingsStore,
-    onBench: () -> Unit,
+    private val store: SettingValues,
+    onBench: (() -> Unit)?,
     onClose: () -> Unit,
+    title: String = "参数",
+    only: (Setting) -> Boolean = { true },
+    private val open: MutableSet<String> = openOnDevice,
+    /** The guide, as the list's first entry (the device's settings only). */
+    onGuide: (() -> Unit)? = null,
 ) : LinearLayout(context) {
     private val refreshers = mutableListOf<() -> Unit>()
 
@@ -31,23 +40,82 @@ class SettingsPanel(
         val header = LinearLayout(context).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(20), dp(10), dp(8), dp(10))
-            addView(text("参数", 20f).apply { typeface = Style.medium }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-            addView(action("测试台", Style.TEXT_2) { onBench() })
+            addView(text(title, 20f).apply { typeface = Style.medium }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            if (onBench != null) addView(action("测试台", Style.TEXT_2) { onBench() })
             addView(action("恢复默认", Style.TEXT_2) { store.resetAll(); refresh() })
             addView(action("完成", Style.ACCENT) { onClose() })
         }
-        val list = LinearLayout(context).apply { orientation = VERTICAL; setPadding(dp(20), 0, dp(20), dp(40)) }
-        var group = ""
+        val list = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(40))
+            // sections open and close smoothly
+            layoutTransition = android.animation.LayoutTransition().apply {
+                enableTransitionType(android.animation.LayoutTransition.CHANGING)
+                setDuration(200)
+            }
+        }
+        list.addView(text("点分类展开 · 长按某一项恢复默认", 12f).apply {
+            setTextColor(Style.TEXT_3)
+            setPadding(dp(4), dp(4), 0, dp(8))
+        })
+        if (onGuide != null) list.addView(LinearLayout(context).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(64)
+            setPadding(dp(14), dp(10), dp(10), dp(10))
+            background = Style.surface(context, fill = Style.SURFACE, radiusDp = 14f, stroke = Style.ACCENT)
+            addView(LinearLayout(context).apply {
+                orientation = VERTICAL
+                addView(text("使用指南", 16f).apply { typeface = Style.medium; setTextColor(Style.ACCENT) })
+                addView(text("每个按键与手势的完整说明", 12f).apply { setTextColor(Style.TEXT_2) })
+            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(android.widget.ImageView(context).apply {
+                setImageDrawable(org.photoall.film.ui.Icon(org.photoall.film.ui.Icon.Kind.CHEVRON, Style.ACCENT, 1.8f))
+            }, LayoutParams(dp(18), dp(18)).apply { marginStart = dp(8) })
+            Style.pressable(this)
+            setOnClickListener { onGuide() }
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+        // One section per topic, folded until opened (the list was long and mixed). A topic's
+        // settings are together even where the list interleaves them.
+        val groups = LinkedHashMap<String, MutableList<Setting>>()
         for (setting in Settings.all) {
             if (setting.group.isEmpty()) continue // set elsewhere (e.g. the camera's LUT picker)
-            if (setting.group != group) {
-                group = setting.group
-                list.addView(text(group, 11f).apply {
-                    Style.sectionTitle(this)
-                    setPadding(0, dp(28), 0, dp(8))
-                })
-            } else list.addView(Style.hairline(context), LayoutParams(LayoutParams.MATCH_PARENT, 1))
-            list.addView(row(setting))
+            if (!only(setting)) continue
+            groups.getOrPut(setting.group) { mutableListOf() } += setting
+        }
+        for ((name, items) in groups) {
+            val body = LinearLayout(context).apply {
+                orientation = VERTICAL
+                setPadding(dp(14), 0, dp(14), dp(6))
+                visibility = if (name in open) VISIBLE else GONE
+                items.forEachIndexed { i, setting ->
+                    if (i > 0) addView(Style.hairline(context), LayoutParams(LayoutParams.MATCH_PARENT, 1))
+                    addView(row(setting))
+                }
+            }
+            val chevron = android.widget.ImageView(context).apply {
+                setImageDrawable(org.photoall.film.ui.Icon(org.photoall.film.ui.Icon.Kind.CHEVRON, Style.TEXT_2, 1.8f))
+                rotation = if (name in open) 90f else 0f
+            }
+            val head = LinearLayout(context).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(54)
+                setPadding(dp(14), 0, dp(10), 0)
+                addView(text(name, 16f).apply { typeface = Style.medium }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+                addView(text("${items.size} 项", 12f).apply { setTextColor(Style.TEXT_3) })
+                addView(chevron, LayoutParams(dp(18), dp(18)).apply { marginStart = dp(8) })
+                setOnClickListener {
+                    val opening = body.visibility != VISIBLE
+                    body.visibility = if (opening) VISIBLE else GONE
+                    if (opening) open += name else open -= name
+                    chevron.animate().rotation(if (opening) 90f else 0f).setDuration(180).start()
+                }
+            }
+            list.addView(LinearLayout(context).apply {
+                orientation = VERTICAL
+                background = Style.surface(context, fill = Style.SURFACE, radiusDp = 14f)
+                addView(head)
+                addView(body)
+            }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
         }
         addView(header)
         addView(Style.hairline(context), LayoutParams(LayoutParams.MATCH_PARENT, 1))
@@ -55,6 +123,11 @@ class SettingsPanel(
     }
 
     fun refresh() = refreshers.forEach { it() }
+
+    private companion object {
+        /** Sections open, kept while the app runs (the screen is rebuilt on a theme change). */
+        val openOnDevice = mutableSetOf<String>()
+    }
 
     private fun row(setting: Setting): View = when (setting) {
         is Setting.Slider -> sliderRow(setting)

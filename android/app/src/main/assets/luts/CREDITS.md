@@ -17,3 +17,16 @@
 
 
 Converted from HaldCLUT level 8 to 33^3 RGB8 (trilinear) by tools/convert_clut.py; source af7b50d4caf6244fb6895a647f5b6a84efe7931a.
+
+
+#CCD 数码相机（digicam/）
+
+Eight CCD compact cameras of 2002-2009 from [Marcs Digicam Emulator](https://github.com/marc-gronenberg/marcs-digicam-emulator) by Marc Gronenberg, MIT License (digicam/LICENSE). The colour part of each camera (its 37^3 LUT over 13 stops of scene exposure) converted to 33^3 sRGB by tools/convert_digicam.py; the emulator's sensor noise, blooming, fringing, sharpening and noise reduction are ported to C++ in android/app/src/main/cpp/digicam.cpp.
+
+#Movie looks, Editor Hub originals, community picks (editorhub/)
+
+35 LUTs from [Editor Hub](https://editor-hub.com/assets/luts): its Originals, its Movie looks and the FreshLUTs community picks it hosts, all released under CC0 1.0 (editorhub/LICENSE). Two community picks carrying a third party's notice (Celluloïd, CineStill 800T) are left out. Converted to 33^3 by tools/convert_editorhub.py.
+
+#Retro cameras (retro/)
+
+26 retro camera looks (CCD compacts, disposable and point-and-shoot film cameras, instant film, black and white) from [ganjmeng/dazz-retro-camera](https://github.com/ganjmeng/dazz-retro-camera) (flutter_app/assets/lut/cameras, commit c8a7f26), MIT License, Copyright (c) 2026 DAZZ Team (retro/LICENSE; full text in third_party/dazz-retro/LICENSE). The project generates them with its own scripts from per-camera colour parameters. Converted to 33^3 by tools/convert_dazzretro.py.

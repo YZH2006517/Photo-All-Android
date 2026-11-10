@@ -30,11 +30,22 @@ vec3 oetf(vec3 v)
   return mix(v * 12.92, 1.055 * pow(v, vec3(1.0 / 2.4)) - 0.055, greaterThan(v, vec3(0.0031308)));
 }
 
-// Gentle shoulder: mid grey stays at 0.18, white reached about 4 stops above it.
-vec3 tone(vec3 x)
+// Gentle shoulder for a scanned negative: mid grey stays at 0.18, white reached about
+// 4 stops above it (the scan keeps the film's own contrast).
+vec3 shoulder(vec3 x)
 {
   x = max(x, 0.0) * 1.2;
   return x * (1.0 + x / 16.0) / (1.0 + x);
+}
+
+// Display rendering for scene light without film: an S-curve like a camera's (the ACES
+// fit of Narkowicz 2015), scaled so mid grey stays at 0.18. Blacks settle to black, the
+// mid-tones get contrast and the highlights roll off over about four stops; a plain
+// shoulder alone leaves the picture flat and grey.
+vec3 tone(vec3 x)
+{
+  x = max(x, 0.0) * 0.72;
+  return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
 // Trilinear: the sampler interpolates red and green within a blue slice, we blend slices.
@@ -69,7 +80,8 @@ void main()
     vec3 base = exp2(push.toe.xyz);
     rgb = 0.18 * (exp2(stops) - base) / (1.0 - base);
   }
-  if(mode >= 1) rgb = tone(rgb);
+  if(mode == 1) rgb = tone(rgb);
+  else if(mode == 2) rgb = shoulder(rgb);
   vec3 c = oetf(clamp(rgb, 0.0, 1.0));
   if(push.lut.x > 0.0 && push.lut.y >= 2.0) c = mix(c, creative(c), push.lut.x);
   imageStore(img_out, p, vec4(c, 1.0));

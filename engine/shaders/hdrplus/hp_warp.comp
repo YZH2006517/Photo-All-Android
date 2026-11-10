@@ -1,0 +1,42 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Burst merge (HDR+): a frame's quads moved onto the reference by the finest level's
+// tile vectors. Each quad blends the frame read at the vectors of the four nearest
+// tiles, weighted bilinearly by its position between their centres. Adapted from
+// warp_texture_bayer of hdr-plus-swift (GPL-3.0); here the weights run the full 0..1
+// between tile centres.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_comp;   // quads, RGBA
+layout(set = 1, binding = 1) uniform sampler2D img_align;  // vectors in quads (xy)
+layout(set = 1, binding = 2, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  int   half_tile; // tile centre spacing, quads
+  int   pad0;
+  ivec2 tiles;
+} push;
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(img_out);
+  if(any(greaterThanEqual(p, size))) return;
+  // Tile t covers [t h, t h + 2 h): its centre is at (t + 1) h.
+  vec2 g = (vec2(p) + 0.5) / float(push.half_tile) - 1.0;
+  vec2 g0 = floor(g);
+  vec2 f = clamp(g - g0, 0.0, 1.0);
+  ivec2 a = clamp(ivec2(g0), ivec2(0), push.tiles - 1);
+  ivec2 b = clamp(ivec2(g0) + 1, ivec2(0), push.tiles - 1);
+  ivec2 last = size - 1;
+  vec4 sum = vec4(0.0);
+  float wsum = 0.0;
+  for(int k = 0; k < 4; k++)
+  {
+    ivec2 t = ivec2((k & 1) == 0 ? a.x : b.x, (k >> 1) == 0 ? a.y : b.y);
+    float w = ((k & 1) == 0 ? 1.0 - f.x : f.x) * ((k >> 1) == 0 ? 1.0 - f.y : f.y);
+    ivec2 d = ivec2(round(texelFetch(img_align, t, 0).xy));
+    sum += w * texelFetch(img_comp, clamp(p + d, ivec2(0), last), 0);
+    wsum += w;
+  }
+  imageStore(img_out, p, sum / max(wsum, 1e-6));
+}

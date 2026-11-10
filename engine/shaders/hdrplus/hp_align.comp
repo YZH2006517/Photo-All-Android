@@ -1,0 +1,139 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Burst merge (HDR+), alignment at one pyramid level: one workgroup per tile. Tiles of
+// `tile` pixels overlap by half. The coarser level's vector, scaled up, and those of
+// two neighbouring tiles are tried first (better at the edges of moving things), then
+// +-`search` pixels (at most 2) around the best. L2 on the coarse levels, L1 at the finest, as in
+// Hasinoff et al. 2016. Adapted from correct_upsampling_error,
+// compute_tile_differences25 and find_best_tile_alignment of hdr-plus-swift (GPL-3.0);
+// here the tile and its search window are loaded into shared memory and the 64
+// threads of the workgroup share its pixels, the sums reduced with subgroup adds.
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 64) in;
+layout(set = 1, binding = 0) uniform sampler2D img_ref;
+layout(set = 1, binding = 1) uniform sampler2D img_comp;
+layout(set = 1, binding = 2) uniform sampler2D img_prev;  // coarser level's vectors (xy)
+layout(set = 1, binding = 3, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  int tile;       // 8, 16 or 32
+  int search;     // 1 or 2
+  int has_prev;   // 0 at the coarsest level
+  int ssd;        // 1: squared differences; 2 and up: also every ssd/2-th pixel only
+  ivec2 tiles;    // this level
+  ivec2 prev_tiles;
+} push;
+
+const int kMaxTile = 32;
+const int kWin = kMaxTile + 4;
+const float kOutside = -4.0; // a comparison pixel outside the frame: never matches
+
+shared float s_ref[kMaxTile * kMaxTile];
+shared float s_comp[kWin * kWin];
+shared float s_part[16][25]; // per subgroup (subgroups of at least 4 lanes) partial sums
+uint t;
+ivec2 size;
+
+float err(float r, float c)
+{
+  float e = abs(r - c);
+  return push.ssd == 1 ? e * e : e;
+}
+
+// The tile's pixels that enter the costs: all, or every `step`-th each way (the finest
+// level, where a tile has 1024 pixels and a quarter of them decide as well).
+int step()
+{
+  return push.ssd >= 2 ? push.ssd / 2 : 1;
+}
+
+float comp_at(ivec2 q)
+{
+  return any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)) ? kOutside : texelFetch(img_comp, q, 0).r;
+}
+
+// Sum of `n` values over the workgroup (each thread passes its own), into s_part[0][i].
+void reduce(float v[25], int n)
+{
+  for(int i = 0; i < n; i++)
+  {
+    float sum = subgroupAdd(v[i]);
+    if(subgroupElect()) s_part[gl_SubgroupID][i] = sum;
+  }
+  barrier();
+  if(t == 0u)
+    for(int i = 0; i < n; i++)
+    {
+      float total = 0.0;
+      for(uint g = 0u; g < gl_NumSubgroups; g++) total += s_part[g][i];
+      s_part[0][i] = total;
+    }
+  barrier();
+}
+
+ivec2 previous(ivec2 tl)
+{
+  tl = clamp(tl, ivec2(0), push.tiles - 1);
+  ivec2 c = clamp(ivec2((vec2(tl) + 0.5) * vec2(push.prev_tiles) / vec2(push.tiles)), ivec2(0), push.prev_tiles - 1);
+  return 2 * ivec2(round(texelFetch(img_prev, c, 0).xy));
+}
+
+void main()
+{
+  t = gl_LocalInvocationIndex;
+  size = textureSize(img_ref, 0);
+  ivec2 tl = ivec2(gl_WorkGroupID.xy);
+  ivec2 origin = tl * (push.tile / 2);
+  int n = push.tile * push.tile;
+  for(int i = int(t); i < n; i += 64)
+    s_ref[i] = texelFetch(img_ref, clamp(origin + ivec2(i % push.tile, i / push.tile), ivec2(0), size - 1), 0).r;
+  barrier();
+
+  ivec2 base = ivec2(0);
+  if(push.has_prev == 1)
+  {
+    ivec2 c[3];
+    c[0] = previous(tl);
+    c[1] = previous(tl + ivec2((tl.x & 1) == 0 ? -1 : 1, 0));
+    c[2] = previous(tl + ivec2(0, (tl.y & 1) == 0 ? -1 : 1));
+    float v[25];
+    for(int k = 0; k < 3; k++) v[k] = 0.0;
+    int st = step(), side_n = push.tile / st;
+    for(int j = int(t); j < side_n * side_n; j += 64)
+    {
+      int x = (j % side_n) * st, y = (j / side_n) * st;
+      ivec2 p = origin + ivec2(x, y);
+      for(int k = 0; k < 3; k++) v[k] += err(s_ref[y * push.tile + x], comp_at(p + c[k]));
+    }
+    reduce(v, 3);
+    float d0 = s_part[0][0], d1 = s_part[0][1], d2 = s_part[0][2];
+    base = d0 <= d1 && d0 <= d2 ? c[0] : d1 <= d2 ? c[1] : c[2];
+    barrier();
+  }
+
+  // The search window: the tile moved by `base`, widened by `search` on every side.
+  int r = push.search, side = 2 * r + 1, count = side * side;
+  int win = push.tile + 2 * r;
+  for(int i = int(t); i < win * win; i += 64)
+    s_comp[i] = comp_at(origin + base + ivec2(i % win - r, i / win - r));
+  barrier();
+  float v[25];
+  for(int k = 0; k < 25; k++) v[k] = 0.0;
+  int st = step(), side_n = push.tile / st;
+  for(int j = int(t); j < side_n * side_n; j += 64)
+  {
+    int x = (j % side_n) * st, y = (j / side_n) * st;
+    float ref = s_ref[y * push.tile + x];
+    for(int k = 0; k < count; k++) v[k] += err(ref, s_comp[(y + k / side) * win + x + k % side]);
+  }
+  reduce(v, count);
+  if(t == 0u)
+  {
+    int best = 0;
+    for(int k = 1; k < count; k++)
+      if(s_part[0][k] < s_part[0][best]) best = k;
+    ivec2 found = base + ivec2(best % side - r, best / side - r);
+    imageStore(img_out, tl, vec4(vec2(found), 0.0, 1.0));
+  }
+}

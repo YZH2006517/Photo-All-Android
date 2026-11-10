@@ -1,0 +1,247 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Burst merge (HDR+): robust temporal merge in the frequency domain, one workgroup per
+// tile of 8x8 quads (16x16 raw pixels; the four CFA positions are four channels).
+// Adapted from merge_frequency_domain, forward_fft, backward_fft and
+// calculate_highlights_norm_rgba of hdr-plus-swift (Martin Marek, Christian Bauer;
+// GPL-3.0), after Hasinoff et al. 2016, Liba et al. 2019 and Monod et al. 2021.
+//
+// Every tile of every frame is raised-cosine windowed and Fourier transformed. Each
+// aligned frame is first moved by the sub-pixel shift (-0.5..0.5 quads, 5x5 steps)
+// that brings it closest to the reference (Fourier shift theorem), then merged per
+// frequency with a Wiener-like weight
+//     w = |R - A|^2 / (|R - A|^2 + k * motion * highlights * noise)
+// so where the frames agree they average and where they differ (motion, misalignment)
+// the reference wins - smoothly, per frequency and per tile, never per pixel. The same
+// weight is used for the four channels (the mean of the two middle ones) so colours do
+// not drift apart. The noise term comes from the raw noise model of each frame at the
+// tile's brightness (Hasinoff's tiled approximation).
+//
+// Run four times, the tile grid shifted by half a tile in x, y and both: the windows
+// of the four runs sum to one, and each run adds its windowed result to img_acc.
+//
+// Changes from hdr-plus-swift: Vulkan compute; the noise term from the DNG noise model
+// instead of the tile RMS and a user strength; the motion measure from the residual
+// after the sub-pixel shift (Parseval) instead of a separate spatial pass, without the
+// frame-wide normalisation; signed frequencies in the shift theorem; no deconvolution
+// or tile-border pass.
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x = 64) in;
+layout(set = 1, binding = 0) uniform sampler2D img_ref;  // quads, RGBA, reference exposure
+layout(set = 1, binding = 1) uniform sampler2D img_a1;   // aligned frames, same layout
+layout(set = 1, binding = 2) uniform sampler2D img_a2;
+layout(set = 1, binding = 3) uniform sampler2D img_a3;
+layout(set = 1, binding = 4) uniform sampler2D img_a4;
+layout(set = 1, binding = 5) uniform sampler2D img_a5;
+layout(set = 1, binding = 6, rgba32f) uniform restrict image2D img_acc;
+layout(push_constant) uniform push_t
+{
+  int   frames;      // reference included
+  int   first;       // 1: write instead of adding (the first of the four runs)
+  ivec2 shift;       // this run's grid offset, quads (0 or 4)
+  float noise_s;     // reference: variance = s x + o
+  float noise_o;
+  float strength;    // k
+  float max_motion;  // extra denoising where the frames agree
+  float gain[6];     // each frame's scale to the reference exposure (frame 0: 1)
+} push;
+
+const float kPi = 3.14159265358979;
+const float kWindowEnergy = 9.0; // sum of the squared 8x8 raised-cosine window
+
+shared vec4 s_pix[64];
+shared vec4 s_re[64], s_im[64];
+shared vec4 s_ref_re[64], s_ref_im[64];
+shared vec4 s_alt_re[64], s_alt_im[64];
+shared vec4 s_sum[64];
+shared float s_cost[25];
+vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+
+uint t;
+int u, v; // this thread's pixel (x, y) and frequency (u, v)
+
+const float kC8[8] = float[8](1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678, 0.0, 0.70710678);
+const float kS8[8] = float[8](0.0, 0.70710678, 1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678);
+float c8(int k) { return kC8[k & 7]; }
+float s8(int k) { return kS8[k & 7]; }
+// The Fourier shift factor exp(-2 pi i f s / 8) for the 5 candidate shifts s
+// (-0.5..0.5 quads) and the 8 frequencies (signed), filled once per workgroup.
+shared vec2 s_shift[40];
+
+// Forward DFT of the tile held one pixel per thread; returns this thread's frequency.
+void forward(vec4 x, out vec4 re, out vec4 im)
+{
+  s_pix[t] = x;
+  barrier();
+  vec4 rr = vec4(0.0), ri = vec4(0.0); // row transform: frequency u of row v
+  for(int k = 0; k < 8; k++)
+  {
+    vec4 a = s_pix[v * 8 + k];
+    rr += a * c8(u * k);
+    ri -= a * s8(u * k);
+  }
+  s_re[t] = rr;
+  s_im[t] = ri;
+  barrier();
+  re = vec4(0.0);
+  im = vec4(0.0);
+  for(int k = 0; k < 8; k++) // column transform: frequency v of column u
+  {
+    vec4 a = s_re[k * 8 + u], b = s_im[k * 8 + u];
+    float c = c8(v * k), s = -s8(v * k);
+    re += a * c - b * s;
+    im += a * s + b * c;
+  }
+  barrier();
+}
+
+// Inverse DFT; returns this thread's pixel (real part).
+vec4 inverse(vec4 re, vec4 im)
+{
+  s_re[t] = re;
+  s_im[t] = im;
+  barrier();
+  vec4 cr = vec4(0.0), ci = vec4(0.0); // columns: row y = v of frequency column u
+  for(int k = 0; k < 8; k++)
+  {
+    vec4 a = s_re[k * 8 + u], b = s_im[k * 8 + u];
+    float c = c8(v * k), s = s8(v * k);
+    cr += a * c - b * s;
+    ci += a * s + b * c;
+  }
+  barrier();
+  s_re[t] = cr;
+  s_im[t] = ci;
+  barrier();
+  vec4 x = vec4(0.0); // rows: pixel x = u of row v
+  for(int k = 0; k < 8; k++)
+  {
+    vec4 a = s_re[v * 8 + k], b = s_im[v * 8 + k];
+    x += a * c8(u * k) - b * s8(u * k);
+  }
+  barrier();
+  return x / 64.0;
+}
+
+// Sum over the workgroup: subgroup adds, then the subgroups' sums.
+vec4 reduce(vec4 x)
+{
+  vec4 part = subgroupAdd(x);
+  if(subgroupElect()) s_sum[gl_SubgroupID] = part;
+  barrier();
+  vec4 r = vec4(0.0);
+  for(uint g = 0u; g < gl_NumSubgroups; g++) r += s_sum[g];
+  barrier();
+  return r;
+}
+
+vec4 fetch(int i, ivec2 p)
+{
+  if(i == 1) return texelFetch(img_a1, p, 0);
+  if(i == 2) return texelFetch(img_a2, p, 0);
+  if(i == 3) return texelFetch(img_a3, p, 0);
+  if(i == 4) return texelFetch(img_a4, p, 0);
+  return texelFetch(img_a5, p, 0);
+}
+
+void main()
+{
+  t = gl_LocalInvocationIndex;
+  u = int(t & 7u);
+  v = int(t >> 3);
+  ivec2 size = textureSize(img_ref, 0);
+  ivec2 origin = ivec2(gl_WorkGroupID.xy) * 8 - push.shift;
+  ivec2 p = origin + ivec2(u, v);
+  ivec2 q = clamp(p, ivec2(0), size - 1);
+  float window = (0.5 - 0.5 * cos(2.0 * kPi * (float(u) + 0.5) / 8.0)) *
+                 (0.5 - 0.5 * cos(2.0 * kPi * (float(v) + 0.5) / 8.0));
+
+  if(t < 40u)
+  {
+    int f = int(t & 7u);
+    float phase = -2.0 * kPi * float(f < 4 ? f : f - 8) * (-0.5 + float(t >> 3) / 4.0) / 8.0;
+    s_shift[t] = vec2(cos(phase), sin(phase));
+  }
+  vec4 ref = texelFetch(img_ref, q, 0);
+  vec4 mean = max(reduce(ref) / 64.0, vec4(0.0));
+  vec4 var_ref = push.noise_s * mean + push.noise_o;
+
+  vec4 ref_re, ref_im;
+  forward(window * ref, ref_re, ref_im);
+  s_ref_re[t] = ref_re;
+  s_ref_im[t] = ref_im;
+  vec4 acc_re = ref_re, acc_im = ref_im;
+
+  for(int i = 1; i < 6; i++)
+  {
+    if(i >= push.frames) break;
+    float g = push.gain[i];
+    vec4 alt = fetch(i, q);
+    // A longer frame's clipped highlights: the fraction of its tile above half white
+    // (before scaling) lowers the noise term, so the reference wins there.
+    float highlights = 1.0;
+    if(g < 0.999)
+    {
+      float m = max(max(alt.x, alt.y), max(alt.z, alt.w)) / g;
+      float frac = reduce(vec4(clamp((m - 0.5) / 0.49, 0.0, 1.0))).x / 64.0;
+      highlights = clamp((1.0 - frac) * (1.0 - frac), 0.04 / min(1.0 / g, 4.0), 1.0);
+    }
+    vec4 alt_re, alt_im;
+    forward(window * alt, alt_re, alt_im);
+    s_alt_re[t] = alt_re;
+    s_alt_im[t] = alt_im;
+    barrier();
+
+    // Sub-pixel shift: 25 candidates, one per thread, each summed over all frequencies.
+    if(t < 25u)
+    {
+      vec2 ex[8];
+      int sx = int(t % 5u), sy = int(t / 5u);
+      for(int f = 0; f < 8; f++) ex[f] = s_shift[sx * 8 + f];
+      float c = 0.0;
+      for(int k = 0; k < 64; k++)
+      {
+        vec2 e = cmul(ex[k & 7], s_shift[sy * 8 + (k >> 3)]);
+        vec4 ar = s_alt_re[k] * e.x - s_alt_im[k] * e.y;
+        vec4 ai = s_alt_re[k] * e.y + s_alt_im[k] * e.x;
+        vec4 dr = s_ref_re[k] - ar, di = s_ref_im[k] - ai;
+        c += dot(dr, dr) + dot(di, di);
+      }
+      s_cost[t] = c;
+    }
+    barrier();
+    int best = 0;
+    for(int k = 1; k < 25; k++)
+      if(s_cost[k] < s_cost[best]) best = k;
+    float residual = s_cost[best];
+    vec2 e = cmul(s_shift[(best % 5) * 8 + u], s_shift[(best / 5) * 8 + v]);
+    barrier();
+
+    vec4 var_alt = g * push.noise_s * mean + g * g * push.noise_o;
+    vec4 noise = kWindowEnergy * (var_ref + var_alt); // expected |R - A|^2 per frequency
+    // Motion: the residual after the best shift against what noise alone leaves. About
+    // 1 where the frames agree: denoise up to max_motion times harder; from 3 on, not.
+    float expected = 64.0 * (noise.x + noise.y + noise.z + noise.w);
+    float mismatch = residual / max(expected, 1e-20);
+    float motion = clamp(push.max_motion - (mismatch - 1.5) * (push.max_motion - 1.0) / 1.5, 1.0, push.max_motion);
+
+    float cr = e.x, ci = e.y;
+    vec4 ar = alt_re * cr - alt_im * ci;
+    vec4 ai = alt_re * ci + alt_im * cr;
+    vec4 dr = ref_re - ar, di = ref_im - ai;
+    vec4 d2 = dr * dr + di * di;
+    vec4 w4 = d2 / (d2 + push.strength * motion * highlights * noise + 1e-20);
+    float lo = min(min(w4.x, w4.y), min(w4.z, w4.w)), hi = max(max(w4.x, w4.y), max(w4.z, w4.w));
+    float w = clamp(0.5 * (w4.x + w4.y + w4.z + w4.w - lo - hi), 0.0, 1.0);
+    acc_re += (1.0 - w) * ar + w * ref_re;
+    acc_im += (1.0 - w) * ai + w * ref_im;
+  }
+
+  vec4 merged = inverse(acc_re / float(push.frames), acc_im / float(push.frames));
+  if(all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, size)))
+  {
+    if(push.first == 0) merged += imageLoad(img_acc, p);
+    imageStore(img_acc, p, merged);
+  }
+}

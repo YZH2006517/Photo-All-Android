@@ -13,6 +13,15 @@
         <item name="android:textColorSecondary">#8E8E8E</item>
         <item name="android:colorButtonNormal">#121212</item>
         <item name="android:alertDialogTheme">@style/FilmDialog</item>
+        <item name="android:windowAnimationStyle">@style/FilmPages</item>
+    </style>
+
+    <!-- Moving between screens: the new one rises in, the old one steps back. -->
+    <style name="FilmPages" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/page_open_enter</item>
+        <item name="android:activityOpenExitAnimation">@anim/page_open_exit</item>
+        <item name="android:activityCloseEnterAnimation">@anim/page_close_enter</item>
+        <item name="android:activityCloseExitAnimation">@anim/page_close_exit</item>
     </style>
 
     <style name="FilmDialog" parent="@android:style/Theme.Material.Dialog.Alert">
@@ -20,5 +29,28 @@
         <item name="android:colorAccent">#F2C14E</item>
         <item name="android:textColorPrimary">#F2F2F2</item>
         <item name="android:colorBackground">#1E1E1E</item>
+    </style>
+
+    <!-- The light theme (相纸): platform popups and dialogs in paper and ink. Colours
+         drawn in code come from ui/Style.kt's palette. -->
+    <style name="FilmThemeLight" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:windowBackground">#EFEAE0</item>
+        <item name="android:colorBackground">#E2DBCD</item>
+        <item name="android:colorAccent">#9A360B</item>
+        <item name="android:colorControlActivated">#9A360B</item>
+        <item name="android:colorControlNormal">#5E574D</item>
+        <item name="android:textColorPrimary">#1B1A18</item>
+        <item name="android:textColorSecondary">#5E574D</item>
+        <item name="android:colorButtonNormal">#E2DBCD</item>
+        <item name="android:alertDialogTheme">@style/FilmDialogLight</item>
+        <item name="android:windowAnimationStyle">@style/FilmPages</item>
+    </style>
+
+    <style name="FilmDialogLight" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:colorAccent">#9A360B</item>
+        <item name="android:textColorPrimary">#1B1A18</item>
+        <item name="android:colorBackground">#F6F3EC</item>
     </style>
 </resources>

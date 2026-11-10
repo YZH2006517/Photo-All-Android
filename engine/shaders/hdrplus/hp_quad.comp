@@ -1,0 +1,26 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Burst merge (HDR+), step 1: one raw frame as 2x2 Bayer quads, one RGBA texel each
+// (the four CFA positions in raster order), black-subtracted, normalised to white and
+// scaled to the reference frame's exposure. Adapted from prepare_texture_bayer and
+// convert_to_rgba of hdr-plus-swift (Martin Marek, Christian Bauer; GPL-3.0).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform usampler2D img_raw;
+layout(set = 1, binding = 1, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4  black;   // per CFA position, code values
+  float white;
+  float gain;    // to the reference exposure (1 for equal frames, 1/4 for two stops longer)
+  float pad0, pad1;
+} push;
+
+void main()
+{
+  ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(q, imageSize(img_out)))) return;
+  vec4 v;
+  for(int k = 0; k < 4; k++)
+    v[k] = (float(texelFetch(img_raw, 2 * q + ivec2(k & 1, k >> 1), 0).r) - push.black[k]) / (push.white - push.black[k]);
+  imageStore(img_out, q, v * push.gain);
+}

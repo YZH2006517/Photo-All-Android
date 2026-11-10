@@ -108,10 +108,14 @@ build/desktop/filmsim_cli --filmsim android/app/src/main/assets/filmsim/filmsim.
 | --- | --- | --- |
 | filmsim 着色器、白平衡表 | [vkdt](https://github.com/hanatos/vkdt)，hanatos | BSD 2-Clause（个别标注的文件为 GPLv3，见 `engine/shaders/vkdt/LICENCE.*`） |
 | RAW 降噪着色器（`engine/shaders/denoise/`） | 改写自 vkdt 的 denoise 模块，hanatos | BSD 2-Clause，改动见该目录的 `README.md` |
+| HDR+ 连拍对齐与频域合并（`engine/shaders/hdrplus/`） | 移植自 [hdr-plus-swift](https://github.com/martin-marek/hdr-plus-swift)（Burst Photo），Martin Marek、Christian Bauer 等 | GPL-3.0，改动见该目录的 `README.md` |
 | 胶片 / 相纸光谱数据（`assets/filmsim/filmsim.lut`） | [spektrafilm](https://github.com/andreavolpato/spektrafilm)，Andrea Volpato | CC BY-SA 4.0（经 vkdt 打包，未修改） |
 | 光谱上采样表（`assets/filmsim/spectra-em.lut`） | 用 vkdt 的 mkspectra 生成 | 同 vkdt |
 | 创意 LUT（`assets/luts/`） | [NatronGitHub/clut](https://github.com/NatronGitHub/clut)，Pat David、Juan Melara、Marc Roovers 等 | CC BY-SA 4.0，已从 HaldCLUT 8 级转换为 33³，见 `assets/luts/CREDITS.md` |
+| CCD 数码相机（`assets/luts/digicam/`、`cpp/digicam.cpp`、`engine/Digicam.kt`） | [Marcs Digicam Emulator](https://github.com/marc-gronenberg/marcs-digicam-emulator)，Marc Gronenberg | MIT。原版 37³ 相机 LUT 随附；取景器用的 33³ sRGB 版由 `tools/convert_digicam.py` 转换；成片的噪点、溢出、紫边、降噪、锐化移植自其滤镜源码，见该目录的 `LICENSE` |
+| 电影 / 调色 LUT（`assets/luts/editorhub/`） | [Editor Hub](https://editor-hub.com/assets/luts) 原创、电影风格与 FreshLUTs 社区精选 | CC0，由 `tools/convert_editorhub.py` 转换为 33³ |
+| 复古相机 LUT（`assets/luts/retro/`） | [ganjmeng/dazz-retro-camera](https://github.com/ganjmeng/dazz-retro-camera) 的 CCD、胶片机、拍立得、黑白相机风格 | MIT，由 `tools/convert_dazzretro.py` 转换为 33³ |
 
 胶片、相纸和 LUT 名称里出现的商标属于各自的所有者，只用来说明模拟的是哪种胶片，本项目与这些公司没有关联。
 
-本项目自己的代码目前还没有选定开源许可。
+本项目以 [GPL-3.0](LICENSE) 发布（其中移植的 hdr-plus-swift 代码要求如此）。上表中各第三方部分保留各自的许可。

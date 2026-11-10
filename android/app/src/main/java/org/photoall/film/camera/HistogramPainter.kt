@@ -47,11 +47,15 @@ class HistogramPainter(private val density: Float) {
     }
 
     companion object {
-        /** Histogram of a decoded photo's display values, sampled on a grid of about 256x256. */
-        fun of(bitmap: Bitmap): PreviewMeter.Histogram {
-            val hr = IntArray(64); val hg = IntArray(64); val hb = IntArray(64); val hl = IntArray(64)
-            val columns = minOf(256, bitmap.width)
-            val rows = minOf(256, bitmap.height)
+        /**
+         * Histogram of a decoded photo's display values in [bins] bins (64 for the small
+         * viewfinder-style one, 256 for the album's), sampled on a grid of about [grid]².
+         */
+        fun of(bitmap: Bitmap, bins: Int = 64, grid: Int = 256): PreviewMeter.Histogram {
+            val hr = IntArray(bins); val hg = IntArray(bins); val hb = IntArray(bins); val hl = IntArray(bins)
+            val shift = Integer.numberOfTrailingZeros(256 / bins)
+            val columns = minOf(grid, bitmap.width)
+            val rows = minOf(grid, bitmap.height)
             val line = IntArray(bitmap.width)
             for (r in 0 until rows) {
                 bitmap.getPixels(line, 0, bitmap.width, 0, (r * bitmap.height) / rows, bitmap.width, 1)
@@ -60,8 +64,8 @@ class HistogramPainter(private val density: Float) {
                     val r8 = (p shr 16) and 0xff
                     val g8 = (p shr 8) and 0xff
                     val b8 = p and 0xff
-                    hr[r8 shr 2]++; hg[g8 shr 2]++; hb[b8 shr 2]++
-                    hl[(77 * r8 + 150 * g8 + 29 * b8) shr 10]++ // Rec.601 luma, as the viewfinder
+                    hr[r8 shr shift]++; hg[g8 shr shift]++; hb[b8 shr shift]++
+                    hl[((77 * r8 + 150 * g8 + 29 * b8) shr 8) shr shift]++ // Rec.601 luma, as the viewfinder
                 }
             }
             return PreviewMeter.Histogram(hr, hg, hb, hl)

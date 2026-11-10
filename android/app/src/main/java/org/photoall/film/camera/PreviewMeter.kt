@@ -11,11 +11,19 @@ import kotlin.math.pow
  *  - [key]: centre-weighted log-average linear luminance. A RAW develop scales its
  *    exposure to it, so the film sees the brightness the preview showed. Weighting
  *    matches the engine's raw_key().
- *  - the fraction of near-white samples, for highlight protection ([onHighlights]).
+ *  - the fraction of near-white samples, for highlight protection ([onHighlights]);
+ *  - [highlight] and [clipped]: how bright the brightest part is, for the HDR burst's
+ *    underexposure.
  * Runs every third frame.
  */
 class PreviewMeter : ImageAnalysis.Analyzer {
     @Volatile var key = 0f
+        private set
+    /** Linear level (0..1) of the brightest channel at the 99.5th percentile of samples. */
+    @Volatile var highlight = 0f
+        private set
+    /** Fraction of samples with a channel at white (nothing tells how far over they are). */
+    @Volatile var clipped = 0f
         private set
     @Volatile var onHighlights: (Float) -> Unit = {}
 
@@ -37,35 +45,80 @@ class PreviewMeter : ImageAnalysis.Analyzer {
         if (v <= 0.04045f) v / 12.92f else ((v + 0.055f) / 1.055f).pow(2.4f)
     }
 
+    /**
+     * Linear gain the viewfinder applies (a burst held under the meter is shown brighter):
+     * the key and the histogram are of what is shown; [highlight] and [clipped] stay the
+     * sensor's own headroom.
+     */
+    @Volatile var gain = 1f
+        set(value) {
+            field = value
+            shownTable = IntArray(256) { i ->
+                val l = (linear[i] * value).coerceIn(0f, 1f)
+                val e = if (l <= 0.0031308f) 12.92f * l else 1.055f * l.pow(1f / 2.4f) - 0.055f
+                (e * 255f + 0.5f).toInt().coerceIn(0, 255)
+            }
+        }
+    private var shownTable = IntArray(256) { it }
+
     override fun analyze(image: ImageProxy) {
-        image.use { if (counter++ % 3 == 0) measure(it) }
+        image.use {
+            if (counter++ % 3 != 0) return@use
+            val plane = it.planes[0]
+            val buffer = plane.buffer
+            val stride = plane.rowStride
+            measure(it.width, it.height) { x, y, out ->
+                val at = y * stride + x * 4
+                out[0] = buffer.get(at).toInt() and 0xff
+                out[1] = buffer.get(at + 1).toInt() and 0xff
+                out[2] = buffer.get(at + 2).toInt() and 0xff
+            }
+        }
     }
 
-    private fun measure(image: ImageProxy) {
-        val plane = image.planes[0]
-        val buffer = plane.buffer
-        val stride = plane.rowStride
+    /** A YUV_420_888 frame straight from a Camera2 ImageReader (full-range BT.601). */
+    fun analyzeYuv(image: android.media.Image) {
+        if (counter++ % 3 != 0) return
+        val yp = image.planes[0]; val up = image.planes[1]; val vp = image.planes[2]
+        val yb = yp.buffer; val ub = up.buffer; val vb = vp.buffer
+        measure(image.width, image.height) { x, y, out ->
+            val l = (yb.get(y * yp.rowStride + x * yp.pixelStride).toInt() and 0xff).toFloat()
+            val ci = (y / 2) * up.rowStride + (x / 2) * up.pixelStride
+            val u = (ub.get(ci).toInt() and 0xff) - 128f
+            val v = (vb.get((y / 2) * vp.rowStride + (x / 2) * vp.pixelStride).toInt() and 0xff) - 128f
+            out[0] = (l + 1.402f * v + 0.5f).toInt().coerceIn(0, 255)
+            out[1] = (l - 0.344136f * u - 0.714136f * v + 0.5f).toInt().coerceIn(0, 255)
+            out[2] = (l + 1.772f * u + 0.5f).toInt().coerceIn(0, 255)
+        }
+    }
+
+    private val rgb = IntArray(3)
+
+    private fun measure(width: Int, height: Int, pixel: (Int, Int, IntArray) -> Unit) {
+        val shownBy = shownTable
+        val g = gain
         val columns = 128
         val rows = 96
         var logSum = 0.0
         var weightSum = 0.0
         var clipped = 0
         val wantHistogram = onHistogram != null
+        val brightest = IntArray(256) // the largest channel per sample
         val hr = IntArray(BINS); val hg = IntArray(BINS); val hb = IntArray(BINS); val hl = IntArray(BINS)
         val table = lut
         val n = lutSize
         for (r in 0 until rows) {
-            val y = (r * image.height) / rows
+            val y = (r * height) / rows
             val dy = (r + 0.5) / rows - 0.5
             for (c in 0 until columns) {
-                val x = (c * image.width) / columns
-                val at = y * stride + x * 4
-                val r8 = buffer.get(at).toInt() and 0xff
-                val g8 = buffer.get(at + 1).toInt() and 0xff
-                val b8 = buffer.get(at + 2).toInt() and 0xff
-                if (maxOf(r8, g8, b8) >= 250) clipped++
+                val x = (c * width) / columns
+                pixel(x, y, rgb)
+                val top = maxOf(rgb[0], rgb[1], rgb[2])
+                if (top >= 250) clipped++
+                brightest[top]++
                 // Rec.709 / sRGB luminance of the linearised pixel
-                val luminance = 0.2126f * linear[r8] + 0.7152f * linear[g8] + 0.0722f * linear[b8]
+                val luminance = g * (0.2126f * linear[rgb[0]] + 0.7152f * linear[rgb[1]] + 0.0722f * linear[rgb[2]])
+                val r8 = shownBy[rgb[0]]; val g8 = shownBy[rgb[1]]; val b8 = shownBy[rgb[2]]
                 val dx = (c + 0.5) / columns - 0.5
                 val w = 1.0 + 3.0 * exp(-(dx * dx + dy * dy) / (2 * 0.18 * 0.18))
                 logSum += w * ln(luminance + 1e-4)
@@ -84,7 +137,13 @@ class PreviewMeter : ImageAnalysis.Analyzer {
             }
         }
         key = (exp(logSum / weightSum) - 1e-4).toFloat()
-        onHighlights(clipped.toFloat() / (columns * rows))
+        val samples = columns * rows
+        var above = 0
+        var level = 255
+        while (level > 0 && above + brightest[level] <= samples / 200) { above += brightest[level]; level-- }
+        highlight = linear[level]
+        this.clipped = clipped.toFloat() / samples
+        onHighlights(clipped.toFloat() / samples)
         if (wantHistogram) onHistogram?.invoke(Histogram(hr, hg, hb, hl))
     }
 

@@ -1,0 +1,41 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Burst merge (HDR+), alignment pyramid. Adapted from avg_pool_normalization,
+// blur_mosaic_texture and build_pyramid of hdr-plus-swift (GPL-3.0).
+//   mode 0: quads (RGBA) -> grey level 0: the four positions white balanced and averaged
+//   mode 1: grey level -> next level: binomial (1 4 6 4 1) blur, then 2x2 average
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4 balance; // mode 0: per CFA position, white balance over its mean
+  int  mode;
+  int  pad0, pad1, pad2;
+} push;
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(p, imageSize(img_out)))) return;
+  if(push.mode == 0)
+  {
+    imageStore(img_out, p, vec4(0.25 * dot(texelFetch(img_in, p, 0), push.balance), 0.0, 0.0, 1.0));
+    return;
+  }
+  // 2x2 average of the binomially blurred level: a 6x6 footprint with weights
+  // (1 5 10 10 5 1) per axis (the 5-tap binomial convolved with the 2-tap box).
+  const float k[6] = float[6](1.0, 5.0, 10.0, 10.0, 5.0, 1.0);
+  ivec2 last = textureSize(img_in, 0) - 1;
+  float sum = 0.0, wsum = 0.0;
+  for(int y = 0; y < 6; y++)
+    for(int x = 0; x < 6; x++)
+    {
+      ivec2 s = 2 * p + ivec2(x - 2, y - 2);
+      if(any(lessThan(s, ivec2(0))) || any(greaterThan(s, last))) continue;
+      float w = k[x] * k[y];
+      sum += w * texelFetch(img_in, s, 0).r;
+      wsum += w;
+    }
+  imageStore(img_out, p, vec4(sum / wsum, 0.0, 0.0, 1.0));
+}

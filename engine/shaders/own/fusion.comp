@@ -1,0 +1,102 @@
+#version 450
+// Local tone mapping by exposure fusion (Mertens, Kautz and Van Reeth 2007), the way
+// HDR+ finishes its merged bursts (Hasinoff et al. 2016): the scene's luminance is
+// "exposed" three times - darker (keeps the highlights), as is, and brighter (opens
+// the shadows) - each through a display gamma; every pixel weights the exposures by
+// how close to mid grey they put it, and the three are blended band by band in a
+// Laplacian pyramid, so large areas take their best exposure while edges and texture
+// keep their contrast without halos. The fused luminance, back in linear light, scales
+// the scene's colour (ratios kept), ahead of the film.
+//
+//   mode 0 prepare:   scene rgb                    -> I   (g(Y e_k), k = 0..2)
+//   mode 1 down:      image                        -> image at half size (4x4 binomial)
+//   mode 2 down w:    I (full size)                -> W at half size: normalised weights, then down
+//   mode 3 top:       I, W                         -> R = sum W I
+//   mode 4 collapse:  I_l, I_l+1, W_l, R_l+1       -> R_l = sum W_l (I_l - up I_l+1) + up R_l+1
+//   mode 5 apply:     scene, I_0, I_1, R_1         -> rgb * norm * g^-1(R_0) / Y
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D in0;
+layout(set = 1, binding = 1) uniform sampler2D in1;
+layout(set = 1, binding = 2) uniform sampler2D in2;
+layout(set = 1, binding = 3) uniform sampler2D in3;
+layout(set = 1, binding = 4, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  int   mode;
+  float norm;      // keeps mid grey where it was
+  float max_gain;  // limits on the final scaling, linear
+  float min_gain;
+  vec4  exposure;  // e_0 e_1 e_2 (dark, as is, bright)
+} push;
+
+const float kGamma = 1.0 / 2.2;
+
+float luminance(vec3 rgb) { return dot(max(rgb, vec3(0.0)), vec3(0.2627, 0.6780, 0.0593)); } // Rec.2020
+
+vec3 exposures(float y) { return pow(clamp(y * push.exposure.xyz, 0.0, 1.0), vec3(kGamma)); }
+
+// Well-exposedness (Mertens: sigma 0.2 around 0.5), normalised over the three.
+vec3 weights(vec3 i)
+{
+  vec3 d = i - 0.5;
+  vec3 w = exp(-12.5 * d * d) + 1e-6;
+  return w / (w.x + w.y + w.z);
+}
+
+// 4x4 binomial (1 3 3 1) centred between the four fine pixels of coarse pixel q, so
+// that bilinear reads at normalised coordinates line up across levels.
+vec4 down(ivec2 q, bool as_weights)
+{
+  ivec2 last = textureSize(in0, 0) - 1;
+  const float k[4] = float[4](1.0, 3.0, 3.0, 1.0);
+  vec4 sum = vec4(0.0);
+  for(int y = 0; y < 4; y++)
+    for(int x = 0; x < 4; x++)
+    {
+      vec4 v = texelFetch(in0, clamp(2 * q + ivec2(x - 1, y - 1), ivec2(0), last), 0);
+      if(as_weights) v = vec4(weights(v.rgb), 1.0);
+      sum += k[x] * k[y] * v;
+    }
+  return sum / 64.0;
+}
+
+vec2 uv(ivec2 p) { return (vec2(p) + 0.5) / vec2(imageSize(img_out)); }
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(p, imageSize(img_out)))) return;
+  if(push.mode == 0)
+  {
+    imageStore(img_out, p, vec4(exposures(luminance(texelFetch(in0, p, 0).rgb)), 1.0));
+  }
+  else if(push.mode == 1 || push.mode == 2)
+  {
+    imageStore(img_out, p, down(p, push.mode == 2));
+  }
+  else if(push.mode == 3)
+  {
+    float r = dot(texelFetch(in1, p, 0).rgb, texelFetch(in0, p, 0).rgb);
+    imageStore(img_out, p, vec4(r, 0.0, 0.0, 1.0));
+  }
+  else if(push.mode == 4)
+  {
+    vec2 t = uv(p);
+    vec3 detail = texelFetch(in0, p, 0).rgb - texture(in1, t).rgb;
+    float r = dot(texelFetch(in2, p, 0).rgb, detail) + texture(in3, t).r;
+    imageStore(img_out, p, vec4(r, 0.0, 0.0, 1.0));
+  }
+  else
+  {
+    vec2 t = uv(p);
+    vec4 rgb = texelFetch(in0, p, 0);
+    vec3 i0 = texelFetch(in1, p, 0).rgb;
+    float r = dot(weights(i0), i0 - texture(in2, t).rgb) + texture(in3, t).r;
+    float fused = pow(clamp(r, 0.0, 1.0), 1.0 / kGamma);
+    float y = luminance(rgb.rgb);
+    // A pixel's own exposure decides near black, where the ratio is noise over noise.
+    float gain = y > 1e-5 ? push.norm * fused / y : push.norm * push.exposure.y;
+    gain = clamp(gain, push.min_gain, push.max_gain);
+    imageStore(img_out, p, vec4(rgb.rgb * gain, rgb.a));
+  }
+}

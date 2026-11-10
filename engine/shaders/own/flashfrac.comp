@@ -7,8 +7,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 1, binding = 0) uniform usampler2D img_flash;
 layout(set = 1, binding = 1) uniform usampler2D img_ambient;
-layout(set = 1, binding = 2, std430) readonly buffer offsets_t { ivec2 offsets[]; };
-layout(set = 1, binding = 3, rgba16f) uniform writeonly restrict image2D img_out;
+layout(set = 1, binding = 2, rgba16f) uniform writeonly restrict image2D img_out;
 layout(push_constant) uniform push_t
 {
   vec4  f_black;
@@ -16,11 +15,8 @@ layout(push_constant) uniform push_t
   float f_white;
   float a_white;
   float ambient_scale;
-  int   ambient_index; // alignment frame of the ambient frame
-  int   tiles_x;
-  int   tiles_y;
-  int   tile;
-  int   pad;
+  float pad;
+  vec4  warp; // a b tx ty: the ambient frame's position q = c + [a -b; b a] (p - c) + t
 } push;
 
 float quad(usampler2D img, ivec2 p, vec4 black, float white)
@@ -41,8 +37,14 @@ void main()
   ivec2 h = ivec2(gl_GlobalInvocationID.xy);
   if(any(greaterThanEqual(h, imageSize(img_out)))) return;
   ivec2 p = 2 * h;
-  ivec2 t = min(p / push.tile, ivec2(push.tiles_x, push.tiles_y) - 1);
-  ivec2 q = p + offsets[push.ambient_index * push.tiles_x * push.tiles_y + t.y * push.tiles_x + t.x];
+  ivec2 size = textureSize(img_flash, 0);
+  vec2 c = 0.5 * vec2(size), d = vec2(p) + 0.5 - c;
+  vec2 qf = c + vec2(push.warp.x * d.x - push.warp.y * d.y, push.warp.y * d.x + push.warp.x * d.y) + push.warp.zw;
+  ivec2 q = ivec2(round((qf - 0.5) * 0.5)) * 2;
+  // Outside the ambient frame: use the nearest quad that has both (the map is smooth).
+  ivec2 inside = clamp(q, ivec2(0), size - 2);
+  p += inside - q;
+  q = inside;
   float f = quad(img_flash, p, push.f_black, push.f_white);
   float a = push.ambient_scale * quad(img_ambient, q, push.a_black, push.a_white);
   // Too dark to tell: count as ambient light (the scene's own white).
