@@ -68,6 +68,10 @@ struct DevelopOptions
   // making the develop start from the same brightness the preview showed.
   // exposure_ev is then an offset on top.
   float match_key = 0.0f;
+  // Burst frames' exposures (time x gain) relative to each other, as the camera was
+  // asked for, when known: frames with the same value need no exposure measurement,
+  // the others only a quick one. Empty: measured with align_burst.
+  std::vector<float> frame_exposure;
   Stages stages;
   // Local tone compression before the film, 0..1: large-scale brightness pulled towards
   // mid grey (shadows lifted, highlights lowered), local contrast kept. For HDR merges.
@@ -87,11 +91,15 @@ struct DevelopOptions
 // pipeline would render it: black level, shading, white balance, colour matrix.
 float raw_key(const RawImage &raw);
 
+// Quantile `q` (0..1) of a raw's luminance (linear Y as raw_key renders it).
+float raw_luminance_quantile(const RawImage &raw, float q);
+
 struct DevelopResult
 {
   int width = 0, height = 0;
   std::vector<uint8_t> rgba8;
   double gpu_ms = 0.0;            // 0 when the queue has no timestamps
+  std::string gpu_breakdown;      // the slowest kernels, "name ms" each
   uint64_t peak_image_bytes = 0;  // GPU images alive at once for this frame
   int passes = 0;
   // Every decision of the develop, one "section\tkey\tvalue" line each (the photo's record).

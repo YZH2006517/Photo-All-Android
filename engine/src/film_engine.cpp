@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstring>
 
@@ -33,7 +35,7 @@ namespace {
 enum Kernel
 {
   kSetup, kDirlut, kFast, kExpose, kDevelop, kHalin, kHalout, kScatter, kNegprint,
-  kBlur, kDownsample, kDecode, kEncode, kRaw, kMerge, kLtm, kChroma, kDnHalf, kDnDowncov, kDnDown, kDnAssemble, kDnDoub, kFlashmix, kFlashfrac, kFlashwb, kKernelCount
+  kBlur, kDownsample, kDecode, kEncode, kRaw, kHpQuad, kHpPyramid, kHpAlign, kHpWarp, kHpMerge, kHpBayer, kFusion, kChroma, kDnHalf, kDnDowncov, kDnDown, kDnAssemble, kDnDoub, kFlashmix, kFlashfrac, kFlashwb, kKernelCount
 };
 
 struct KernelSpec
@@ -48,13 +50,17 @@ constexpr KernelSpec kKernels[kKernelCount] = {
     {"expose", "SSBII", 0},    {"develop", "SBSSI", 0},   {"halin", "SBSI", 0},
     {"halout", "SBSISSSSSS", 0}, {"scatter", "SISSSS", 0}, {"negprint", "SSBI", 0},
     {"blur", "SI", 16},        {"downsample", "SI", 4},   {"decode", "SI", 56},
-    {"encode", "SIS", 112},     {"raw", "SSI", 128},       {"merge", "SSSSSSBI", 80},
-    {"ltm", "SSI", 16},        {"chroma", "SSSI", 16},
+    {"encode", "SIS", 112},     {"raw", "SSI", 128},
+    {"hp_quad", "SI", 32},     {"hp_pyramid", "SI", 32},  {"hp_align", "SSSI", 32},
+    {"hp_warp", "SSI", 16},    {"hp_merge", "SSSSSSI", 56}, {"hp_bayer", "SI", 16},
+    {"fusion", "SSSSI", 32},   {"chroma", "SSSI", 16},
     {"dn_half", "SI", 48},     {"dn_downcov", "SII", 16}, {"dn_down", "SI", 16},
-    {"dn_assemble", "SSSSSI", 32}, {"dn_doub", "SSSI", 64},  {"flashmix", "SSBI", 128},
-    {"flashfrac", "SSBI", 64},  {"flashwb", "SSI", 80},
+    {"dn_assemble", "SSSSSI", 32}, {"dn_doub", "SSSI", 64},  {"flashmix", "SSI", 128},
+    {"flashfrac", "SSI", 64},  {"flashwb", "SSI", 80},
 };
 constexpr int kMaxBurst = 6;
+// Timestamps: one before the passes and one after each, up to this many.
+constexpr uint32_t kMaxQueries = 512;
 // Code value of 1.0 in the merged mosaic: 20 bits, so shadows lifted from a longer
 // bracket frame keep their precision below the reference's own quantisation.
 constexpr float kMergeScale = 1048575.0f;
@@ -234,6 +240,7 @@ struct Image
   uint32_t width = 0, height = 0;
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkDeviceSize bytes = 0;
+  VkImageUsageFlags usage = 0;
 };
 
 struct Pipeline
@@ -269,8 +276,27 @@ struct FilmEngine::Impl
   int creative_size = 0;
   float creative_strength = 0.0f;
   BurstAlignment alignment; // of the frame being developed
+  Warp warp;                // flash pair: the flash (or ambient) frame registered as a whole
+  int crop[4] = {0, 0, 0, 0}; // flash mix: raw pixels to drop (left top right bottom), no flash data there
   float flash_gain = 0.0f;  // flash mix: gain on the flash-only light of the frame being developed
   float flash_ambient_k = 1.0f; // flash white: flash frame exposure over the ambient frame's
+  // HDR tone mapping (exposure fusion): the three synthetic exposures and the scale that
+  // keeps mid grey, chosen by develop() from the frame's highlights.
+  float tone_exposure[3] = {1.0f, 1.0f, 1.0f};
+  float tone_norm = 1.0f;
+  float merge_strength = 4.0f; // HDR+ merge: the noise term's multiplier (Hasinoff's c)
+  // CPU time per stage of the develop, "stage ms" each, for the record.
+  std::chrono::steady_clock::time_point lap_start;
+  std::string laps;
+  void lap(const char *stage)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    char item[64];
+    std::snprintf(item, sizeof(item), "%s%s %.0f", laps.empty() ? "" : "，", stage,
+                  std::chrono::duration<double, std::milli>(now - lap_start).count());
+    laps += item;
+    lap_start = now;
+  }
   // The develop's record: "section\tkey\tvalue" lines, filled by develop() and build_graph().
   std::string record;
   void note(const char *section, const char *key, const char *format, ...)
@@ -293,6 +319,9 @@ struct FilmEngine::Impl
     if(device)
     {
       vkDeviceWaitIdle(device);
+      for(Image &image : image_cache) destroy(image);
+      destroy(cached_staging);
+      destroy(cached_readback);
       destroy(filmsim_lut);
       destroy(creative_lut);
       destroy(spectra_lut);
@@ -405,6 +434,38 @@ struct FilmEngine::Impl
     view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_TRY(vkCreateImageView(device, &view, nullptr, &image.view), "vkCreateImageView");
     return true;
+  }
+
+  // GPU memory kept from the last develop: the next one of the same kind (a burst of the
+  // same size, say) takes its images and buffers instead of allocating them again.
+  std::vector<Image> image_cache;
+  Buffer cached_staging, cached_readback;
+
+  bool take_image(Image &image, uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
+                  std::string &error)
+  {
+    for(auto it = image_cache.begin(); it != image_cache.end(); ++it)
+      if(it->width == width && it->height == height && it->format == format && it->usage == usage)
+      {
+        image = *it;
+        image_cache.erase(it);
+        return true;
+      }
+    if(!create_image(image, width, height, format, usage, error)) return false;
+    image.usage = usage;
+    return true;
+  }
+
+  bool take_buffer(Buffer &cached, Buffer &buffer, VkDeviceSize size, VkBufferUsageFlags usage, std::string &error)
+  {
+    if(cached.buffer && cached.size == size)
+    {
+      buffer = cached;
+      cached = {};
+      return true;
+    }
+    destroy(cached);
+    return create_buffer(buffer, size, usage, true, error);
   }
 
   void destroy(Image &image)
@@ -533,7 +594,7 @@ struct FilmEngine::Impl
     {
       VkQueryPoolCreateInfo query_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
       query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-      query_info.queryCount = 2;
+      query_info.queryCount = kMaxQueries;
       VK_TRY(vkCreateQueryPool(device, &query_info, nullptr, &queries), "vkCreateQueryPool");
     }
 
@@ -842,30 +903,50 @@ struct FilmEngine::Impl
     return out;
   }
 
-  // Local tone compression of the scene-linear `input` (see ltm.comp): guided filter
-  // of log luminance at 1/4 resolution with a radius of about 2% of the long edge.
-  int local_tone(Graph &g, int input, uint32_t w, uint32_t h, float strength)
+  // Exposure fusion (see fusion.comp): synthetic exposures of the scene's luminance,
+  // a Laplacian pyramid down to 16-32 px, collapsed with each level's blended weights;
+  // the result scales the scene's colour.
+  int local_tone(Graph &g, int input, uint32_t w, uint32_t h)
   {
     struct
     {
       int32_t mode;
-      float strength, eps, anchor;
-    } push{0, strength, 0.3f, std::log2(0.18f)};
-    const int factor = 4;
-    const int small = g.image((w + factor - 1) / factor, (h + factor - 1) / factor);
-    const int32_t f = factor;
-    g.pixels(kDownsample, {img(input), img(small)}, small, f);
-    const int stats = g.image(g.images[small].width, g.images[small].height);
-    g.pixels(kLtm, {img(small), img(small), img(stats)}, stats, push);
-    const float sigma = 0.02f * static_cast<float>(std::max(w, h)) / factor;
-    const int mean_stats = g.blur(stats, sigma, true);
-    const int coef = g.image(g.images[mean_stats].width, g.images[mean_stats].height);
-    push.mode = 1;
-    g.pixels(kLtm, {img(mean_stats), img(mean_stats), img(coef)}, coef, push);
-    const int mean_coef = g.blur(coef, sigma * g.images[coef].width / g.images[small].width, true);
+      float norm, max_gain, min_gain;
+      float exposure[4];
+    } push{0, tone_norm, 8.0f, 1.0f / 16.0f, {tone_exposure[0], tone_exposure[1], tone_exposure[2], 0.0f}};
+    static_assert(sizeof(push) == 32, "fusion push constants");
+    std::vector<int> I{g.image(w, h)}, W{-1};
+    g.pixels(kFusion, {img(input), img(input), img(input), img(input), img(I[0])}, I[0], push);
+    uint32_t lw = w, lh = h;
+    while(std::min(lw, lh) > 32 && I.size() < 12)
+    {
+      lw = (lw + 1) / 2;
+      lh = (lh + 1) / 2;
+      const int i = g.image(lw, lh), wi = g.image(lw, lh);
+      push.mode = 1;
+      g.pixels(kFusion, {img(I.back()), img(I.back()), img(I.back()), img(I.back()), img(i)}, i, push);
+      // level 1's weights from the full-size exposures; deeper ones from the level above
+      const int from = W.size() == 1 ? I[0] : W.back();
+      push.mode = W.size() == 1 ? 2 : 1;
+      g.pixels(kFusion, {img(from), img(from), img(from), img(from), img(wi)}, wi, push);
+      I.push_back(i);
+      W.push_back(wi);
+    }
+    const size_t top = I.size() - 1;
+    if(top == 0) return input; // too small to fuse
+    int r = g.image(g.images[I[top]].width, g.images[I[top]].height);
+    push.mode = 3;
+    g.pixels(kFusion, {img(I[top]), img(W[top]), img(I[top]), img(I[top]), img(r)}, r, push);
+    for(size_t l = top - 1; l >= 1; l--)
+    {
+      const int rl = g.image(g.images[I[l]].width, g.images[I[l]].height);
+      push.mode = 4;
+      g.pixels(kFusion, {img(I[l]), img(I[l + 1]), img(W[l]), img(r), img(rl)}, rl, push);
+      r = rl;
+    }
     const int out = g.image(w, h);
-    push.mode = 2;
-    g.pixels(kLtm, {img(input), img(mean_coef), img(out)}, out, push);
+    push.mode = 5;
+    g.pixels(kFusion, {img(input), img(I[0]), img(I[1]), img(r), img(out)}, out, push);
     return out;
   }
 
@@ -941,6 +1022,139 @@ struct FilmEngine::Impl
     return developed;
   }
 
+  // HDR+ burst merge (Hasinoff et al. 2016), ported from hdr-plus-swift (GPL-3.0; see
+  // shaders/hdrplus/README.md): every frame as RGBA quads at the reference exposure; a
+  // grey pyramid per frame; tile alignment from the coarsest level down; each frame
+  // warped onto the reference; then the robust merge in the frequency domain, four runs
+  // on half-tile shifted grids. Returns the merged mosaic (R32_UINT, 0..kMergeScale).
+  int burst_merge(Graph &g, const SourceImage &source, const RawImage &raw, int frames)
+  {
+    const uint32_t qw = raw.width / 2, qh = raw.height / 2;
+    std::vector<int> quads;
+    for(int i = 0; i < frames; i++)
+    {
+      const RawImage &f = *source.burst[i];
+      struct
+      {
+        float black[4];
+        float white, gain, pad0, pad1;
+      } push{};
+      static_assert(sizeof(push) == 32, "hp_quad push constants");
+      std::memcpy(push.black, f.black, sizeof(push.black));
+      push.white = f.white;
+      push.gain = i < static_cast<int>(alignment.gain.size()) ? alignment.gain[i] : 1.0f;
+      const int q = g.image(qw, qh);
+      g.pixels(kHpQuad, {upload(i), img(q)}, q, push);
+      quads.push_back(q);
+    }
+    // Pyramid: level 0 is the quads' grey; halve while the shorter side exceeds 64,
+    // with tiles of 32, 16 and then 8 pixels (hdr-plus-swift's "medium" settings).
+    std::vector<int> tile{32};
+    for(uint32_t r = std::min(qw, qh); r > 64; r /= 2) tile.push_back(std::max(tile.back() / 2, 8));
+    struct
+    {
+      float balance[4];
+      int32_t mode, pad0, pad1, pad2;
+    } pyr{};
+    static_assert(sizeof(pyr) == 32, "hp_pyramid push constants");
+    float mean_wb = 0.0f;
+    for(int k = 0; k < 4; k++) mean_wb += 0.25f * raw.wb[raw.cfa_colour[k]];
+    for(int k = 0; k < 4; k++) pyr.balance[k] = raw.wb[raw.cfa_colour[k]] / mean_wb;
+    std::vector<std::vector<int>> levels(frames);
+    for(int i = 0; i < frames; i++)
+    {
+      int level = g.image(qw, qh);
+      pyr.mode = 0;
+      g.pixels(kHpPyramid, {img(quads[i]), img(level)}, level, pyr);
+      levels[i].push_back(level);
+      for(size_t l = 1; l < tile.size(); l++)
+      {
+        const LogicalImage &above = g.images[levels[i].back()];
+        const int next = g.image((above.width + 1) / 2, (above.height + 1) / 2);
+        pyr.mode = 1;
+        g.pixels(kHpPyramid, {img(levels[i].back()), img(next)}, next, pyr);
+        levels[i].push_back(next);
+      }
+    }
+    std::vector<int> aligned{quads[0]};
+    for(int i = 1; i < frames; i++)
+    {
+      int prev = -1;
+      int32_t prev_tiles[2] = {1, 1};
+      for(int l = static_cast<int>(tile.size()) - 1; l >= 0; l--)
+      {
+        const LogicalImage &level = g.images[levels[0][l]];
+        const int32_t nx = std::max<int32_t>(1, static_cast<int32_t>(level.width) / (tile[l] / 2) - 1);
+        const int32_t ny = std::max<int32_t>(1, static_cast<int32_t>(level.height) / (tile[l] / 2) - 1);
+        struct
+        {
+          int32_t tile, search, has_prev, ssd;
+          int32_t tiles[2], prev_tiles[2];
+        // L2 on the coarse levels; at the finest L1 on every other pixel each way (ssd 4).
+        } push{tile[l], l > 0 ? 2 : 1, prev >= 0, l > 0 ? 1 : 4, {nx, ny}, {prev_tiles[0], prev_tiles[1]}};
+        static_assert(sizeof(push) == 32, "hp_align push constants");
+        const int out = g.image(nx, ny);
+        // one workgroup per tile
+        g.pass(kHpAlign, {img(levels[0][l]), img(levels[i][l]), img(prev >= 0 ? prev : levels[0][l]), img(out)}, nx, ny,
+               push);
+        prev = out;
+        prev_tiles[0] = nx;
+        prev_tiles[1] = ny;
+      }
+      struct
+      {
+        int32_t half_tile, pad;
+        int32_t tiles[2];
+      } warp_push{tile[0] / 2, 0, {prev_tiles[0], prev_tiles[1]}};
+      static_assert(sizeof(warp_push) == 16, "hp_warp push constants");
+      const int a = g.image(qw, qh);
+      g.pixels(kHpWarp, {img(quads[i]), img(prev), img(a)}, a, warp_push);
+      aligned.push_back(a);
+    }
+    // Noise of the reference (normalised units); without a NoiseProfile, a typical phone
+    // sensor at mid ISO. Denoising leans harder on agreeing tiles in the dark (Liba et
+    // al. 2019: 1 in daylight up to ~6 at night), here from the noise at mid grey.
+    const float s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
+    const float o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
+    const float sigma = std::sqrt(s * 0.18f + o);
+    struct
+    {
+      int32_t frames, first;
+      int32_t shift[2];
+      float noise_s, noise_o, strength, max_motion;
+      float gain[6];
+    } merge{};
+    static_assert(sizeof(merge) == 56, "hp_merge push constants");
+    merge.frames = frames;
+    merge.noise_s = s;
+    merge.noise_o = o;
+    merge.strength = merge_strength;
+    merge.max_motion = std::clamp(1.0f + (sigma - 0.003f) / 0.002f, 1.0f, 6.0f);
+    for(int i = 0; i < 6; i++)
+      merge.gain[i] = i < frames && i < static_cast<int>(alignment.gain.size()) ? alignment.gain[i] : 1.0f;
+    note("合并", "算法", "HDR+ 频域合并（hdr-plus-swift 移植）：%d 层金字塔，分块 %d px", static_cast<int>(tile.size()), 2 * tile[0]);
+    note("合并", "噪声 σ(18%) / 强度 / 静止区加强", "%.4f / %.1f / %.2f", sigma, merge.strength, merge.max_motion);
+    const int acc = g.image(qw, qh, VK_FORMAT_R32G32B32A32_SFLOAT);
+    std::vector<Ref> bindings{img(aligned[0])};
+    for(int i = 1; i < 6; i++) bindings.push_back(img(aligned[i < frames ? i : 0]));
+    bindings.push_back(img(acc));
+    for(int run = 0; run < 4; run++)
+    {
+      merge.first = run == 0;
+      merge.shift[0] = (run & 1) * 4;
+      merge.shift[1] = (run >> 1) * 4;
+      g.pass(kHpMerge, bindings, (qw + merge.shift[0] + 7) / 8, (qh + merge.shift[1] + 7) / 8, merge);
+    }
+    const int out = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
+    struct
+    {
+      float scale;
+      int32_t pad0, pad1, pad2;
+    } bayer{kMergeScale, 0, 0, 0};
+    g.pixels(kHpBayer, {img(acc), img(out)}, out, bayer);
+    return out;
+  }
+
   Graph build_graph(const FilmParams &params, uint32_t w, uint32_t h, const SourceImage &source,
                     const DevelopOptions &options, int &output)
   {
@@ -994,34 +1208,7 @@ struct FilmEngine::Impl
       { // merge first; the merged mosaic is black-subtracted, at frame 0's exposure, and spans 0..kMergeScale
         const int frames = ambient_frames;
         note("合并", "合并帧数", "%d", frames);
-        const int merged = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
-        struct
-        {
-          float black[4];
-          float white, noise_s, noise_o, strength;
-          int32_t frames, tiles_x, tiles_y, tile;
-          float gain[6];
-          float scale, pad;
-        } merge{};
-        static_assert(sizeof(merge) == 80, "merge push constants");
-        std::memcpy(merge.black, raw.black, sizeof(merge.black));
-        merge.white = raw.white;
-        // Without a NoiseProfile assume a typical phone sensor at mid ISO.
-        merge.noise_s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
-        merge.noise_o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
-        merge.strength = 8.0f;
-        merge.frames = frames;
-        merge.tiles_x = alignment.tiles_x;
-        merge.tiles_y = alignment.tiles_y;
-        merge.tile = alignment.tile;
-        for(int i = 0; i < 6; i++)
-          merge.gain[i] = i < frames && i < static_cast<int>(alignment.gain.size()) ? alignment.gain[i] : 1.0f;
-        merge.scale = kMergeScale;
-        std::vector<Ref> bindings;
-        for(int i = 0; i < kMaxBurst; i++) bindings.push_back(upload(i < frames ? i : 0));
-        bindings.push_back(kOffsets);
-        bindings.push_back(img(merged));
-        g.pixels(kMerge, bindings, merged, merge);
+        const int merged = burst_merge(g, source, raw, frames);
         sensor = img(merged);
         for(float &b : push.black) b = 0.0f;
         push.wb_white[3] = kMergeScale;
@@ -1033,8 +1220,8 @@ struct FilmEngine::Impl
         struct
         {
           float f_black[4], a_black[4];
-          float f_white, a_white, ambient_scale;
-          int32_t ambient_index, tiles_x, tiles_y, tile, pad;
+          float f_white, a_white, ambient_scale, pad;
+          float warp[4]; // a b tx ty: the ambient frame registered to the flash frame
         } frac{};
         static_assert(sizeof(frac) == 64, "flashfrac push constants");
         std::memcpy(frac.f_black, push.black, sizeof(frac.f_black));
@@ -1042,12 +1229,12 @@ struct FilmEngine::Impl
         frac.f_white = push.wb_white[3];
         frac.a_white = amb.white;
         frac.ambient_scale = flash_ambient_k;
-        frac.ambient_index = 1;
-        frac.tiles_x = alignment.tiles_x;
-        frac.tiles_y = alignment.tiles_y;
-        frac.tile = alignment.tile;
+        frac.warp[0] = warp.a;
+        frac.warp[1] = warp.b;
+        frac.warp[2] = warp.tx;
+        frac.warp[3] = warp.ty;
         const int share = g.image(raw.width / 2, raw.height / 2);
-        g.pixels(kFlashfrac, {sensor, upload(1), kOffsets, img(share)}, share, frac);
+        g.pixels(kFlashfrac, {sensor, upload(1), img(share)}, share, frac);
         // Smooth: the white changes with the lighting, not with texture or misregistration.
         const int smooth = g.blur(share, 0.015f * static_cast<float>(std::max(raw.width, raw.height)) / 2.0f, true);
         struct
@@ -1080,8 +1267,8 @@ struct FilmEngine::Impl
           float a_black[4], f_black[4], wb[4];
           float a_white, f_white, ambient_gain, flash_gain;
           int32_t cfa[4];
-          float noise_s, noise_o, scale;
-          int32_t flash_index, tiles_x, tiles_y, tile, pad;
+          float noise_s, noise_o, scale, pad;
+          float warp[4]; // a b tx ty: the flash frame registered to the ambient one
           float wbg[4];
         } mix{};
         static_assert(sizeof(mix) == 128, "flashmix push constants");
@@ -1097,12 +1284,12 @@ struct FilmEngine::Impl
         mix.noise_s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
         mix.noise_o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
         mix.scale = kMergeScale;
-        mix.flash_index = ambient_frames;
-        mix.tiles_x = alignment.tiles_x;
-        mix.tiles_y = alignment.tiles_y;
-        mix.tile = alignment.tile;
+        mix.warp[0] = warp.a;
+        mix.warp[1] = warp.b;
+        mix.warp[2] = warp.tx;
+        mix.warp[3] = warp.ty;
         const int mixed = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
-        g.pixels(kFlashmix, {sensor, upload(ambient_frames), kOffsets, img(mixed)}, mixed, mix);
+        g.pixels(kFlashmix, {sensor, upload(ambient_frames), img(mixed)}, mixed, mix);
         sensor = img(mixed);
         for(float &b : push.black) b = 0.0f;
         push.wb_white[3] = kMergeScale;
@@ -1159,15 +1346,17 @@ struct FilmEngine::Impl
 
     int scene = input;
     note("降噪", "彩色降噪", options.chroma_denoise > 0 ? "%.2f" : "关", options.chroma_denoise);
-    note("影调", "HDR 影调压缩", options.local_tone > 0 ? "%.2f" : "关", options.local_tone);
+    note("影调", "HDR 影调压缩（曝光融合）", options.local_tone > 0 ? "%.2f" : "关", options.local_tone);
     note("冲洗曝光", "工作尺寸", "%ux%u（长边上限 %d）", w, h, options.max_long_edge);
     if(options.chroma_denoise > 0.0f)
       scene = chroma_denoise(g, scene, w, h, std::min(options.chroma_denoise, 1.0f));
-    if(options.local_tone > 0.0f) scene = local_tone(g, scene, w, h, std::min(options.local_tone, 1.0f));
+    if(options.local_tone > 0.0f) scene = local_tone(g, scene, w, h);
 
-    // Film off: the scene itself under a neutral curve (raw) or as shot (display-referred).
+    // Film off: the scene itself under the camera-like display curve. The same for a raw
+    // and for the viewfinder's frames (the camera is asked for a plain sRGB curve, so
+    // they are scene light too): the viewfinder then shows what the shot will be.
     int developed = scene;
-    int mode = source.raw ? 1 : 0;
+    int mode = 1;
     if(options.stages.film)
     {
       developed = develop_film(g, params, scene, w, h);
@@ -1192,12 +1381,78 @@ struct FilmEngine::Impl
     return g;
   }
 
+  // The exposure fusion's synthetic exposures at `strength` (0..1): the dark one brings
+  // the brightest 0.5% of the frame (its luminance at the develop's exposure) down to 0.9,
+  // the bright one opens the shadows by up to 3 stops (HDR+ uses about 2); mid grey is
+  // kept where it was.
+  void choose_tone(const RawImage *raw, float exposure_ev, float strength)
+  {
+    float high = 0.0f;
+    if(raw) high = raw_luminance_quantile(*raw, 0.995f) * std::exp2(exposure_ev);
+    const float dark = high > 0.9f ? std::max(1.0f / 16.0f, std::pow(0.9f / high, strength)) : 1.0f;
+    const float bright = std::exp2(3.0f * strength);
+    tone_exposure[0] = dark;
+    tone_exposure[1] = 1.0f;
+    tone_exposure[2] = bright;
+    // What the fusion makes of an even mid-grey area, so it can be put back at 0.18.
+    float sum = 0.0f, wsum = 0.0f;
+    for(float e : tone_exposure)
+    {
+      const float i = std::pow(std::clamp(0.18f * e, 0.0f, 1.0f), 1.0f / 2.2f);
+      const float wt = std::exp(-12.5f * (i - 0.5f) * (i - 0.5f)) + 1e-6f;
+      sum += wt * i;
+      wsum += wt;
+    }
+    tone_norm = 0.18f / std::pow(sum / wsum, 2.2f);
+    note("影调", "高光亮度 (99.5%)", raw ? "%.3f" : "无 RAW", high);
+    note("影调", "虚拟曝光（暗 / 原 / 亮）", "%+.2f / 0 / %+.2f EV", std::log2(dark), std::log2(bright));
+    note("影调", "中灰校正", "%.3f", tone_norm);
+  }
+
+  // Drops the margins in `crop` (raw pixels of a raw_w x raw_h frame) from the developed
+  // image, then trims the longer side so the frame keeps its aspect ratio. More than 15%
+  // per side is not cropped (the margin then holds the ambient frame alone).
+  void crop_result(DevelopResult &result, int raw_w, int raw_h)
+  {
+    if(!(crop[0] || crop[1] || crop[2] || crop[3]) || raw_w <= 0 || raw_h <= 0) return;
+    if(crop[0] + crop[2] > 0.15 * raw_w || crop[1] + crop[3] > 0.15 * raw_h) return;
+    const double sx = static_cast<double>(result.width) / raw_w, sy = static_cast<double>(result.height) / raw_h;
+    double x0 = crop[0] * sx, x1 = result.width - crop[2] * sx;
+    double y0 = crop[1] * sy, y1 = result.height - crop[3] * sy;
+    const double aspect = static_cast<double>(result.width) / result.height;
+    if((x1 - x0) / (y1 - y0) > aspect)
+    {
+      const double keep = (y1 - y0) * aspect, mid = 0.5 * (x0 + x1);
+      x0 = mid - 0.5 * keep;
+      x1 = mid + 0.5 * keep;
+    }
+    else
+    {
+      const double keep = (x1 - x0) / aspect, mid = 0.5 * (y0 + y1);
+      y0 = mid - 0.5 * keep;
+      y1 = mid + 0.5 * keep;
+    }
+    const int ix0 = std::clamp(static_cast<int>(std::ceil(x0)), 0, result.width - 1);
+    const int iy0 = std::clamp(static_cast<int>(std::ceil(y0)), 0, result.height - 1);
+    const int w = std::clamp(static_cast<int>(std::floor(x1)) - ix0, 1, result.width - ix0);
+    const int h = std::clamp(static_cast<int>(std::floor(y1)) - iy0, 1, result.height - iy0);
+    std::vector<uint8_t> out(static_cast<size_t>(w) * h * 4);
+    for(int y = 0; y < h; y++)
+      std::memcpy(&out[static_cast<size_t>(y) * w * 4], &result.rgba8[(static_cast<size_t>(iy0 + y) * result.width + ix0) * 4],
+                  static_cast<size_t>(w) * 4);
+    result.rgba8 = std::move(out);
+    result.width = w;
+    result.height = h;
+  }
+
   bool develop(const SourceImage &source, const FilmParams &raw_params, const DevelopOptions &options,
                DevelopResult &result, std::string &error)
   {
     SourceImage src = source;
     alignment = {};
     record.clear();
+    laps.clear();
+    lap_start = std::chrono::steady_clock::now();
     // Flash white balance: develop the flash frame (given last), compare the ambient one.
     const RawImage *white_order[2] = {nullptr, nullptr};
     const bool white_map = options.flash_white.enabled && !options.flash.enabled && source.burst &&
@@ -1230,28 +1485,54 @@ struct FilmEngine::Impl
         // matched by structure. So is the ambient frame against a flash reference.
         std::vector<char> same(frames.size(), 0);
         if(options.flash.enabled || white_map) same.back() = 2;
-        if(!align_burst(frames, alignment, error, &same)) return false;
+        const bool pair = options.flash.enabled || white_map;
+        if(!pair && options.frame_exposure.size() >= frames.size() && options.frame_exposure[0] > 0)
+        { // A burst whose exposures the camera reports: the GPU aligns; only frames
+          // exposed differently get their exposure measured.
+          alignment.gain.assign(frames.size(), 1.0f);
+          const GainReference reference(*frames[0]);
+          std::vector<std::thread> workers;
+          for(size_t f = 1; f < frames.size(); f++)
+          {
+            const float hint = options.frame_exposure[f] / options.frame_exposure[0];
+            if(std::fabs(std::log2(std::max(hint, 1e-6f))) >= 0.02f)
+              workers.emplace_back([&, f, hint] { alignment.gain[f] = reference.gain(*frames[f], hint); });
+          }
+          for(std::thread &t : workers) t.join();
+          for(size_t f = 1; f < frames.size(); f++)
+          {
+            const float hint = options.frame_exposure[f] / options.frame_exposure[0];
+            char k[48];
+            std::snprintf(k, sizeof(k), "帧 %d 曝光比（请求 / 实测）", static_cast<int>(f));
+            note("对齐", k, "%.3f / %.3f", hint, alignment.gain[f] > 0 ? 1.0f / alignment.gain[f] : 0.0f);
+          }
+        }
+        else if(!align_burst(frames, alignment, error, &same, pair)) return false;
       }
     }
     else src.burst_count = 0;
+    if(src.burst_count > 1) lap("对齐");
     const bool flash = options.flash.enabled && src.burst_count >= 2;
+    warp = {};
+    for(int &m : crop) m = 0;
     if((flash || white_map) && !alignment.offsets.empty())
-    { // The flash re-lights the scene, which misleads per-tile matching: tiles of one
-      // frame then disagree and the flash-only light shows their seams. The frames are
-      // a fraction of a second apart, so one global shift (the tiles' median) is used.
-      const int tiles = alignment.tiles_x * alignment.tiles_y;
-      int32_t *o = &alignment.offsets[static_cast<size_t>(src.burst_count - 1) * tiles * 2];
-      std::vector<int32_t> xs, ys;
-      for(int t = 0; t < tiles; t++) { xs.push_back(o[2 * t]); ys.push_back(o[2 * t + 1]); }
-      std::nth_element(xs.begin(), xs.begin() + tiles / 2, xs.end());
-      std::nth_element(ys.begin(), ys.begin() + tiles / 2, ys.end());
-      const int32_t mx = xs[tiles / 2] & ~1, my = ys[tiles / 2] & ~1; // keep the CFA phase
-      for(int t = 0; t < tiles; t++) { o[2 * t] = mx; o[2 * t + 1] = my; }
+    { // The flash re-lights the scene, which misleads per-tile matching, and per-tile
+      // shifts would show their seams in the flash-only light. The frames are a few
+      // hundred milliseconds apart: one similarity (shift, roll, zoom) for the whole
+      // frame, fitted to the tiles that agree.
+      warp = fit_warp(*src.burst[0], *src.burst[src.burst_count - 1], alignment, src.burst_count - 1);
+      if(flash)
+      { // Where the flash frame has no data the mix cannot be made: crop it away, plus
+        // the mix's widest neighbourhood (+-8 samples) and interpolation on that side.
+        warp_margins(warp, src.burst[0]->width, src.burst[0]->height, 0, crop);
+        for(int &m : crop)
+          if(m > 0) m += 12;
+      }
     }
     flash_ambient_k = 1.0f;
-    if(white_map && src.burst_count == 2) flash_ambient_k = flash_ambient_scale(*src.burst[0], *src.burst[1], alignment, 1);
+    if(white_map && src.burst_count == 2) flash_ambient_k = flash_ambient_scale(*src.burst[0], *src.burst[1], warp);
     float level = 0.0f;
-    if(flash) level = flash_level(*src.burst[0], *src.burst[src.burst_count - 1], alignment, src.burst_count - 1);
+    if(flash) level = flash_level(*src.burst[0], *src.burst[src.burst_count - 1], warp);
     if(src.raw)
     {
       src.width = src.raw->width;
@@ -1327,6 +1608,14 @@ struct FilmEngine::Impl
         note("对齐", k, "位移中位 (%d, %d) px，范围 x %d…%d y %d…%d，曝光比 %.3f", xs[tiles / 2], ys[tiles / 2], *x0, *x1, *y0,
              *y1, g > 0 ? 1.0f / g : 0.0f);
       }
+      if(flash || white_map)
+      {
+        note("对齐", "闪光帧整体配准", warp.fitted ? "拟合（平移 + 旋转 + 缩放）" : "只用中位平移（可用分块不足）");
+        note("对齐", "平移 / 旋转 / 缩放", "(%.1f, %.1f) px / %.3f° / %.4f", warp.tx, warp.ty, warp.degrees(), warp.scale());
+        note("对齐", "参与分块 / 吻合分块 / 残差", "%d / %d / %.2f px", warp.tiles, warp.used, warp.residual);
+        if(flash)
+          note("对齐", "裁边（左 上 右 下）", "%d %d %d %d px", crop[0], crop[1], crop[2], crop[3]);
+      }
     }
     if(src.raw)
     {
@@ -1337,6 +1626,7 @@ struct FilmEngine::Impl
            options.match_key > 0 && key > 0 ? std::clamp(std::log2(options.match_key / key), -6.0f, 6.0f) : 0.0f);
       note("冲洗曝光", "最终曝光", "%+.2f EV", opts.exposure_ev);
     }
+    if(opts.local_tone > 0.0f) choose_tone(src.raw, opts.exposure_ev, std::min(opts.local_tone, 1.0f));
     if(flash)
     {
       note("闪光", "合成", "环境光增益 %.3f，目标 %.3f，上限 %.2f", opts.flash.ambient, opts.flash.target, opts.flash.max_gain);
@@ -1351,12 +1641,17 @@ struct FilmEngine::Impl
            options.flash_white.flash[1], options.flash_white.flash[2]);
       note("闪光", "闪光帧 / 环境帧曝光比", "%.3f", flash_ambient_k);
     }
+    lap(src.burst_count > 1 ? "统计" : "对齐与统计");
     const bool ok = develop_source(src, raw_params, opts, result, error);
+    if(ok && flash) crop_result(result, src.width, src.height);
     if(ok)
     {
       note("冲洗结果", "输出尺寸", "%dx%d", result.width, result.height);
       note("冲洗结果", "GPU 计算", "%d 个 pass，GPU %.1f ms，显存峰值 %.1f MB", result.passes, result.gpu_ms,
            result.peak_image_bytes / 1048576.0);
+      if(!result.gpu_breakdown.empty()) note("冲洗结果", "GPU 最耗时的步骤", "%s", result.gpu_breakdown.c_str());
+      lap("裁边");
+      note("冲洗结果", "引擎各步用时", "%s ms", laps.c_str());
     }
     result.note = record;
     return ok;
@@ -1475,6 +1770,7 @@ struct FilmEngine::Impl
 
     int output = -1;
     Graph g = build_graph(params, w, h, source, options, output);
+    lap("建图");
 
     // Lifetime-based reuse: a logical image takes a free physical image of the
     // same size and format at its first write and returns it after its last read.
@@ -1520,7 +1816,7 @@ struct FilmEngine::Impl
           Image image;
           VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
           if(static_cast<int>(id) == output) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-          ok = create_image(image, want.width, want.height, want.format, usage, error);
+          ok = take_image(image, want.width, want.height, want.format, usage, error);
           physical.push_back(image);
           mapping[id] = static_cast<int>(physical.size()) - 1;
         }
@@ -1548,13 +1844,15 @@ struct FilmEngine::Impl
     const size_t map_bytes = static_cast<size_t>(map_w) * map_h * 16;
     uploads.resize(frames);
     for(int f = 0; ok && f < frames; f++)
-      ok = create_image(uploads[f], source.width, source.height, upload_format,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, error);
+      ok = take_image(uploads[f], source.width, source.height, upload_format,
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, error);
     if(ok)
-      ok = create_image(gain, map_w, map_h, VK_FORMAT_R32G32B32A32_SFLOAT,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, error);
-    if(ok) ok = create_buffer(staging, map_offset + map_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, error);
-    if(ok) ok = create_buffer(readback, static_cast<VkDeviceSize>(w) * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, error);
+      ok = take_image(gain, map_w, map_h, VK_FORMAT_R32G32B32A32_SFLOAT,
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, error);
+    if(ok) ok = take_buffer(cached_staging, staging, map_offset + map_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, error);
+    if(ok)
+      ok = take_buffer(cached_readback, readback, static_cast<VkDeviceSize>(w) * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                       error);
     if(ok)
       ok = create_buffer(offsets, std::max<size_t>(16, alignment.offsets.size() * sizeof(int32_t)),
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, error);
@@ -1578,6 +1876,7 @@ struct FilmEngine::Impl
       }
       if(!alignment.offsets.empty())
         std::memcpy(offsets.mapped, alignment.offsets.data(), alignment.offsets.size() * sizeof(int32_t));
+      lap("分配与暂存");
     }
 
     // Descriptor sets: one shared set 0, one set 1 per pass.
@@ -1614,7 +1913,7 @@ struct FilmEngine::Impl
       for(const Image &image : uploads) fresh.push_back(image.image);
       for(const Image &image : physical) fresh.push_back(image.image);
       to_general(cmd, fresh);
-      if(queries) vkCmdResetQueryPool(cmd, queries, 0, 2);
+      if(queries) vkCmdResetQueryPool(cmd, queries, 0, kMaxQueries);
       VkBufferImageCopy region;
       for(int f = 0; f < frames; f++)
       {
@@ -1644,8 +1943,17 @@ struct FilmEngine::Impl
         memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        if(queries && i + 1 < kMaxQueries)
+          vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, static_cast<uint32_t>(i + 1));
+        // A phone GPU stops a submission that runs for seconds (VK_ERROR_DEVICE_LOST):
+        // the heavy burst passes go one per submission, the rest in groups.
+        const bool heavy = pass.kernel == kHpAlign || pass.kernel == kHpMerge;
+        if(i + 1 < n_passes && (heavy || (i + 1) % 16 == 0))
+        {
+          ok = submit_and_wait(error) && begin(error);
+          if(!ok) break;
+        }
       }
-      if(queries) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
       memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
       copy_region(region, w, h);
@@ -1654,6 +1962,7 @@ struct FilmEngine::Impl
       memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                      VK_ACCESS_HOST_READ_BIT);
       ok = submit_and_wait(error);
+      lap("GPU");
     }
     if(ok)
     {
@@ -1663,19 +1972,53 @@ struct FilmEngine::Impl
                           static_cast<const uint8_t *>(readback.mapped) + static_cast<size_t>(w) * h * 4);
       result.passes = static_cast<int>(n_passes);
       result.gpu_ms = 0.0;
-      uint64_t stamps[2];
-      if(queries && vkGetQueryPoolResults(device, queries, 0, 2, sizeof(stamps), stamps, sizeof(uint64_t),
-                                          VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-        result.gpu_ms = static_cast<double>(stamps[1] - stamps[0]) * limits.timestampPeriod * 1e-6;
+      const uint32_t stamped = static_cast<uint32_t>(std::min<size_t>(n_passes + 1, kMaxQueries));
+      std::vector<uint64_t> stamps(stamped);
+      if(queries && vkGetQueryPoolResults(device, queries, 0, stamped, stamps.size() * sizeof(uint64_t), stamps.data(),
+                                          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+      {
+        result.gpu_ms = static_cast<double>(stamps.back() - stamps[0]) * limits.timestampPeriod * 1e-6;
+        // Time per kernel, for the record: where the GPU time went.
+        std::array<double, kKernelCount> per{};
+        for(uint32_t k = 1; k < stamped; k++)
+          per[g.passes[k - 1].kernel] += static_cast<double>(stamps[k] - stamps[k - 1]) * limits.timestampPeriod * 1e-6;
+        std::vector<int> order(kKernelCount);
+        for(int k = 0; k < kKernelCount; k++) order[k] = k;
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return per[a] > per[b]; });
+        std::string top;
+        for(int k = 0; k < 6 && per[order[k]] > 0.05; k++)
+        {
+          char item[64];
+          std::snprintf(item, sizeof(item), "%s%s %.1f", top.empty() ? "" : "，", kKernels[order[k]].name, per[order[k]]);
+          top += item;
+        }
+        result.gpu_breakdown = top + " ms";
+      }
     }
 
     if(pool) vkDestroyDescriptorPool(device, pool, nullptr);
-    for(Image &image : physical) destroy(image);
-    for(Image &image : uploads) destroy(image);
-    destroy(gain);
+    // Keep this develop's memory for the next one; what it did not use goes.
+    for(Image &image : image_cache) destroy(image);
+    image_cache.clear();
+    if(ok)
+    {
+      for(Image &image : physical) image_cache.push_back(image);
+      for(Image &image : uploads) image_cache.push_back(image);
+      image_cache.push_back(gain);
+      destroy(cached_staging);
+      destroy(cached_readback);
+      cached_staging = staging;
+      cached_readback = readback;
+    }
+    else
+    {
+      for(Image &image : physical) destroy(image);
+      for(Image &image : uploads) destroy(image);
+      destroy(gain);
+      destroy(staging);
+      destroy(readback);
+    }
     destroy(offsets);
-    destroy(staging);
-    destroy(readback);
     return ok;
   }
 
@@ -1737,7 +2080,7 @@ struct FilmEngine::Impl
         // Float32 and integer textures are only texelFetch'ed: no filtering support needed.
         const bool unfiltered = ref.kind == Ref::FilmsimLut || ref.kind == Ref::SpectraLut ||
                                 ref.kind == Ref::GainMap || image.format == VK_FORMAT_R16_UINT ||
-                                image.format == VK_FORMAT_R32_UINT;
+                                image.format == VK_FORMAT_R32_UINT || image.format == VK_FORMAT_R32G32B32A32_SFLOAT;
         image_infos.push_back({unfiltered ? nearest : linear, image.view, VK_IMAGE_LAYOUT_GENERAL});
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstSet = sets[i];
@@ -1848,6 +2191,37 @@ float raw_key(const RawImage &raw)
       weight_sum += w;
     }
   return static_cast<float>(std::exp(log_sum / weight_sum) - 1e-4);
+}
+
+float raw_luminance_quantile(const RawImage &raw, float q)
+{
+  // Every 4th Bayer quad each way, rendered as raw_key does (no shading map: the
+  // quantile only needs the bright end, near the centre for most frames).
+  const float *m = raw.camera_to_rec2020;
+  const float yr = 0.2627f * m[0] + 0.6780f * m[3] + 0.0593f * m[6];
+  const float yg = 0.2627f * m[1] + 0.6780f * m[4] + 0.0593f * m[7];
+  const float yb = 0.2627f * m[2] + 0.6780f * m[5] + 0.0593f * m[8];
+  std::vector<float> ys;
+  for(int qy = 0; qy < raw.height / 2; qy += 4)
+    for(int qx = 0; qx < raw.width / 2; qx += 4)
+    {
+      float rgb[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+      for(int position = 0; position < 4; position++)
+      {
+        const int x = 2 * qx + (position & 1), y = 2 * qy + (position >> 1);
+        const float black = raw.black[position];
+        const float v = (raw.cfa[size_t(y) * raw.width + x] - black) / (raw.white - black);
+        const int colour = raw.cfa_colour[position];
+        rgb[colour] += std::max(v, 0.0f) * raw.wb[colour];
+        n[colour] += 1;
+      }
+      for(int k = 0; k < 3; k++) rgb[k] = n[k] > 0 ? rgb[k] / n[k] : 0.0f;
+      ys.push_back(std::max(0.0f, yr * rgb[0] + yg * rgb[1] + yb * rgb[2]));
+    }
+  if(ys.empty()) return 0.0f;
+  auto at = ys.begin() + static_cast<long>(std::clamp(q, 0.0f, 1.0f) * (ys.size() - 1));
+  std::nth_element(ys.begin(), at, ys.end());
+  return *at;
 }
 
 FilmEngine::FilmEngine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

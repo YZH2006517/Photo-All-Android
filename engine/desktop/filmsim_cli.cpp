@@ -149,6 +149,7 @@ int main(int argc, char **argv)
     else if(arg == "--spectra") spectra_path = next();
     else if(arg == "--in") in_path = next();
     else if(arg == "--also") burst_paths.push_back(next()); // more DNGs: HDR burst merge
+    else if(arg == "--exposure") options.frame_exposure.push_back(std::stof(next())); // per frame, in order
     else if(arg == "--lut") creative_path = next();         // RGB8 33^3 creative LUT
     else if(arg == "--lut-strength") creative_strength = std::stof(next());
     else if(arg == "--out") out_path = next();
@@ -269,6 +270,15 @@ int main(int argc, char **argv)
   std::cout << "film: " << film::kFilmStocks[params.film] << " / paper: " << film::kPapers[params.paper] << "\n"
             << "size: " << result.width << "x" << result.height << ", passes: " << result.passes
             << ", peak GPU images: " << result.peak_image_bytes / (1024.0 * 1024.0) << " MiB\n"
-            << "init: " << ms(t0, t1) << " ms, develop: " << ms(t1, t2) << " ms, GPU: " << result.gpu_ms << " ms\n";
+            << "init: " << ms(t0, t1) << " ms, develop: " << ms(t1, t2) << " ms, GPU: " << result.gpu_ms << " ms\n"
+            << "GPU breakdown: " << result.gpu_breakdown << "\n";
+  for(size_t at = 0; at < result.note.size();)
+  { // the alignment and timing lines of the record
+    const size_t end = result.note.find('\n', at);
+    const std::string line = result.note.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    if(line.rfind("对齐", 0) == 0 || line.find("用时") != std::string::npos) std::cout << line << "\n";
+    if(end == std::string::npos) break;
+    at = end + 1;
+  }
   return 0;
 }

@@ -82,7 +82,7 @@ const float kSensitivity[3] = {0.5f, 1.0f, 0.6f};   // camera RGB response (inve
 float g_tint[3] = {1, 1, 1};
 
 film::RawImage capture(const std::vector<float> &s, int w, int h, float exposure, int dx, int dy, uint32_t seed,
-                       float noise = 1.0f, float flash = 0.0f)
+                       float noise = 1.0f, float flash = 0.0f, float roll_deg = 0.0f)
 {
   film::RawImage raw;
   raw.width = w & ~1;
@@ -102,7 +102,12 @@ film::RawImage capture(const std::vector<float> &s, int w, int h, float exposure
     for(int x = 0; x < raw.width; x++)
     {
       const int c = (x & 1) + (y & 1); // R, G, G, B for RGGB
-      const int sx = std::clamp(x + dx, 0, w - 1), sy = std::clamp(y + dy, 0, h - 1);
+      // the camera rolled by roll_deg about the frame centre, then shifted
+      const float cr = std::cos(roll_deg * 0.0174533f), sr = std::sin(roll_deg * 0.0174533f);
+      const float rx = 0.5f * w + cr * (x - 0.5f * w) - sr * (y - 0.5f * h);
+      const float ry = 0.5f * h + sr * (x - 0.5f * w) + cr * (y - 0.5f * h);
+      const int sx = std::clamp(static_cast<int>(std::lround(rx)) + dx, 0, w - 1);
+      const int sy = std::clamp(static_cast<int>(std::lround(ry)) + dy, 0, h - 1);
       const float scene = s[(static_cast<size_t>(sy) * w + sx) * 3 + c];
       const float ux = (sx - 0.5f * w) / (0.35f * w), uy = (sy - 0.45f * h) / (0.35f * w);
       const float falloff = flash > 0.0f ? flash / (1.0f + 4.0f * (ux * ux + uy * uy)) : 0.0f;
@@ -135,6 +140,8 @@ int main(int argc, char **argv)
   int shorts = 3;
   float ltm = 0.5f;
   float flash_peak = 3.0f;
+  float flash_roll = 0.0f;
+  int motion = 0;
   float chroma = 0.0f;
   float luma = 0.0f;
   std::vector<std::string> sets;
@@ -153,6 +160,8 @@ int main(int argc, char **argv)
     else if(arg == "--chroma") chroma = std::stof(next());
     else if(arg == "--denoise") luma = std::stof(next());
     else if(arg == "--flash-peak") flash_peak = std::stof(next());
+    else if(arg == "--flash-roll") flash_roll = std::stof(next());
+    else if(arg == "--motion") motion = std::stoi(next());
     else if(arg == "--noise")
     {
       const float k = std::stof(next());
@@ -204,7 +213,7 @@ int main(int argc, char **argv)
     std::vector<film::RawImage> fr;
     fr.push_back(capture(sc, w, h, exposure, 0, 0, 3));
     fr.push_back(capture(sc, w, h, exposure, 0, 0, 4));
-    fr.push_back(capture(sc, w, h, exposure, 12, -6, 5, 1.0f, flash_peak));
+    fr.push_back(capture(sc, w, h, exposure, 12, -6, 5, 1.0f, flash_peak, flash_roll));
     { // what alignment makes of it, as the develop does (flash frame: same exposure)
       std::vector<const film::RawImage *> v{&fr[0], &fr[2]};
       std::vector<char> same{0, 2};
@@ -300,6 +309,18 @@ int main(int argc, char **argv)
   std::vector<film::RawImage> frames;
   for(int i = 0; i < shorts; i++) frames.push_back(capture(s, w, h, short_exposure, 0, 0, 11 + i));
   frames.push_back(capture(s, w, h, long_exposure, 6, -4, 97));
+  // --motion: something moves between the frames - a box in the middle of every frame
+  // after the first is replaced by what lies `motion` pixels per frame to its left.
+  if(motion > 0)
+    for(size_t i = 1; i < frames.size(); i++)
+    {
+      film::RawImage &f = frames[i];
+      const film::RawImage copy = f;
+      const int shift = (motion * static_cast<int>(i)) & ~1; // keep the CFA phase
+      for(int y = f.height * 2 / 5; y < f.height * 3 / 5; y++)
+        for(int x = f.width * 2 / 5; x < f.width * 3 / 5; x++)
+          f.cfa[static_cast<size_t>(y) * f.width + x] = copy.cfa[static_cast<size_t>(y) * f.width + x - shift];
+    }
   // What HDR off shoots: one frame at the metered exposure, 1.7 stops over the shorts.
   const float under = 1.7f;
   const film::RawImage metered = capture(s, w, h, short_exposure * std::exp2(under), 0, 0, 5);

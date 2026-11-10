@@ -4,9 +4,14 @@
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Only to list the app's own folder again after its data was cleared or it was
+         reinstalled: the system then no longer counts those photos as the app's. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <application
-        android:label="胶片相机"
+        android:label="Photo All"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/FilmTheme"
@@ -15,15 +20,27 @@
             android:name=".camera.CameraActivity"
             android:exported="true"
             android:screenOrientation="portrait"
+            android:rotationAnimation="jumpcut"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <activity android:name=".settings.SettingsActivity" android:exported="false" />
-        <activity android:name=".gallery.GalleryActivity" android:exported="false" />
-        <activity android:name=".gallery.ViewerActivity" android:exported="false" />
+        <activity android:name=".settings.SettingsActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".settings.GuideActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.GalleryActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.ViewerActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.FrameActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.ImportActivity" android:exported="false" android:screenOrientation="portrait" />
+        <!-- the app's own photo folder, for sharing and opening those photos -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="org.photoall.film.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/photo_paths" />
+        </provider>
         <!-- engine test bench; also the adb benchmark entry point -->
         <activity android:name=".MainActivity" android:exported="true" />
     </application>

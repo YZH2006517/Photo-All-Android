@@ -1,0 +1,4 @@
+Retro camera LUTs from https://github.com/ganjmeng/dazz-retro-camera
+(flutter_app/assets/lut/cameras), MIT License, Copyright (c) 2026 DAZZ Team.
+Converted to 33^3 RGB8 by tools/convert_dazzretro.py; the full license text is in
+third_party/dazz-retro/LICENSE.

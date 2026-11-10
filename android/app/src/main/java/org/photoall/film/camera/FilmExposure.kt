@@ -41,12 +41,30 @@ private const val TAG = "FilmExposure"
  *    matrix), auto white balance by the HAL.
  * A known sRGB tone curve is always requested, which the preview LUT and meter assume.
  */
+/** Camera characteristics, from CameraX (Camera2CameraInfo) or straight from Camera2. */
+interface Characteristics {
+    fun <T> get(key: CameraCharacteristics.Key<T>): T?
+}
+
+/** Where request settings go: a CameraX options builder or a Camera2 request builder. */
+interface RequestSink {
+    fun <T : Any> put(key: CaptureRequest.Key<T>, value: T): RequestSink
+}
+
 @OptIn(ExperimentalCamera2Interop::class)
 class FilmExposure(
-    private val chars: Camera2CameraInfo,
+    private val chars: Characteristics,
     private val calibration: Calibration?,
     private val apply: (CaptureRequestOptions) -> Unit,
 ) {
+    /**
+     * A zero-lag burst session runs the sensor this many stops under the meter (the
+     * viewfinder shows it brighter): the RAW frames keep their highlights.
+     */
+    var under = 0.0
+    /** Set while a Camera2 session (not CameraX) owns the camera: it takes the settings. */
+    var onSettings: (() -> Unit)? = null
+
     // ----- settings, written by the activity, then push() -----------------------
     /** Film rules on: metering pattern, highlight protection, film ISO, calibrated WB. */
     var filmRules = false
@@ -114,18 +132,18 @@ class FilmExposure(
     /** The exposure currently frozen on the sensor (a still or burst in progress), or null. */
     val held: Exposure? get() = hold
 
-    private val activeArray: Rect? = chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-    private val isoRange = chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-    private val timeRange = chars.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-    private val compensationRange = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
-    private val compensationStep = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
+    private val activeArray: Rect? = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+    private val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+    private val timeRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+    private val compensationRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+    private val compensationStep = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
         ?.toDouble()?.takeIf { it > 0 } ?: (1.0 / 3)
-    private val maxAeRegions = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
-    private val boostRange = chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
+    private val maxAeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+    private val boostRange = chars.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
     /** The lens has a flash unit (its LED serves the flash frame as a torch at full strength). */
-    val hasFlash: Boolean = chars.getCameraCharacteristic(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+    val hasFlash: Boolean = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
     private val torchMaxLevel: Int = if (Build.VERSION.SDK_INT >= 35)
-        chars.getCameraCharacteristic(CameraCharacteristics.FLASH_TORCH_STRENGTH_MAX_LEVEL) ?: 1 else 1
+        chars.get(CameraCharacteristics.FLASH_TORCH_STRENGTH_MAX_LEVEL) ?: 1 else 1
     /** The next still fires the flash (AE meters with a pre-flash); single-frame flash. */
     var flashShot = false
         private set
@@ -148,9 +166,14 @@ class FilmExposure(
     /** The flash LED is lit (for a flash frame); only together with a hold. */
     var torch = false
         private set
+    /**
+     * Steady fill light: the flash LED lit as a torch all the time, at this share of its
+     * strength (the strength only where the phone lets it be set). Null: off.
+     */
+    var steadyLight: Float? = null
     /** Android 16 AE priority: the HAL keeps our ISO and meters with the shutter. */
     val isoPriority: Boolean = Build.VERSION.SDK_INT >= 36 &&
-        chars.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_PRIORITY_MODES)
+        chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_PRIORITY_MODES)
             ?.contains(CameraMetadata.CONTROL_AE_PRIORITY_MODE_SENSOR_SENSITIVITY_PRIORITY) == true
 
     private var highlightBias = 0.0  // film rules: stops taken off for clipped highlights
@@ -201,7 +224,10 @@ class FilmExposure(
         }
     }
 
-    fun push() = apply(options())
+    fun push() {
+        val direct = onSettings
+        if (direct != null) direct() else apply(options())
+    }
 
     /**
      * Viewfinder highlight statistics (fraction of near-white samples). With highlight
@@ -354,48 +380,75 @@ class FilmExposure(
         (hold?.let { " held ${it.label()}" } ?: "")
 
     fun options(): CaptureRequestOptions {
-        val o = CaptureRequestOptions.Builder()
-            .setCaptureRequestOption(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
+        val b = CaptureRequestOptions.Builder()
+        fill(object : RequestSink {
+            override fun <T : Any> put(key: CaptureRequest.Key<T>, value: T): RequestSink {
+                b.setCaptureRequestOption(key, value)
+                return this
+            }
+        })
+        return b.build()
+    }
+
+    /** The settings for a Camera2 request builder (a zero-lag session). */
+    fun fill(builder: CaptureRequest.Builder) = fill(object : RequestSink {
+        override fun <T : Any> put(key: CaptureRequest.Key<T>, value: T): RequestSink {
+            builder.set(key, value)
+            return this
+        }
+    })
+
+    private fun fill(o: RequestSink) {
+        o.put(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
                 CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
-            .setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_PRESET_CURVE)
-            .setCaptureRequestOption(CaptureRequest.TONEMAP_PRESET_CURVE, CaptureRequest.TONEMAP_PRESET_CURVE_SRGB)
+            .put(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_PRESET_CURVE)
+            .put(CaptureRequest.TONEMAP_PRESET_CURVE, CaptureRequest.TONEMAP_PRESET_CURVE_SRGB)
 
         val fixed = hold ?: manual
         if (fixed != null) {
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, fixed.iso)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, fixed.timeNs)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(fixed.timeNs, 33_333_333L))
+            o.put(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                .put(CaptureRequest.SENSOR_SENSITIVITY, fixed.iso)
+                .put(CaptureRequest.SENSOR_EXPOSURE_TIME, fixed.timeNs)
+                .put(CaptureRequest.SENSOR_FRAME_DURATION, max(fixed.timeNs, 33_333_333L))
             // No digital gain after the raw: the sensor gets the whole requested exposure.
-            boostRange?.let { o.setCaptureRequestOption(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, it.lower) }
-            if (torch && hasFlash) {
-                o.setCaptureRequestOption(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
-                if (Build.VERSION.SDK_INT >= 35 && torchMaxLevel > 1)
-                    o.setCaptureRequestOption(CaptureRequest.FLASH_STRENGTH_LEVEL, torchMaxLevel)
-            }
+            boostRange?.let { o.put(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, it.lower) }
         } else {
             // A flash shot lets the HAL fire the flash and meter it (pre-flash); CameraX runs
             // the precapture sequence for it.
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE,
+            o.put(CaptureRequest.CONTROL_AE_MODE,
                 if (flashShot && hasFlash) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH else CaptureRequest.CONTROL_AE_MODE_ON)
-            val bias = evStops + if (filmRules) highlightBias else 0.0
+            val bias = evStops - under + if (filmRules) highlightBias else 0.0
             val range = compensationRange
             val index = (bias / compensationStep).roundToInt().let { if (range != null) it.coerceIn(range.lower, range.upper) else it }
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, index)
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, when (antibanding) {
+            o.put(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, index)
+            o.put(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, when (antibanding) {
                 0 -> CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_50HZ
                 1 -> CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_60HZ
                 else -> CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_OFF
             })
             if (filmRules) {
-                meteringRegion()?.let { o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it)) }
+                meteringRegion()?.let { o.put(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it)) }
                 if (filmIso > 0 && isoPriority && Build.VERSION.SDK_INT >= 36) {
-                    o.setCaptureRequestOption(CaptureRequest.CONTROL_AE_PRIORITY_MODE,
+                    o.put(CaptureRequest.CONTROL_AE_PRIORITY_MODE,
                         CameraMetadata.CONTROL_AE_PRIORITY_MODE_SENSOR_SENSITIVITY_PRIORITY)
-                        .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY,
+                        .put(CaptureRequest.SENSOR_SENSITIVITY,
                             filmIso.coerceIn(isoRange?.lower ?: 50, isoRange?.upper ?: 6400))
                 }
             }
+        }
+
+        // The LED as a torch: full strength for a flash frame, else the steady fill light.
+        val level = when {
+            !hasFlash -> null
+            torch -> 1f
+            flashShot -> null
+            else -> steadyLight
+        }
+        if (level != null) {
+            o.put(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+            if (Build.VERSION.SDK_INT >= 35 && torchMaxLevel > 1)
+                o.put(CaptureRequest.FLASH_STRENGTH_LEVEL,
+                    (level * torchMaxLevel).roundToInt().coerceIn(1, torchMaxLevel))
         }
 
         val kelvin = fixedKelvin
@@ -405,20 +458,30 @@ class FilmExposure(
             // the matching camera -> sRGB matrix, instead of the HAL's preset guess.
             val (r, b) = cal.pointAt(kelvin)
             val ccm = cal.cameraToSrgb(kelvin)
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_MODE,
+            o.put(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+                .put(CaptureRequest.COLOR_CORRECTION_MODE,
                     CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-                .setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_GAINS,
+                .put(CaptureRequest.COLOR_CORRECTION_GAINS,
                     RggbChannelVector(Calibration.clampGain(1 / r).toFloat(), 1f, 1f, Calibration.clampGain(1 / b).toFloat()))
-                .setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_TRANSFORM,
+                .put(CaptureRequest.COLOR_CORRECTION_TRANSFORM,
                     ColorSpaceTransform(Array(9) { Rational((ccm[it] * 10000).roundToInt(), 10000) }))
-        } else o.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, if (filmRules) CaptureRequest.CONTROL_AWB_MODE_AUTO else awbPreset)
+        } else o.put(CaptureRequest.CONTROL_AWB_MODE, if (filmRules) CaptureRequest.CONTROL_AWB_MODE_AUTO else awbPreset)
 
         focusDiopters?.let {
-            o.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, it)
+            o.put(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                .put(CaptureRequest.LENS_FOCUS_DISTANCE, it)
         }
-        return o.build()
+    }
+
+    /** A square on the sensor around viewfinder point (u, v), 0..1 each: tap-to-focus areas. */
+    fun regionAt(u: Double, v: Double, half: Double = 0.06): MeteringRectangle? {
+        val area = activeArray ?: return null
+        val (cx, cy) = toSensor(u, v)
+        val x0 = ((cx - half).coerceIn(0.0, 1.0) * area.width()).toInt()
+        val y0 = ((cy - half).coerceIn(0.0, 1.0) * area.height()).toInt()
+        val x1 = ((cx + half).coerceIn(0.0, 1.0) * area.width()).toInt()
+        val y1 = ((cy + half).coerceIn(0.0, 1.0) * area.height()).toInt()
+        return MeteringRectangle(x0, y0, max(1, x1 - x0), max(1, y1 - y0), MeteringRectangle.METERING_WEIGHT_MAX)
     }
 
     /** Centre-weighted / spot rectangle on the sensor; null leaves the phone's matrix metering. */

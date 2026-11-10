@@ -43,14 +43,30 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
 
     /** CameraInfo.sensorRotationDegrees of the bound camera. */
     @Volatile var sensorRotation = 0
+    /**
+     * A front camera: its buffers come mirrored (the selfie view) by the SurfaceTexture
+     * transform, so the turn left for the screen runs the other way.
+     */
+    @Volatile var frontFacing = false
+
+    /**
+     * Linear gain on the camera frames: a zero-lag burst session runs the sensor under
+     * the meter and the viewfinder shows it as metered.
+     */
+    @Volatile var gain = 1f
+        set(value) { field = value; requestRender() }
 
     /** Focus peaking: outline in-focus edges in red (manual focus aid). */
     @Volatile var peaking = false
         set(value) { field = value; requestRender() }
 
-    /** Pinch: multiplicative zoom step. Tap: focus/meter at view coordinates. */
+    /**
+     * Pinch: multiplicative zoom step. Tap: focus/meter at view coordinates. Double tap:
+     * focus there and hold it.
+     */
     var onPinch: (Float) -> Unit = {}
     var onTap: (Float, Float) -> Unit = { _, _ -> }
+    var onDoubleTap: (Float, Float) -> Unit = { _, _ -> }
     private val pinch = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
             onPinch(detector.scaleFactor)
@@ -58,8 +74,13 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         }
     })
     private val taps = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
-        override fun onSingleTapUp(e: MotionEvent): Boolean {
+        // A single tap waits out the double-tap window to tell the two apart.
+        override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
             onTap(e.x, e.y)
+            return true
+        }
+        override fun onDoubleTap(e: MotionEvent): Boolean {
+            onDoubleTap(e.x, e.y)
             return true
         }
     })
@@ -82,6 +103,50 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         val lut = (data ?: ByteArray(0)) to size
         lastLut = lut
         pendingLut = lut
+        requestRender()
+    }
+
+    // A Camera2 session waiting for the GL surface: size, rotation and where to hand it.
+    private var pendingDirect: Triple<android.util.Size, Int, (Surface) -> Unit>? = null
+    private var directSurface: Surface? = null
+
+    /**
+     * A surface for a Camera2 session (not CameraX): buffers of [size], [rotationDegrees]
+     * from the sensor to upright; the camera applies its own orientation transform.
+     * [ready] runs on the GL thread.
+     */
+    fun provideDirect(size: android.util.Size, rotationDegrees: Int, ready: (Surface) -> Unit) {
+        queueEvent {
+            if (surfaceTexture == null) pendingDirect = Triple(size, rotationDegrees, ready)
+            else direct(size, rotationDegrees, ready)
+        }
+    }
+
+    /**
+     * The screen turned under a running Camera2 session: the same buffers, a new turn to
+     * upright. No new surface, so the picture keeps running.
+     */
+    fun setDirectRotation(rotationDegrees: Int) = queueEvent {
+        contentRotation = rotationDegrees
+        requestRender()
+    }
+
+    /** Counts GL surfaces made (a new one means the camera must be handed a new surface). */
+    @Volatile var surfaceGeneration = 0
+        private set
+
+    // GL thread.
+    private fun direct(size: android.util.Size, rotationDegrees: Int, ready: (Surface) -> Unit) {
+        val texture = surfaceTexture ?: return
+        texture.setDefaultBufferSize(size.width, size.height)
+        bufferWidth = size.width
+        bufferHeight = size.height
+        contentRotation = rotationDegrees
+        cameraTransform = true
+        directSurface?.release()
+        val surface = Surface(texture)
+        directSurface = surface
+        ready(surface)
         requestRender()
     }
 
@@ -111,6 +176,7 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        surfaceGeneration++
         program = buildProgram()
         val textures = IntArray(2)
         GLES30.glGenTextures(2, textures, 0)
@@ -126,6 +192,7 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         surfaceTexture?.release()
         surfaceTexture = SurfaceTexture(cameraTexture).apply { setOnFrameAvailableListener { requestRender() } }
         pendingRequest?.let { pendingRequest = null; provide(it) }
+        pendingDirect?.let { (size, rotation, ready) -> pendingDirect = null; direct(size, rotation, ready) }
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -154,6 +221,7 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uLutMap"), (n - 1f) / n, 0.5f / n)
         GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uTransform"), 1, false, transform, 0)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uPeaking"), if (peaking) 1 else 0)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGain"), gain)
         // One sensor-buffer texel in texture coordinates, for the edge detector.
         GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uTexel"),
             1f / bufferWidth.coerceAtLeast(1), 1f / bufferHeight.coerceAtLeast(1))
@@ -172,7 +240,11 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     /** Screen corners with buffer coordinates: centre-crop to fill, then undo sensor rotation. */
     private fun fillQuad() {
         // Only the rotation the SurfaceTexture matrix leaves undone is ours to apply.
-        val rotation = if (cameraTransform) (contentRotation - sensorRotation + 360) % 360 else contentRotation
+        val rotation = when {
+            !cameraTransform -> contentRotation
+            frontFacing -> (sensorRotation - contentRotation + 360) % 360
+            else -> (contentRotation - sensorRotation + 360) % 360
+        }
         val sideways = contentRotation == 90 || contentRotation == 270
         val contentAspect = if (sideways) bufferHeight.toFloat() / bufferWidth else bufferWidth.toFloat() / bufferHeight
         val viewAspect = width.toFloat() / height.coerceAtLeast(1)
@@ -232,11 +304,17 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             uniform vec2 uLutMap; // scale, offset onto texel centres
             uniform bool uPeaking;
             uniform vec2 uTexel;
+            uniform float uGain;
             in vec2 vTexcoord;
             out vec4 colour;
             float luma(vec2 t) { return dot(texture(uCamera, t).rgb, vec3(0.299, 0.587, 0.114)); }
             void main() {
               vec3 c = texture(uCamera, vTexcoord).rgb;
+              if (uGain != 1.0) { // sRGB -> linear, the gain, back
+                vec3 l = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)) * uGain;
+                l = clamp(l, 0.0, 1.0);
+                c = mix(12.92 * l, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, l));
+              }
               if (uHasLut) c = texture(uLut, clamp(c, 0.0, 1.0) * uLutMap.x + uLutMap.y).rgb;
               if (uPeaking) {
                 // Sobel on camera luma two texels apart: strong local contrast = in focus.

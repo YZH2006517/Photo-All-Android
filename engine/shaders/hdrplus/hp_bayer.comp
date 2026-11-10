@@ -1,0 +1,22 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Burst merge (HDR+), last step: the merged quads back to a Bayer mosaic in the
+// layout the develop reads after a merge (black-subtracted, 0..1 at `scale`).
+// Adapted from convert_to_bayer of hdr-plus-swift (GPL-3.0).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_acc;
+layout(set = 1, binding = 1, r32ui) uniform writeonly restrict uimage2D img_out;
+layout(push_constant) uniform push_t
+{
+  float scale;
+  int   pad0, pad1, pad2;
+} push;
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if(any(greaterThanEqual(p, imageSize(img_out)))) return;
+  vec4 quad = texelFetch(img_acc, min(p / 2, textureSize(img_acc, 0) - 1), 0);
+  float v = quad[(p.x & 1) + 2 * (p.y & 1)];
+  imageStore(img_out, p, uvec4(uint(clamp(v, 0.0, 1.0) * push.scale + 0.5)));
+}

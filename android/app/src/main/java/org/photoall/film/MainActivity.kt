@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     private var busy = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        org.photoall.film.ui.Style.apply(this)
         super.onCreate(savedInstanceState)
         status = TextView(this).apply { setPadding(24, 24, 24, 24) }
         preview = ImageView(this).apply {
