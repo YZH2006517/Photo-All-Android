@@ -142,6 +142,16 @@ class FilmExposure(
     private val boostRange = chars.get(CameraCharacteristics.CONTROL_POST_RAW_SENSITIVITY_BOOST_RANGE)
     /** The lens has a flash unit (its LED serves the flash frame as a torch at full strength). */
     val hasFlash: Boolean = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+    /**
+     * The flash fired by the LED lit steadily for the frame (as with manual exposure) instead
+     * of the HAL's metered flash: for phones that do not offer that mode, or offer it and do
+     * not fire (seen on some MediaTek phones). Set from the start when the mode is missing,
+     * and by the camera once a flash shot comes back unfired ([onFlashMissed]).
+     */
+    var flashByTorch: Boolean = hasFlash && chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)
+        ?.contains(CameraCharacteristics.CONTROL_AE_MODE_ON_ALWAYS_FLASH) != true
+    /** A still asked for the metered flash and the HAL reports it did not fire (camera thread). */
+    @Volatile var onFlashMissed: ((flashState: Int) -> Unit)? = null
     private val torchMaxLevel: Int = if (Build.VERSION.SDK_INT >= 35)
         chars.get(CameraCharacteristics.FLASH_TORCH_STRENGTH_MAX_LEVEL) ?: 1 else 1
     /** The next still fires the flash (AE meters with a pre-flash); single-frame flash. */
@@ -213,6 +223,12 @@ class FilmExposure(
             liveAeState = result.get(CaptureResult.CONTROL_AE_STATE) ?: -1
             // Still captures pass through this session callback too: log what each really got.
             if (request.get(CaptureRequest.CONTROL_CAPTURE_INTENT) == CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE) {
+                // the metered flash asked for and not given: the phone's flash needs the LED way
+                if (request.get(CaptureRequest.CONTROL_AE_MODE) == CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) {
+                    val state = result.get(CaptureResult.FLASH_STATE)
+                    if (state != null && state != CaptureResult.FLASH_STATE_FIRED && state != CaptureResult.FLASH_STATE_PARTIAL)
+                        onFlashMissed?.invoke(state)
+                }
                 val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
                 val neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
                 android.util.Log.i(TAG, "still result frame ${result.frameNumber}: ${e.label()} (sensor ISO $iso boost $boost)" +

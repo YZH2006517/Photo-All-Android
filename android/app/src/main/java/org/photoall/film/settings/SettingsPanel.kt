@@ -31,6 +31,8 @@ class SettingsPanel(
     private val open: MutableSet<String> = openOnDevice,
     /** The guide, as the list's first entry (the device's settings only). */
     onGuide: (() -> Unit)? = null,
+    /** Diagnostics to copy when something does not work (the device's settings only). */
+    onDiagnostics: (() -> Unit)? = null,
 ) : LinearLayout(context) {
     private val refreshers = mutableListOf<() -> Unit>()
 
@@ -74,6 +76,12 @@ class SettingsPanel(
             Style.pressable(this)
             setOnClickListener { onGuide() }
         }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+        if (onDiagnostics != null) list.addView(text("复制诊断信息（反馈问题时用）", 13f).apply {
+            setTextColor(Style.TEXT_2)
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+            Style.pressable(this)
+            setOnClickListener { onDiagnostics() }
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
         // One section per topic, folded until opened (the list was long and mixed). A topic's
         // settings are together even where the list interleaves them.
         val groups = LinkedHashMap<String, MutableList<Setting>>()

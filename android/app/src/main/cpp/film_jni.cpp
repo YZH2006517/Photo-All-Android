@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "film_engine.h"
+#include "jni_guard.h"
 
 namespace {
 
@@ -83,25 +84,32 @@ extern "C" {
 
 // Native byte buffers for DNGs written in memory: outside the Java heap (a burst is
 // ~25 MB a frame), freed explicitly.
-JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_bufferCreate(JNIEnv *, jclass, jlong capacity)
+JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_bufferCreate(JNIEnv *env, jclass, jlong capacity)
 {
+  JNI_TRY
   auto *b = new std::vector<uint8_t>();
   b->reserve(static_cast<size_t>(capacity));
   return reinterpret_cast<jlong>(b);
+  JNI_CATCH(env)
+  return 0;
 }
 
 JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferWrite(JNIEnv *env, jclass, jlong handle,
                                                                              jbyteArray data, jint offset, jint length)
 {
+  JNI_TRY
   auto *b = reinterpret_cast<std::vector<uint8_t> *>(handle);
   const size_t at = b->size();
   b->resize(at + static_cast<size_t>(length));
   env->GetByteArrayRegion(data, offset, length, reinterpret_cast<jbyte *>(b->data() + at));
+  JNI_CATCH(env)
+  return;
 }
 
 JNIEXPORT jboolean JNICALL Java_org_photoall_film_engine_FilmNative_bufferSave(JNIEnv *env, jclass, jlong handle,
                                                                                 jstring path)
 {
+  JNI_TRY
   auto *b = reinterpret_cast<std::vector<uint8_t> *>(handle);
   const char *chars = env->GetStringUTFChars(path, nullptr);
   FILE *f = std::fopen(chars, "wb");
@@ -110,15 +118,21 @@ JNIEXPORT jboolean JNICALL Java_org_photoall_film_engine_FilmNative_bufferSave(J
   const bool ok = std::fwrite(b->data(), 1, b->size(), f) == b->size();
   std::fclose(f);
   return ok ? JNI_TRUE : JNI_FALSE;
+  JNI_CATCH(env)
+  return JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferRelease(JNIEnv *, jclass, jlong handle)
+JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferRelease(JNIEnv *env, jclass, jlong handle)
 {
+  JNI_TRY
   delete reinterpret_cast<std::vector<uint8_t> *>(handle);
+  JNI_CATCH(env)
+  return;
 }
 
 JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *env, jclass, jobject asset_manager)
 {
+  JNI_TRY
   AAssetManager *assets = AAssetManager_fromJava(env, asset_manager);
   film::Lut filmsim, spectra;
   std::string error;
@@ -136,25 +150,36 @@ JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *
     return 0;
   }
   return reinterpret_cast<jlong>(handle.release());
+  JNI_CATCH(env)
+  return 0;
 }
 
-JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_destroy(JNIEnv *, jclass, jlong handle)
+JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_destroy(JNIEnv *env, jclass, jlong handle)
 {
+  JNI_TRY
   delete handle_of(handle);
+  JNI_CATCH(env)
+  return;
 }
 
 JNIEXPORT jstring JNICALL Java_org_photoall_film_engine_FilmNative_deviceName(JNIEnv *env, jclass, jlong handle)
 {
+  JNI_TRY
   return env->NewStringUTF(handle_of(handle)->engine->device().name.c_str());
+  JNI_CATCH(env)
+  return nullptr;
 }
 
 JNIEXPORT jobjectArray JNICALL Java_org_photoall_film_engine_FilmNative_names(JNIEnv *env, jclass, jboolean papers)
 {
+  JNI_TRY
   const char *const *names = papers ? film::kPapers : film::kFilmStocks;
   const int count = papers ? film::kPaperCount : film::kFilmCount;
   jobjectArray out = env->NewObjectArray(count, env->FindClass("java/lang/String"), nullptr);
   for(int i = 0; i < count; i++) env->SetObjectArrayElement(out, i, env->NewStringUTF(names[i]));
   return out;
+  JNI_CATCH(env)
+  return nullptr;
 }
 
 // Returns {width, height, passes, peak image bytes, gpu microseconds}; pixels stay
@@ -163,6 +188,7 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_develop(
     JNIEnv *env, jclass, jlong handle_value, jobject bitmap, jboolean source_p3, jobjectArray names,
     jfloatArray values, jint max_long_edge, jfloat exposure_ev, jint seed, jboolean output_p3)
 {
+  JNI_TRY
   Handle *handle = handle_of(handle_value);
   film::FilmParams params;
   film::Stages stages;
@@ -219,6 +245,8 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_develop(
   jlongArray result = env->NewLongArray(5);
   env->SetLongArrayRegion(result, 0, 5, out);
   return result;
+  JNI_CATCH(env)
+  return nullptr;
 }
 
 // Develops one DNG, or a burst of DNGs merged HDR+-style (first = reference). Each
@@ -233,6 +261,7 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
     jfloatArray neutral_override, jfloat noise_s, jfloat noise_o, jfloatArray flash_mix,
     jfloatArray flash_white, jfloatArray frame_exposure)
 {
+  JNI_TRY
   Handle *handle = handle_of(handle_value);
   film::FilmParams params;
   film::Stages stages;
@@ -299,10 +328,26 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
     std::vector<std::thread> workers;
     for(jsize i = 0; i < count; i++)
       workers.emplace_back([&, i] {
-        if(film::parse_dng(datas[i], sizes[i], raws[i], errors[i], has_neutral ? neutral : nullptr) && noise_s > 0.0f)
+        // an error escaping a std::thread ends the process: it becomes this frame's error
+        try
         {
-          raws[i].noise_scale = noise_s;
-          raws[i].noise_offset = noise_o;
+          if(film::parse_dng(datas[i], sizes[i], raws[i], errors[i], has_neutral ? neutral : nullptr) && noise_s > 0.0f)
+          {
+            raws[i].noise_scale = noise_s;
+            raws[i].noise_offset = noise_o;
+          }
+        }
+        catch(const std::bad_alloc &)
+        {
+          errors[i] = "out of memory reading DNG " + std::to_string(i);
+        }
+        catch(const std::exception &e)
+        {
+          errors[i] = std::string("DNG ") + std::to_string(i) + ": " + e.what();
+        }
+        catch(...)
+        {
+          errors[i] = "DNG " + std::to_string(i) + " unreadable";
         }
       });
     for(std::thread &t : workers) t.join();
@@ -385,12 +430,15 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
   jlongArray result = env->NewLongArray(6);
   env->SetLongArrayRegion(result, 0, 6, out);
   return result;
+  JNI_CATCH(env)
+  return nullptr;
 }
 
 // Creative LUT after the film: RGB8 size^3, red fastest; null clears it.
 JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_setCreativeLut(
     JNIEnv *env, jclass, jlong handle_value, jbyteArray rgb, jint size, jfloat strength)
 {
+  JNI_TRY
   Handle *handle = handle_of(handle_value);
   std::vector<uint8_t> table;
   if(rgb)
@@ -406,11 +454,14 @@ JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_setCreativeLut(
   std::string error;
   std::lock_guard<std::mutex> lock(handle->mutex);
   if(!handle->engine->set_creative_lut(rgb ? table.data() : nullptr, size, strength, error)) throw_java(env, error);
+  JNI_CATCH(env)
+  return;
 }
 
 JNIEXPORT jbyteArray JNICALL Java_org_photoall_film_engine_FilmNative_previewLut(
     JNIEnv *env, jclass, jlong handle_value, jobjectArray names, jfloatArray values, jint size, jboolean output_p3)
 {
+  JNI_TRY
   Handle *handle = handle_of(handle_value);
   film::FilmParams params;
   film::Stages stages;
@@ -430,19 +481,25 @@ JNIEXPORT jbyteArray JNICALL Java_org_photoall_film_engine_FilmNative_previewLut
   jbyteArray out = env->NewByteArray(static_cast<jsize>(rgba.size()));
   env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgba.size()), reinterpret_cast<const jbyte *>(rgba.data()));
   return out;
+  JNI_CATCH(env)
+  return nullptr;
 }
 
 // The last develop's record ("section\tkey\tvalue" lines).
 JNIEXPORT jstring JNICALL Java_org_photoall_film_engine_FilmNative_lastNote(JNIEnv *env, jclass, jlong handle_value)
 {
+  JNI_TRY
   Handle *handle = handle_of(handle_value);
   std::lock_guard<std::mutex> lock(handle->mutex);
   return env->NewStringUTF(handle->last.note.c_str());
+  JNI_CATCH(env)
+  return nullptr;
 }
 
 JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_copyResult(JNIEnv *env, jclass, jlong handle_value,
                                                                           jobject bitmap)
 {
+  JNI_TRY
   Handle *handle = handle_of(handle_value);
   std::lock_guard<std::mutex> lock(handle->mutex);
   const film::DevelopResult &last = handle->last;
@@ -464,6 +521,8 @@ JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_copyResult(JNIEn
     std::memcpy(static_cast<uint8_t *>(pixels) + static_cast<size_t>(y) * info.stride,
                 &last.rgba8[static_cast<size_t>(y) * last.width * 4], static_cast<size_t>(last.width) * 4);
   AndroidBitmap_unlockPixels(env, bitmap);
+  JNI_CATCH(env)
+  return;
 }
 
 } // extern "C"

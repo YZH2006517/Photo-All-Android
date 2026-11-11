@@ -119,6 +119,7 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
         params: Map<String, Float> = emptyMap(),
         options: DevelopOptions = DevelopOptions(),
     ): Developed {
+        org.photoall.film.CrashReport.stage("冲洗 ${source.width}×${source.height}")
         val rgba = if (source.config == Bitmap.Config.ARGB_8888) source else source.copy(Bitmap.Config.ARGB_8888, false)
         val sourceP3 = rgba.colorSpace?.let { it == ColorSpace.get(ColorSpace.Named.DISPLAY_P3) } ?: false
         val info = FilmNative.develop(
@@ -129,6 +130,7 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
         val space = ColorSpace.get(if (options.displayP3) ColorSpace.Named.DISPLAY_P3 else ColorSpace.Named.SRGB)
         val out = Bitmap.createBitmap(info[0].toInt(), info[1].toInt(), Bitmap.Config.ARGB_8888, false, space)
         FilmNative.copyResult(handle, out)
+        org.photoall.film.CrashReport.stage("冲洗完成")
         return Developed(out, info[2].toInt(), info[3], info[4] / 1000.0)
     }
 
@@ -147,6 +149,7 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
         params: Map<String, Float> = emptyMap(),
         options: DevelopOptions = DevelopOptions(),
     ): Developed {
+        org.photoall.film.CrashReport.stage("从 RAW 冲洗 ${sources.size} 帧")
         val info = FilmNative.developDng(
             checkOpen(), sources.toTypedArray(), params.keys.toTypedArray(), params.values.toFloatArray(),
             options.maxLongEdge, options.exposureEv, options.seed, options.displayP3, options.matchKey,
@@ -165,6 +168,7 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
             out = Bitmap.createBitmap(out, 0, 0, out.width, out.height, upright, true)
         }
         val rotatedAt = System.nanoTime()
+        org.photoall.film.CrashReport.stage("冲洗完成")
         val timing = "冲洗结果\t取图 / 旋转\t%.0f / %.0f ms\n".format(java.util.Locale.US,
             (copiedAt - developedAt) / 1e6, (rotatedAt - copiedAt) / 1e6)
         return Developed(out, info[2].toInt(), info[3], info[4] / 1000.0, FilmNative.lastNote(handle) + timing)
@@ -196,7 +200,13 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
 
     companion object {
         /** Loads filmsim/filmsim.lut and filmsim/spectra-em.lut from the app assets. */
-        fun create(assets: AssetManager) = FilmEngine(FilmNative.create(assets))
+        fun create(assets: AssetManager): FilmEngine {
+            org.photoall.film.CrashReport.stage("启动 GPU 引擎")
+            return FilmEngine(FilmNative.create(assets)).also {
+                runCatching { it.deviceName }.getOrNull()?.let { name -> org.photoall.film.CrashReport.gpuName(name) }
+                org.photoall.film.CrashReport.stage("GPU 引擎就绪")
+            }
+        }
 
         val filmStocks: List<String> by lazy { FilmNative.names(false).toList() }
         val papers: List<String> by lazy { FilmNative.names(true).toList() }

@@ -214,6 +214,226 @@ void read_gain_maps(const uint8_t *p, size_t size, RawImage &out)
   }
 }
 
+/**
+ * Lossless JPEG (ITU T.81 process 14, SOF3), as DNG compression 7 stores raw data: Huffman
+ * coded differences from a predictor, one or more interleaved components, optional point
+ * transform and restart markers. Decodes [n] bytes at [p] to [out], row-major with the
+ * components interleaved ([cols] = width x components, [rows] lines).
+ */
+bool ljpeg_decode(const uint8_t *p, size_t n, std::vector<uint16_t> &out, int &cols, int &rows, std::string &error)
+{
+  struct Huff
+  {
+    bool set = false;
+    int maxcode[18], valptr[17], mincode[17];
+    uint8_t vals[256];
+    int16_t fast[512]; // 9-bit lookahead: (length << 8 | value), -1 when longer
+  } huff[4];
+  int precision = 0, width = 0, height = 0, ncomp = 0, predictor = 1, pt = 0, restart = 0;
+  int comp_table[4] = {0, 0, 0, 0};
+  size_t pos = 2, scan = 0;
+  if(n < 4 || p[0] != 0xFF || p[1] != 0xD8)
+  {
+    error = "lossless JPEG: no SOI";
+    return false;
+  }
+  while(pos + 4 <= n)
+  {
+    if(p[pos] != 0xFF) { pos++; continue; }
+    const uint8_t marker = p[pos + 1];
+    if(marker == 0xFF) { pos++; continue; }
+    const size_t len = (size_t(p[pos + 2]) << 8) | p[pos + 3];
+    const uint8_t *s = p + pos + 4;
+    if(pos + 2 + len > n) break;
+    if(marker == 0xC3)
+    {
+      precision = s[0];
+      height = (s[1] << 8) | s[2];
+      width = (s[3] << 8) | s[4];
+      ncomp = s[5];
+    }
+    else if(marker == 0xC4)
+    {
+      size_t k = 0;
+      while(k + 17 <= len - 2)
+      {
+        const int id = s[k] & 3;
+        Huff &h = huff[id];
+        int counts[17] = {0}, total = 0;
+        for(int i = 1; i <= 16; i++) { counts[i] = s[k + i]; total += counts[i]; }
+        if(total > 256 || k + 17 + total > len - 2) break;
+        std::memcpy(h.vals, s + k + 17, total);
+        int code = 0, at = 0;
+        for(int l = 1; l <= 16; l++)
+        {
+          h.valptr[l] = at;
+          h.mincode[l] = code;
+          code += counts[l];
+          at += counts[l];
+          h.maxcode[l] = counts[l] ? code - 1 : -1;
+          code <<= 1;
+        }
+        h.maxcode[17] = 0x7fffffff;
+        std::fill(h.fast, h.fast + 512, int16_t(-1));
+        for(int l = 1; l <= 9; l++)
+          for(int c = h.mincode[l]; c <= h.maxcode[l]; c++)
+          {
+            const int v = h.vals[h.valptr[l] + c - h.mincode[l]];
+            const int shift = 9 - l;
+            for(int f = 0; f < (1 << shift); f++) h.fast[(c << shift) | f] = int16_t((l << 8) | v);
+          }
+        h.set = true;
+        k += 17 + total;
+      }
+    }
+    else if(marker == 0xDD)
+      restart = (s[0] << 8) | s[1];
+    else if(marker == 0xDA)
+    {
+      const int ns = s[0];
+      for(int i = 0; i < ns && i < 4; i++) comp_table[i] = (s[2 + i * 2] >> 4) & 3;
+      predictor = s[1 + ns * 2];
+      pt = s[3 + ns * 2] & 15;
+      scan = pos + 2 + len;
+      break;
+    }
+    pos += 2 + len;
+  }
+  if(!scan || !width || !height || ncomp < 1 || ncomp > 4 || precision < 2 || precision > 16)
+  {
+    error = "lossless JPEG: header incomplete";
+    return false;
+  }
+  for(int c = 0; c < ncomp; c++)
+    if(!huff[comp_table[c]].set)
+    {
+      error = "lossless JPEG: Huffman table missing";
+      return false;
+    }
+
+  // the bit stream: 0xFF00 stands for 0xFF; a marker ends the data (zeros are fed after it)
+  size_t at = scan;
+  uint32_t acc = 0;
+  int have = 0;
+  auto fill = [&]() {
+    while(have <= 24)
+    {
+      uint32_t b = 0;
+      if(at < n)
+      {
+        b = p[at];
+        if(b == 0xFF)
+        {
+          const uint8_t next = at + 1 < n ? p[at + 1] : 0;
+          if(next == 0x00) at += 2;
+          else b = 0; // a marker: stay before it
+        }
+        else at++;
+      }
+      acc |= b << (24 - have);
+      have += 8;
+    }
+  };
+  auto bits = [&](int k) -> int {
+    if(k == 0) return 0;
+    fill();
+    const int v = int(acc >> (32 - k));
+    acc <<= k;
+    have -= k;
+    return v;
+  };
+  auto decode = [&](const Huff &h) -> int {
+    fill();
+    const int16_t f = h.fast[acc >> 23];
+    if(f >= 0)
+    {
+      const int l = f >> 8;
+      acc <<= l;
+      have -= l;
+      return f & 0xff;
+    }
+    int code = int(acc >> 23); // 9 bits
+    acc <<= 9;
+    have -= 9;
+    int l = 9;
+    while(code > h.maxcode[l] && l < 16)
+    {
+      fill();
+      code = (code << 1) | int(acc >> 31);
+      acc <<= 1;
+      have--;
+      l++;
+    }
+    if(code > h.maxcode[l]) return 0;
+    return h.vals[h.valptr[l] + code - h.mincode[l]];
+  };
+  auto restart_here = [&]() {
+    // drop the partial byte, step over RSTn
+    acc = 0;
+    have = 0;
+    while(at + 1 < n && !(p[at] == 0xFF && p[at + 1] >= 0xD0 && p[at + 1] <= 0xD7)) at++;
+    if(at + 1 < n) at += 2;
+  };
+
+  cols = width * ncomp;
+  rows = height;
+  out.assign(size_t(cols) * rows, 0);
+  const int initial = 1 << (precision - pt - 1);
+  int until_restart = restart;
+  bool fresh = true; // first line after the start or a restart
+  for(int y = 0; y < height; y++)
+  {
+    uint16_t *row = out.data() + size_t(y) * cols;
+    const uint16_t *up = y ? row - cols : nullptr;
+    for(int x = 0; x < width; x++)
+    {
+      if(restart && until_restart == 0)
+      {
+        restart_here();
+        until_restart = restart;
+        fresh = true;
+      }
+      for(int c = 0; c < ncomp; c++)
+      {
+        const int ssss = decode(huff[comp_table[c]]);
+        int diff;
+        if(ssss == 16) diff = 32768;
+        else
+        {
+          diff = bits(ssss);
+          if(ssss && diff < (1 << (ssss - 1))) diff -= (1 << ssss) - 1;
+        }
+        const int i = x * ncomp + c;
+        int pred;
+        if(fresh && x == 0) pred = initial;
+        else if(fresh || !up) pred = row[i - ncomp];
+        else if(x == 0) pred = up[i];
+        else
+        {
+          const int ra = row[i - ncomp], rb = up[i], rc = up[i - ncomp];
+          switch(predictor)
+          {
+          case 1: pred = ra; break;
+          case 2: pred = rb; break;
+          case 3: pred = rc; break;
+          case 4: pred = ra + rb - rc; break;
+          case 5: pred = ra + ((rb - rc) >> 1); break;
+          case 6: pred = rb + ((ra - rc) >> 1); break;
+          case 7: pred = (ra + rb) >> 1; break;
+          default: pred = ra; break;
+          }
+        }
+        row[i] = uint16_t((pred + diff) & 0xffff);
+      }
+      if(restart) until_restart--;
+    }
+    fresh = false;
+  }
+  if(pt)
+    for(uint16_t &v : out) v = uint16_t(v << pt);
+  return true;
+}
+
 } // namespace
 
 bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override)
@@ -259,36 +479,118 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
 
   const auto width = tag(256), height = tag(257), bits = tag(258), compression = tag(259);
   const auto offsets = tag(273), counts = tag(279);
-  if(width.empty() || height.empty() || offsets.empty() || offsets.size() != counts.size())
+  const auto tile_w = tag(322), tile_h = tag(323), tile_offsets = tag(324), tile_counts = tag(325);
+  const bool tiled = offsets.empty() && !tile_offsets.empty() && tile_offsets.size() == tile_counts.size() &&
+                     !tile_w.empty() && !tile_h.empty();
+  if(width.empty() || height.empty() || (!tiled && (offsets.empty() || offsets.size() != counts.size())))
   {
     error = "DNG image layout missing";
     return false;
   }
-  if((!compression.empty() && compression[0] != 1) || (!bits.empty() && bits[0] != 16))
+  // Uncompressed samples of 8 to 16 bits. 16 bits are words in the file's byte order;
+  // fewer are packed most significant bit first, each row padded to a whole byte (TIFF),
+  // as some phones' DNGs come (seen on a custom Xiaomi ROM). Compression 7 is lossless
+  // JPEG, in strips or tiles (another custom Xiaomi ROM writes its camera DNGs so).
+  const int bps = bits.empty() ? 16 : static_cast<int>(bits[0]);
+  const int comp = compression.empty() ? 1 : static_cast<int>(compression[0]);
+  if((comp != 1 && comp != 7) || bps < 8 || bps > 16 || (tiled && comp != 7))
   {
-    error = "only uncompressed 16-bit DNG is supported";
+    error = "unsupported DNG: compression " + std::to_string(comp) + ", " + std::to_string(bps) + " bits per sample" +
+            (tiled ? ", tiled" : "");
     return false;
   }
   out.width = static_cast<int>(width[0]);
   out.height = static_cast<int>(height[0]);
   const size_t samples = static_cast<size_t>(out.width) * out.height;
   out.cfa.resize(samples);
-  size_t written = 0;
-  for(size_t s = 0; s < offsets.size(); s++)
+  if(comp == 7)
   {
-    const size_t at = static_cast<size_t>(offsets[s]), n = static_cast<size_t>(counts[s]) / 2;
-    if(at + n * 2 > size || written + n > samples)
+    // each strip or tile one lossless JPEG; its samples fill the piece row by row
+    const auto &offs = tiled ? tile_offsets : offsets;
+    const auto &cnts = tiled ? tile_counts : counts;
+    const int pw = tiled ? static_cast<int>(tile_w[0]) : out.width;
+    const int ph = tiled ? static_cast<int>(tile_h[0]) : 0; // strips: as many rows as decoded
+    const int across = tiled ? (out.width + pw - 1) / pw : 1;
+    int strip_y = 0;
+    std::vector<uint16_t> piece;
+    for(size_t s = 0; s < offs.size(); s++)
     {
-      error = "DNG strip outside the file";
+      const size_t at = static_cast<size_t>(offs[s]), n = static_cast<size_t>(cnts[s]);
+      if(at + n > size)
+      {
+        error = "DNG lossless JPEG piece outside the file";
+        return false;
+      }
+      int cols = 0, rows = 0;
+      if(!ljpeg_decode(data + at, n, piece, cols, rows, error)) return false;
+      const int x0 = tiled ? static_cast<int>(s % across) * pw : 0;
+      const int y0 = tiled ? static_cast<int>(s / across) * ph : strip_y;
+      const size_t total = piece.size();
+      const int piece_rows = static_cast<int>(total / pw);
+      for(int r = 0; r < piece_rows; r++)
+      {
+        const int y = y0 + r;
+        if(y >= out.height) break;
+        const int w = std::min(pw, out.width - x0);
+        if(w <= 0) break;
+        std::memcpy(&out.cfa[static_cast<size_t>(y) * out.width + x0], piece.data() + static_cast<size_t>(r) * pw,
+                    static_cast<size_t>(w) * sizeof(uint16_t));
+      }
+      if(!tiled) strip_y += piece_rows;
+    }
+  }
+  else if(bps == 16)
+  {
+    size_t written = 0;
+    for(size_t s = 0; s < offsets.size(); s++)
+    {
+      const size_t at = static_cast<size_t>(offsets[s]), n = static_cast<size_t>(counts[s]) / 2;
+      if(at + n * 2 > size || written + n > samples)
+      {
+        error = "DNG strip outside the file";
+        return false;
+      }
+      for(size_t i = 0; i < n; i++) out.cfa[written + i] = tiff.u16(at + i * 2);
+      written += n;
+    }
+    if(written != samples)
+    {
+      error = "DNG image data truncated";
       return false;
     }
-    for(size_t i = 0; i < n; i++) out.cfa[written + i] = tiff.u16(at + i * 2);
-    written += n;
   }
-  if(written != samples)
+  else
   {
-    error = "DNG image data truncated";
-    return false;
+    std::vector<uint8_t> packed;
+    for(size_t s = 0; s < offsets.size(); s++)
+    {
+      const size_t at = static_cast<size_t>(offsets[s]), n = static_cast<size_t>(counts[s]);
+      if(at + n > size)
+      {
+        error = "DNG strip outside the file";
+        return false;
+      }
+      packed.insert(packed.end(), data + at, data + at + n);
+    }
+    const size_t row_bytes = (static_cast<size_t>(out.width) * bps + 7) / 8;
+    if(packed.size() < row_bytes * out.height)
+    {
+      error = "DNG image data truncated (" + std::to_string(bps) + "-bit)";
+      return false;
+    }
+    const uint32_t mask = (1u << bps) - 1;
+    for(int y = 0; y < out.height; y++)
+    {
+      const uint8_t *row = packed.data() + row_bytes * y;
+      for(int x = 0; x < out.width; x++)
+      {
+        const size_t bit = static_cast<size_t>(x) * bps, byte = bit / 8;
+        uint32_t window = 0;
+        for(size_t k = 0; k < 3; k++) window = (window << 8) | (byte + k < row_bytes ? row[byte + k] : 0);
+        out.cfa[static_cast<size_t>(y) * out.width + x] =
+            static_cast<uint16_t>((window >> (24 - bps - static_cast<int>(bit % 8))) & mask);
+      }
+    }
   }
 
   const auto pattern = tag(33422);
@@ -297,7 +599,7 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
   const auto black = tag(50714);
   for(int i = 0; i < 4; i++) out.black[i] = black.empty() ? 0.0f : static_cast<float>(black[black.size() == 4 ? i : 0]);
   const auto white = tag(50717);
-  out.white = white.empty() ? 65535.0f : static_cast<float>(white[0]);
+  out.white = white.empty() ? static_cast<float>((1u << bps) - 1) : static_cast<float>(white[0]);
   const auto orientation = tag(274);
   out.orientation = orientation.empty() ? 1 : static_cast<int>(orientation[0]);
   // NoiseProfile: (S, O) per plane, variance = S * x + O for x in [0, 1]; averaged.
