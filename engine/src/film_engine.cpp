@@ -1496,7 +1496,17 @@ struct FilmEngine::Impl
           {
             const float hint = options.frame_exposure[f] / options.frame_exposure[0];
             if(std::fabs(std::log2(std::max(hint, 1e-6f))) >= 0.02f)
-              workers.emplace_back([&, f, hint] { alignment.gain[f] = reference.gain(*frames[f], hint); });
+              workers.emplace_back([&, f, hint] {
+                // an error escaping a std::thread ends the process: the camera's own ratio then
+                try
+                {
+                  alignment.gain[f] = reference.gain(*frames[f], hint);
+                }
+                catch(...)
+                {
+                  alignment.gain[f] = hint;
+                }
+              });
           }
           for(std::thread &t : workers) t.join();
           for(size_t f = 1; f < frames.size(); f++)

@@ -263,6 +263,12 @@ class CameraActivity : ComponentActivity() {
         // One grid for every control row: same side padding, same row height, and
         // each row split into equal cells, so columns line up from row to row.
         status = label(12f).apply { maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setTextColor(Style.TEXT_2) }
+        // every status line also goes to the diagnostics' recent events (what the user saw)
+        status.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { s?.toString()?.let { org.photoall.film.CrashReport.event(it) } }
+        })
         modeLabel = label(12f).apply { gravity = Gravity.END; setTextColor(Style.TEXT_2); typeface = Style.medium }
         evLabel = label(15f).apply { gravity = Gravity.CENTER; typeface = android.graphics.Typeface.MONOSPACE; setTypeface(typeface, android.graphics.Typeface.BOLD) }
         zoomLabel = label(14f).apply { gravity = Gravity.CENTER; minWidth = dp(48) }
@@ -610,6 +616,9 @@ class CameraActivity : ComponentActivity() {
 
         store.onChange { key -> onSettingChanged(key) }
         updateLabels()
+        // the last launch ended badly: offer its report to send (nothing is sent by itself)
+        main.postDelayed({ if (!isFinishing) org.photoall.film.CrashReport.pending(this)?.let { showCrashReport(it) } }, 700)
+        org.photoall.film.CrashReport.onRecovered = { thread, _ -> onThreadRecovered(thread) }
         status.text = "正在启动胶片引擎…"
         engineThread.later {
             try {
@@ -1798,6 +1807,54 @@ class CameraActivity : ComponentActivity() {
         return android.graphics.RectF(minOf(a.first, b.first), minOf(a.second, b.second), maxOf(a.first, b.first), maxOf(a.second, b.second))
     }
 
+    /**
+     * What went wrong last time, to copy and send to the developer. After repeated crashes
+     * the camera has already been put on safe settings, and says which.
+     */
+    private fun showCrashReport(report: org.photoall.film.CrashReport.Report) {
+        if (report.safeMode) {
+            // the heavy paths off: zero-lag HDR (RAW kept in memory), flash, a large develop
+            store[Settings.HDR] = 0f
+            store[Settings.FLASH] = 0f
+            store[Settings.LONG_EDGE] = 1f
+        }
+        val text = TextView(this).apply {
+            this.text = report.text
+            textSize = 11f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+        }
+        val lead = (if (report.fatal) "抱歉。" else "应用已自动恢复，但这些错误值得修好。") +
+            "把下面这份报告复制给开发者（GitHub Issues，或小红书 / 抖音私信），能帮我们在这台手机上修好它。报告只含机型、系统与出错位置，不含照片。" +
+            if (report.safeMode) "\n\n连续意外退出了两次，已切换到安全设置：关闭 HDR 与闪光，冲洗尺寸改为 3072。可在参数里改回。" else ""
+        android.app.AlertDialog.Builder(this)
+            .setTitle(report.title)
+            .setMessage(lead)
+            .setView(android.widget.ScrollView(this).apply { addView(text) })
+            .setPositiveButton("复制报告") { _, _ ->
+                val clip = getSystemService(android.content.ClipboardManager::class.java)
+                clip.setPrimaryClip(android.content.ClipData.newPlainText("Photo All 问题报告", report.text))
+                status.text = "报告已复制"
+            }
+            .setNegativeButton("忽略", null)
+            .show()
+    }
+
+    /** A thread died and the app went on: start again what it was running. */
+    private fun onThreadRecovered(thread: String) {
+        if (isFinishing || isDestroyed) return
+        when {
+            // the viewfinder's GL thread is gone: only a new screen brings it back
+            thread.startsWith("GLThread") -> recreate()
+            // a camera thread (the zero-lag session's, CameraX's): the camera again
+            thread == "zsl" || thread.contains("camera", ignoreCase = true) -> {
+                zsl?.close(); zsl = null
+                bindCamera()
+            }
+        }
+    }
+
     // ----- the tour -----------------------------------------------------------------------
 
     private var coach: org.photoall.film.ui.Coach? = null
@@ -1913,6 +1970,13 @@ class CameraActivity : ComponentActivity() {
     // adb: `am start ... --ei turn 0|1` switches the layout the animated way (no phone to turn).
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        // adb, debug builds only: `--es crashtest main|thread` throws there (the recovery's test)
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
+            when (intent.getStringExtra("crashtest")) {
+                "main" -> main.post { throw IllegalStateException("crash test: main thread") }
+                "thread" -> Thread({ throw IllegalStateException("crash test: background thread") }, "crash-test").start()
+                "report" -> org.photoall.film.CrashReport.latestNative(this)?.let { showCrashReport(it) }
+            }
         // adb: `--ez coach true` starts the tour again
         if (intent.getBooleanExtra("coach", false)) main.postDelayed({ startCoach() }, 600)
         // adb: `--ez hint true` shows the rotate offer (no phone to turn)
@@ -2265,6 +2329,7 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (org.photoall.film.CrashReport.onRecovered != null) org.photoall.film.CrashReport.onRecovered = null
         analysisThread.shutdown()
         engineThread.execute { engine?.close() } // before shutdown: always accepted
         engineThread.shutdown()
@@ -2427,6 +2492,16 @@ class CameraActivity : ComponentActivity() {
         return (focal * 43.27 / diagonal).toFloat()
     }
 
+    /** Lenses that refused the zero-lag RAW session on this phone (kept across launches). */
+    private val zslBlocked: MutableSet<String> by lazy {
+        getSharedPreferences("camera_quirks", MODE_PRIVATE).getStringSet("zsl_blocked", emptySet())!!.toMutableSet()
+    }
+
+    private fun blockZsl(id: String) {
+        zslBlocked += id
+        getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putStringSet("zsl_blocked", zslBlocked.toSet()).apply()
+    }
+
     private fun zslWanted(): Boolean {
         val flash = store[Settings.FLASH].toInt()
         return store.flag(Settings.HDR) && store.flag(Settings.RAW) && (flash == 0 || flash == Settings.FLASH_STEADY)
@@ -2446,8 +2521,21 @@ class CameraActivity : ComponentActivity() {
             m.setLut(lastLut, 33)
             applyHistogram(m)
         }
-        val session = ZslCamera(this, id, full, controller, previewMeter) { message -> main.post { status.text = message } }
+        lateinit var session: ZslCamera
+        session = ZslCamera(this, id, full, controller, previewMeter) { message, refused ->
+            main.post {
+                if (zsl !== session) return@post
+                org.photoall.film.CrashReport.note(this@CameraActivity, "零延迟 RAW 会话失败（镜头 $id）", IllegalStateException(message))
+                if (!refused) { status.text = message; return@post }
+                // this lens will not stream RAW beside the preview: remembered, and HDR goes
+                // through the ordinary capture path instead of a black viewfinder
+                blockZsl(id)
+                status.text = "$message · HDR 改用普通连拍"
+                bindCamera()
+            }
+        }
         zsl = session
+        org.photoall.film.CrashReport.stage(this, "打开零延迟 RAW 相机 $id · ${session.rawSize} × ${session.keep} 帧")
         val sensor = full.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val rotation = zslRotation(full)
         viewfinder.sensorRotation = sensor
@@ -2526,11 +2614,21 @@ class CameraActivity : ComponentActivity() {
     private fun bindCamera() {
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
         val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
+        future.addListener({ try {
             val provider = future.get().also { provider = it }
             val info = pickCamera(provider) ?: run { status.text = "没有可用的相机"; return@addListener }
             val fourThree = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build()
+            // Stills: the largest 4:3 size up to ~26 MP. Many phones (Xiaomi, vivo, OPPO
+            // with 50 MP sensors) offer the full-resolution size here; a burst of those, or one
+            // decoded and turned, is gigabytes, and the develop works at 4096 px or less anyway.
+            val stillSize = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .setResolutionFilter { sizes, _ ->
+                    sizes.filter { it.width.toLong() * it.height <= MAX_STILL_PIXELS }
+                        .ifEmpty { listOfNotNull(sizes.minByOrNull { it.width.toLong() * it.height }) }
+                }
+                .build()
             val chars = Camera2CameraInfo.from(info)
             val capabilities = chars.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
             // Calibrated white balance needs to write the colour matrix ourselves.
@@ -2545,10 +2643,26 @@ class CameraActivity : ComponentActivity() {
             }.also { c -> c.onLive = { e -> main.post { showLive(e) } } }
             exposure = controller
             boundInfo = info
+            // a phone whose metered flash came back unfired: the LED way from then on (this lens)
+            val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+            if (quirks.getBoolean("flash_torch_${chars.cameraId}", false)) controller.flashByTorch = true
+            controller.onFlashMissed = { state ->
+                main.post {
+                    if (!controller.flashByTorch) {
+                        controller.flashByTorch = true
+                        quirks.edit().putBoolean("flash_torch_${chars.cameraId}", true).apply()
+                        org.photoall.film.CrashReport.note(this, "闪光未触发，已改用常亮方式",
+                            IllegalStateException("lens ${chars.cameraId}: FLASH_STATE $state after AE_MODE_ON_ALWAYS_FLASH"))
+                        status.text = "这台手机的闪光没有亮，已改用常亮方式，下一张起生效"
+                    }
+                }
+            }
             zsl?.close()
             zsl = null
             // HDR on a lens that streams RAW: the zero-lag session instead of CameraX.
-            if (zslWanted()) {
+            // a lens whose RAW this app cannot develop (an unreadable DNG format): JPEG
+            val rawUnusable = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_unusable_${chars.cameraId}", false)
+            if (zslWanted() && chars.cameraId !in zslBlocked && !rawUnusable) {
                 val full = (getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager)
                     .getCameraCharacteristics(chars.cameraId)
                 if (ZslCamera.supported(full)) {
@@ -2581,19 +2695,51 @@ class CameraActivity : ComponentActivity() {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build().also { it.setAnalyzer(analysisThread, previewMeter); analysisCase = it }
-            val wantRaw = store.flag(Settings.RAW)
+            val wantRaw = store.flag(Settings.RAW) && !rawUnusable
             val rawSupported = ImageCapture.getImageCaptureCapabilities(info).supportedOutputFormats
                 .contains(ImageCapture.OUTPUT_FORMAT_RAW)
             rawCapture = wantRaw && rawSupported
             val builder = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .setResolutionSelector(fourThree)
+                .setResolutionSelector(stillSize)
             if (rawCapture) builder.setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW)
             val imageCapture = builder.build()
             provider.unbindAll()
-            val bound = provider.bindToLifecycle(this, info.cameraSelector, preview, imageCapture, analysis)
+            // Not every phone runs preview + capture (RAW) + analysis at once; CameraX then
+            // throws here, on the main thread, which would end the app. Step down instead:
+            // without the analysis stream, then JPEG instead of RAW.
+            var finalCapture = imageCapture
+            val bound = try {
+                org.photoall.film.CrashReport.stage(this, "绑定相机 ${chars.cameraId}${if (rawCapture) " RAW" else ""}")
+                provider.bindToLifecycle(this, info.cameraSelector, preview, imageCapture, analysis)
+            } catch (e: Exception) {
+                Log.w(TAG, "bind: preview + capture + analysis", e)
+                org.photoall.film.CrashReport.note(this, "相机绑定降级：去掉测光分析流（${if (rawCapture) "RAW" else "JPEG"}）", e)
+                provider.unbindAll()
+                analysisCase = null
+                try {
+                    provider.bindToLifecycle(this, info.cameraSelector, preview, imageCapture)
+                } catch (e2: Exception) {
+                    Log.w(TAG, "bind: preview + capture", e2)
+                    org.photoall.film.CrashReport.note(this, "相机绑定降级：RAW 改为 JPEG", e2)
+                    provider.unbindAll()
+                    rawCapture = false
+                    finalCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setResolutionSelector(stillSize).build()
+                    try {
+                        provider.bindToLifecycle(this, info.cameraSelector, preview, finalCapture).also {
+                            status.text = "这颗镜头不支持 RAW 与预览同时输出，改用 JPEG"
+                        }
+                    } catch (e3: Exception) {
+                        Log.e(TAG, "bind failed", e3)
+                        org.photoall.film.CrashReport.note(this, "相机绑定失败", e3)
+                        status.text = "相机启动失败：${e3.message}"
+                        return@addListener
+                    }
+                }
+            }
             camera = bound
-            capture = imageCapture
+            capture = finalCapture
             viewfinder.sensorRotation = bound.cameraInfo.sensorRotationDegrees
             viewfinder.frontFacing = bound.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
             // Metering regions map from the viewfinder as currently rotated (landscape too).
@@ -2607,7 +2753,12 @@ class CameraActivity : ComponentActivity() {
             applyCameraOptions()
             updateLabels()
             if (wantRaw && !rawSupported) status.text = "这颗镜头不支持 RAW，改用 JPEG"
-        }, mainExecutor)
+        } catch (e: Exception) {
+            // a camera stack that throws where others do not: say so, keep the app alive
+            Log.e(TAG, "bindCamera", e)
+            org.photoall.film.CrashReport.note(this, "相机启动失败", e)
+            status.text = "相机启动失败：${e.message}"
+        } }, mainExecutor)
     }
 
     private val exposureKeys = setOf(
@@ -3029,7 +3180,8 @@ class CameraActivity : ComponentActivity() {
         // Manual exposure turns the phone's AE off, and its flash pulse only fires through AE
         // (a pre-flash to meter it): with manual, the flash LED lights at full strength for
         // the frame instead, exposed at the manual ISO and shutter.
-        val manualFlash = singleFlash && controller?.manual != null
+        // ... and on phones whose metered flash does not fire, the LED the same way (auto exposure)
+        val manualFlash = singleFlash && (controller?.manual != null || controller?.flashByTorch == true)
         val steadyLight = flashMode == Settings.FLASH_STEADY
         val flashPair = flashMode == Settings.FLASH_OVERPOWER
         val flashWhiteChoice = store[Settings.FLASH_WHITE].toInt()
@@ -3080,7 +3232,8 @@ class CameraActivity : ComponentActivity() {
         log.put("拍摄", "时间", stamp)
         log.put("拍摄", "格式", if (rawCapture) "RAW（DNG）冲洗" else "JPEG 冲洗")
         log.put("拍摄", "模式", when {
-            manualFlash -> "单张闪光（手动曝光：闪光灯全功率常亮一帧）"
+            manualFlash -> if (controller?.manual != null) "单张闪光（手动曝光：闪光灯全功率常亮一帧）"
+                else "单张闪光（这台手机的测光闪光不可用：闪光灯常亮一帧）"
             singleFlash -> "单张闪光"
             flashPair -> "闪光${Settings.flashModes[flashMode]}（两帧合成）"
             hdr -> if (steadyLight) "HDR · 补光常亮" else "HDR"
@@ -3221,7 +3374,7 @@ class CameraActivity : ComponentActivity() {
             main.postDelayed(shoot, settle)
         } else {
             // manual flash: the LED lights first and gets a couple of frames to reach full strength
-            val torchWait = if (manualFlash) controller?.manual?.let { 200 + 2 * it.timeNs / 1_000_000 } ?: 250L else 0L
+            val torchWait = if (manualFlash) controller?.manual?.let { 200 + 2 * it.timeNs / 1_000_000 } ?: 600L else 0L
             if (manualFlash) controller?.lightTorch(true)
             main.postDelayed({
                 capture.takePicture(engineThread, object : ImageCapture.OnImageCapturedCallback() {
@@ -3291,7 +3444,8 @@ class CameraActivity : ComponentActivity() {
         val started = SystemClock.uptimeMillis()
         // The burst length set in the settings; at most six frames reach the merge (five
         // from the ring when a long one follows).
-        val frames = store[Settings.HDR_FRAMES].toInt().coerceIn(2, if (long != null) ZslCamera.RING - 1 else ZslCamera.RING)
+        // (fewer on a phone whose RAW frames are large: the ring keeps fewer)
+        val frames = store[Settings.HDR_FRAMES].toInt().coerceIn(2, maxOf(2, if (long != null) session.keep - 1 else session.keep))
         haptics.quiet = long != null // the ring frames are already taken; the long one is not
         // Zero lag: the frames were exposed as the button went down. The curtain shuts now
         // and opens after the reference frame's exposure, or after the long frame's.
@@ -3374,14 +3528,15 @@ class CameraActivity : ComponentActivity() {
                 })
         }
         val target = exposures.getOrNull(index)
-        val controller = exposure
-        if (target == null || controller == null) return shoot()
+        val controller = exposure ?: return shoot()
         if (index == torchFrame) {
-            // The LED needs a couple of frames to light fully at the held exposure.
+            // The LED needs a couple of frames to light fully at the held exposure; without
+            // one (the LED as the flash, auto exposure) the meter gets time to settle on it.
             controller.lightTorch(true)
-            main.postDelayed(shoot, 200 + 2 * target.timeNs / 1_000_000)
+            main.postDelayed(shoot, if (target != null) 200 + 2 * target.timeNs / 1_000_000 else 600L)
             return
         }
+        if (target == null) return shoot()
         controller.hold(target)
         // A few frames at the new exposure: the time it takes to land plus margin.
         val deadline = SystemClock.uptimeMillis() + 400 + 4 * target.timeNs / 1_000_000
@@ -3627,11 +3782,27 @@ class CameraActivity : ComponentActivity() {
         return ShotInfo.fromStream(ByteArrayInputStream(bytes))
     }
 
+    /**
+     * The still, upright, decoded no larger than the develop needs (a power-of-two step
+     * down to at least the working long edge): a 50 MP JPEG decoded whole and turned is
+     * ~400 MB, enough for the system to end the app on some phones.
+     */
     private fun upright(image: ImageProxy): Bitmap {
         val rotation = image.imageInfo.rotationDegrees
-        val frame = image.use { it.toBitmap() }
+        val frame = image.use { proxy ->
+            if (proxy.format != ImageFormat.JPEG) return@use proxy.toBitmap()
+            val buffer = proxy.planes[0].buffer.duplicate()
+            val bytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
+            val want = store.longEdge
+            var sample = 1
+            while (maxOf(proxy.width, proxy.height) / (sample * 2) >= want) sample *= 2
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
+                android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
+                ?: proxy.toBitmap()
+        }
         if (rotation == 0) return frame
         return Bitmap.createBitmap(frame, 0, 0, frame.width, frame.height, Matrix().apply { postRotate(rotation.toFloat()) }, true)
+            .also { if (it !== frame) frame.recycle() }
     }
 
     // Engine thread: develop, save, report.
@@ -3700,6 +3871,17 @@ class CameraActivity : ComponentActivity() {
                 bitmap.width, bitmap.height, developed.gpuMs, if (filmOn) "冲洗" else "处理", (System.nanoTime() - start) / 1e9)
         } catch (e: Throwable) {
             Log.e(TAG, "develop failed", e)
+            org.photoall.film.CrashReport.note(this, "冲洗失败（$source）", e)
+            // a RAW this app cannot read: say so plainly, and shoot JPEG on this lens from now on
+            if (e.message?.let { it.contains("DNG") || it.contains("lossless JPEG") } == true) runOnUiThread {
+                val id = boundInfo?.let { Camera2CameraInfo.from(it).cameraId }
+                if (id != null) getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_unusable_$id", true).apply()
+                android.widget.Toast.makeText(this, "这台手机的 RAW 格式暂时无法冲洗，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
+                zsl?.close(); zsl = null
+                bindCamera()
+            } else runOnUiThread {
+                android.widget.Toast.makeText(this, "冲洗失败：${e.message}", android.widget.Toast.LENGTH_LONG).show()
+            }
             "${if (recipe["stage film"] != 0f) "冲洗" else "处理"}失败：${e.message}"
         }
         Log.i(TAG, message)
@@ -4179,6 +4361,7 @@ class CameraActivity : ComponentActivity() {
 
     private fun failed(exception: ImageCaptureException) {
         Log.e(TAG, "capture failed", exception)
+        org.photoall.film.CrashReport.note(this, "拍摄失败（相机返回错误 ${exception.imageCaptureError}）", exception)
         runOnUiThread {
             developing--
             status.text = "拍摄失败：${exception.message}"
@@ -4361,6 +4544,8 @@ class CameraActivity : ComponentActivity() {
         private const val BLACKOUT = 120L    // the least time the view stays black
 
         private const val TAG = "FilmCamera"
+        /** Stills (JPEG or RAW) are taken at most this large (see bindCamera). */
+        private const val MAX_STILL_PIXELS = 26_000_000L
         private const val LANDSCAPE_RAIL_DP = 88
         private const val ROLL_LENGTH = 36
         // Recipe-only entries next to the engine parameters (never sent to the engine).

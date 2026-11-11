@@ -201,7 +201,15 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
 
     override fun onDrawFrame(gl: GL10?) {
         val texture = surfaceTexture ?: return
-        texture.updateTexImage()
+        // Between one camera session and the next (HDR on or off, RAW on or off, another
+        // lens) the producer leaves the texture; some phones then throw here. That frame
+        // is skipped: thrown on the GL thread, it would end the app.
+        try {
+            texture.updateTexImage()
+        } catch (e: RuntimeException) {
+            android.util.Log.w("FilmViewfinder", "updateTexImage", e)
+            return
+        }
         texture.getTransformMatrix(transform)
         pendingLut?.let { (data, size) ->
             pendingLut = null

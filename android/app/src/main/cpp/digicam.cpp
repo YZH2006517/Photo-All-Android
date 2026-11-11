@@ -16,6 +16,7 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include "jni_guard.h"
 
 namespace {
 
@@ -202,7 +203,11 @@ void band(const Job &j, int c0, std::vector<float> &buf) {
     const int pw = j.cw, ph = a1 - a0;
     const size_t area = size_t(pw) * ph;
     const size_t half = size_t((pw + 1) / 2) * ((ph + 1) / 2);
-    const size_t need = area * 10 + half * 3 + size_t(2 * (pw + ph) + 8) * 2;
+    // the planes laid out below: inR inG inB inC cnt py pcb pcr blown s1 s2 (eleven of area,
+    // s1 and s2 each with a margin), then hb hr ht (three of half). Sized for ten areas this
+    // wrote one area past the end: heap corruption that crashed some phones a moment later.
+    const size_t margin = size_t(2 * (pw + ph) + 8);
+    const size_t need = area * 11 + margin * 2 + half * 3;
     if (buf.size() < need) buf.resize(need);
     float *inR = buf.data(), *inG = inR + area, *inB = inG + area, *inC = inB + area, *cnt = inC + area;
     float *py = cnt + area, *pcb = py + area, *pcr = pcb + area, *blown = pcr + area;
@@ -364,6 +369,7 @@ void band(const Job &j, int c0, std::vector<float> &buf) {
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_photoall_film_engine_FilmNative_digicam(JNIEnv *env, jclass, jobject srcBitmap, jobject dstBitmap,
                                                  jbyteArray lutU16, jfloatArray params, jint iso, jfloat strength, jint seed) {
+  JNI_TRY
     AndroidBitmapInfo si{}, di{};
     if (AndroidBitmap_getInfo(env, srcBitmap, &si) != 0 || AndroidBitmap_getInfo(env, dstBitmap, &di) != 0) return JNI_FALSE;
     if (si.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || di.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
@@ -389,6 +395,11 @@ Java_org_photoall_film_engine_FilmNative_digicam(JNIEnv *env, jclass, jobject sr
     void *sp = nullptr, *dp = nullptr;
     if (AndroidBitmap_lockPixels(env, srcBitmap, &sp) != 0) return JNI_FALSE;
     if (AndroidBitmap_lockPixels(env, dstBitmap, &dp) != 0) { AndroidBitmap_unlockPixels(env, srcBitmap); return JNI_FALSE; }
+    // unlocked on every way out, a thrown error (out of memory for the planes) too
+    struct Unlock {
+        JNIEnv *env; jobject a, b;
+        ~Unlock() { AndroidBitmap_unlockPixels(env, b); AndroidBitmap_unlockPixels(env, a); }
+    } unlock{env, srcBitmap, dstBitmap};
 
     Job j{};
     j.src = static_cast<const uint8_t *>(sp); j.dst = static_cast<uint8_t *>(dp);
@@ -409,16 +420,23 @@ Java_org_photoall_film_engine_FilmNative_digicam(JNIEnv *env, jclass, jobject sr
     // bands on two threads (each keeps its planes), next band by a shared counter
     std::atomic<int> next{0};
     const int bands = (j.ch + BAND - 1) / BAND;
+    // an error on a std::thread ends the process: each worker catches its own, and the
+    // Kotlin side then takes the slower path (a false return)
+    std::atomic<bool> failed{false};
     auto worker = [&]() {
-        std::vector<float> buf;
-        for (int b; (b = next.fetch_add(1)) < bands;) band(j, b * BAND, buf);
+        try {
+            std::vector<float> buf;
+            for (int b; !failed && (b = next.fetch_add(1)) < bands;) band(j, b * BAND, buf);
+        } catch (...) {
+            failed = true;
+        }
     };
     const int threads = std::max(1, std::min(2, int(std::thread::hardware_concurrency())));
     std::vector<std::thread> pool;
     for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
     worker();
     for (auto &th : pool) th.join();
-    AndroidBitmap_unlockPixels(env, dstBitmap);
-    AndroidBitmap_unlockPixels(env, srcBitmap);
-    return JNI_TRUE;
+    return failed ? JNI_FALSE : JNI_TRUE;
+  JNI_CATCH(env)
+  return JNI_FALSE;
 }

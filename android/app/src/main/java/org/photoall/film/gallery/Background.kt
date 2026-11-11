@@ -11,7 +11,15 @@ import java.util.concurrent.RejectedExecutionException
 fun ExecutorService.later(task: () -> Unit) {
     if (isShutdown) return
     try {
-        execute(task)
+        execute {
+            // an error in the task is reported, and the thread lives on for the next one
+            try {
+                task()
+            } catch (e: Throwable) {
+                android.util.Log.e("later", "task failed", e)
+                Thread.currentThread().let { t -> Thread.getDefaultUncaughtExceptionHandler()?.uncaughtException(t, e) }
+            }
+        }
     } catch (_: RejectedExecutionException) {
         // shut down between the check and the call: nothing to do
     }

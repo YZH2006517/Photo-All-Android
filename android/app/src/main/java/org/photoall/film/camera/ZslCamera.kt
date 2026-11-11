@@ -43,7 +43,8 @@ class ZslCamera(
     val characteristics: CameraCharacteristics,
     private val exposure: FilmExposure,
     private val meter: PreviewMeter,
-    private val onError: (String) -> Unit,
+    /** A failure, and whether it is the lens refusing these streams (true) or a passing one. */
+    private val onError: (String, Boolean) -> Unit,
 ) {
     /**
      * A burst: one DNG per frame in native memory (newest = reference first; the caller
@@ -67,9 +68,22 @@ class ZslCamera(
     private var preview: Surface? = null
     @Volatile private var closed = false
 
-    /** The full sensor RAW size streamed. */
+    /**
+     * The RAW size streamed: the largest up to ~26 MP. Some phones (quad-Bayer 50 MP
+     * sensors, often MediaTek) list the full-resolution RAW here too; a ring of those is
+     * gigabytes and gets the app killed, so the binned size is taken when there is one.
+     */
     val rawSize: Size = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-        .getOutputSizes(ImageFormat.RAW_SENSOR).maxBy { it.width.toLong() * it.height }
+        .getOutputSizes(ImageFormat.RAW_SENSOR).let { sizes ->
+            sizes.filter { it.width.toLong() * it.height <= MAX_RAW_PIXELS }.maxByOrNull { it.width.toLong() * it.height }
+                ?: sizes.minBy { it.width.toLong() * it.height }
+        }
+
+    /** Frames the ring keeps: [RING], fewer when the frames are large (about 600 MB of buffers at most). */
+    val keep: Int = run {
+        val bytes = rawSize.width.toLong() * rawSize.height * 2
+        ((600_000_000L / bytes - 4) / 2).toInt().coerceIn(2, RING)
+    }
 
     // Handler thread only: the last frames, kept in the reader's own (native) buffers,
     // newest last; the results by sensor timestamp.
@@ -99,7 +113,7 @@ class ZslCamera(
     fun open(viewfinder: Surface) {
         preview = viewfinder
         // The ring, the frames of a burst being written out and a few for the camera.
-        rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2 * RING + 4).apply {
+        rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2 * keep + 4).apply {
             setOnImageAvailableListener({ onRaw(it) }, handler)
         }
         yuvReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 3).apply {
@@ -111,17 +125,24 @@ class ZslCamera(
                 override fun onOpened(camera: CameraDevice) {
                     if (closed) return camera.close()
                     device = camera
-                    configure(camera)
+                    // a camera HAL may refuse the streams by throwing rather than by
+                    // onConfigureFailed; thrown here (a camera thread) it would end the app
+                    try {
+                        configure(camera)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "configure", e)
+                        if (!closed) onError("这颗镜头不能同时连续输出 RAW 和预览：${e.message}", true)
+                    }
                 }
                 override fun onDisconnected(camera: CameraDevice) { camera.close(); device = null }
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
                     device = null
-                    if (!closed) onError("相机打开失败（$error）")
+                    if (!closed) onError("相机打开失败（$error）", false)
                 }
             }, handler)
         } catch (e: Exception) {
-            onError("相机打开失败：${e.message}")
+            onError("相机打开失败：${e.message}", false)
         }
     }
 
@@ -135,7 +156,7 @@ class ZslCamera(
                     repeat()
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    if (!closed) onError("这颗镜头不能同时连续输出 RAW 和预览")
+                    if (!closed) onError("这颗镜头不能同时连续输出 RAW 和预览", true)
                 }
             })
         camera.createCaptureSession(config)
@@ -163,7 +184,7 @@ class ZslCamera(
                 statsSince = now; frameCount = 0; gaps = 0; restarts = 0
             }
             results[ts] = result
-            while (results.size > 3 * RING) results.remove(results.keys.first())
+            while (results.size > 3 * keep) results.remove(results.keys.first())
             if (request.tag == LONG_TAG) longWanted = ts
             takeLong()
             watchFocus(result)
@@ -284,7 +305,7 @@ class ZslCamera(
                 continue
             }
             ring.addLast(image)
-            while (ring.size > RING) ring.removeFirst().close()
+            while (ring.size > keep) ring.removeFirst().close()
         }
     }
 
@@ -417,6 +438,7 @@ class ZslCamera(
         private const val TAG = "ZslCamera"
         /** Frames kept for a burst. */
         const val RING = 6
+        const val MAX_RAW_PIXELS = 26_000_000L
         private const val LONG_TAG = "long"
 
         fun exifOrientation(degrees: Int) = when ((degrees % 360 + 360) % 360) {
