@@ -207,7 +207,7 @@ class GalleryActivity : Activity() {
             setBackgroundColor(Style.BG)
             addView(browseBar, LinearLayout.LayoutParams(-1, dp(56)))
             addView(selectBar, LinearLayout.LayoutParams(-1, dp(56)))
-            addView(HorizontalScrollView(this@GalleryActivity).apply {
+            addView(HorizontalScrollView(this@GalleryActivity).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
                 isHorizontalScrollBarEnabled = false
                 addView(chips)
             })
@@ -216,7 +216,7 @@ class GalleryActivity : Activity() {
             })
             addView(sheet, LinearLayout.LayoutParams(-1, 0, 1f))
             setOnApplyWindowInsetsListener { view, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
                 insets
             }

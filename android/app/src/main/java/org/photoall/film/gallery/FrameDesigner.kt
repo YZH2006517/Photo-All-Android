@@ -159,7 +159,25 @@ object FrameDesigner {
     // ---- the picture as a whole --------------------------------------------------------------
 
     fun render(source: Bitmap, d: FrameDesign, data: Data, maxLong: Int = 4096): Bitmap {
+        val sheet = renderSheet(source, d, data, maxLong)
+        if (!d.cartridge) return sheet
+        val out = if (sheet.isMutable) sheet else sheet.copy(Bitmap.Config.ARGB_8888, true).also { sheet.recycle() }
+        drawCartridge(Canvas(out), out.width, out.height, d, data.filmKey)
+        return out
+    }
+
+    /** The cartridge on a sheet [w] x [h]: where the design puts it, as big as it says, straight on. */
+    fun drawCartridge(c: Canvas, w: Int, h: Int, d: FrameDesign, film: String, onReady: (() -> Unit)? = null) {
+        val name = film.takeIf { it.isNotBlank() && it != "直出" } ?: "kodak portra 400"
+        val ch = d.cartSize * min(w, h)
+        // on screen: whatever picture there is, redrawn when the 3D one comes; in an export: wait for it
+        if (onReady != null) org.photoall.film.ui.CartridgeSprites.draw(c, d.cartX * w, d.cartY * h, ch, name, leader = 0.35f, onReady = onReady)
+        else org.photoall.film.ui.CartridgeSprites.drawWaiting(c, d.cartX * w, d.cartY * h, ch, name, leader = 0.35f)
+    }
+
+    private fun renderSheet(source: Bitmap, d: FrameDesign, data: Data, maxLong: Int): Bitmap {
         d.border.kind?.let { kind -> return renderFilm(source, kind, d, data, maxLong) }
+        d.border.theme?.let { theme -> return renderTheme(source, theme, d, data, maxLong) }
         val k = min(1f, maxLong.toFloat() / max(source.width, source.height))
         val pw = source.width * k
         val ph = source.height * k
@@ -207,8 +225,30 @@ object FrameDesigner {
         if (radius > 0f) c.clipPath(Path().apply { addRoundRect(photo, radius, radius, Path.Direction.CW) })
         c.drawBitmap(source, null, photo, paint)
         c.restore()
-        drawMarks(c, d, data, photo, RectF(0f, 0f, w.toFloat(), h.toFloat()), s, cardLuma, source)
-        drawStamp(c, d, data, photo, s)
+        val words = drawMarks(c, d, data, photo, RectF(0f, 0f, w.toFloat(), h.toFloat()), s, cardLuma, source)
+        drawStamp(c, d, data, photo, s, avoid = words)
+        return out
+    }
+
+    /**
+     * A theme's own paper ([ThemePapers]): the paper and its ornament under the photo, the
+     * photo in the theme's shape, the ornament that goes over it, then the words in the
+     * paper's own field (clear of what the ornament keeps), and the stamp clear of both.
+     */
+    private fun renderTheme(source: Bitmap, t: ThemePapers.Theme, d: FrameDesign, data: Data, maxLong: Int): Bitmap {
+        val plan = ThemePapers.plan(t, source.width, source.height, maxLong)
+        val out = Bitmap.createBitmap(plan.w, plan.h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        val photo = plan.photo
+        val s = min(photo.width(), photo.height())
+        ThemePapers.drawUnder(c, t, plan, d.leakSeed)
+        c.drawBitmap(source, null, photo, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+        ThemePapers.drawOver(c, t, plan, d.leakSeed, data.date, data.frame, data.filmKey)
+        val keep = plan.keep
+        val words = if (d.inPhoto) drawMarks(c, d, data, photo, plan.sheet, s, 0.5f, source, keepOut = keep)
+            else drawMarks(c, d.copy().apply { vertical = false }, data, photo, plan.sheet, s, 0.9f,
+                source, given = plan.text, keepOut = keep, inkOverride = if (d.ink == FrameDesign.AUTO) ThemePapers.ink(t) else null)
+        drawStamp(c, d, data, photo, s, avoid = words + keep)
         return out
     }
 
@@ -233,16 +273,19 @@ object FrameDesigner {
 
     /** Film edges come from [Frames]; over them only what goes on the picture. */
     private fun renderFilm(source: Bitmap, kind: Frames.Kind, d: FrameDesign, data: Data, maxLong: Int): Bitmap {
+        val picture = RectF()
         val base = Frames.render(source, kind, Frames.Options(edgeText = data.edgeName, frame = data.frame, date = null,
             film = data.filmKey, fog = if (d.fog) 1f else 0f, leak = d.leak, seed = d.leakSeed * 101 + data.frame),
-            maxLong = maxLong, rotation = d.turn)
+            maxLong = maxLong, rotation = d.turn, imageOut = picture)
         val out = if (base.isMutable) base else base.copy(Bitmap.Config.ARGB_8888, true).also { base.recycle() }
         val c = Canvas(out)
         val all = RectF(0f, 0f, out.width.toFloat(), out.height.toFloat())
-        val s = min(all.width(), all.height()) * 0.8f
+        if (picture.isEmpty) picture.set(all)
+        val s = min(picture.width(), picture.height())
         val inside = d.copy().apply { inPhoto = true }
-        drawMarks(c, inside, data, all, all, s, 0.2f, null)
-        drawStamp(c, d, data, RectF(all).apply { inset(s * 0.06f, s * 0.12f) }, s)
+        // the photo as it lies in the picture's place (centre-cropped to it), for what is under the words
+        val words = drawMarks(c, inside, data, picture, all, s, 0.2f, source)
+        drawStamp(c, d, data, picture, s, avoid = words)
         return out
     }
 
@@ -327,15 +370,19 @@ object FrameDesigner {
     /** The blocks to place, with how each sits in the area (fx, fy: 0 start, 0.5 middle, 1 end). */
     private class Placed(val block: Block, val fx: Float, val fy: Float)
 
-    private fun drawMarks(c: Canvas, d: FrameDesign, data: Data, photo: RectF, sheet: RectF, s: Float, cardLuma: Float, source: Bitmap?) {
+    private fun drawMarks(c: Canvas, d: FrameDesign, data: Data, photo: RectF, sheet: RectF, s: Float, cardLuma: Float, source: Bitmap?,
+                          given: RectF? = null, keepOut: List<RectF> = emptyList(), inkOverride: Int? = null): List<RectF> {
         val row = d.anchor / 3
         val col = d.anchor % 3
         val m = s * 0.045f
-        val onPhoto = d.inPhoto || d.border == Border.NONE
+        val onPhoto = given == null && (d.inPhoto || d.border == Border.NONE)
         // the area the words go in, and whether its long side runs across
         val area: RectF
         val across: Boolean
-        if (onPhoto) {
+        if (given != null) {
+            area = RectF(given)
+            across = true
+        } else if (onPhoto) {
             area = RectF(photo).apply { inset(m, m) }
             across = row != 1 || col == 1
         } else {
@@ -353,7 +400,7 @@ object FrameDesigner {
             across = band == 0 || band == 2
             if (across) area.inset(m * 0.4f, area.height() * 0.14f) else area.inset(area.width() * 0.14f, m * 0.4f)
         }
-        if (area.width() <= 1f || area.height() <= 1f) return
+        if (area.width() <= 1f || area.height() <= 1f) return emptyList()
 
         fun build(base: Float): List<Placed> {
             val (head, sub) = lines(d, data, base)
@@ -391,7 +438,7 @@ object FrameDesigner {
         // size: by the photo, then shrunk to fit the area
         var base = s * (0.017f + 0.017f * d.size)
         var placed = build(base)
-        if (placed.isEmpty()) return
+        if (placed.isEmpty()) return emptyList()
         fun extent(p: Placed) = if (d.vertical) blockHeight(p.block) to blockWidth(p.block) else blockWidth(p.block) to blockHeight(p.block)
         val alongTotal = placed.sumOf { (if (across) extent(it).first else extent(it).second).toDouble() }.toFloat() *
             (if (placed.size > 1) 1.12f else 1f)
@@ -401,11 +448,23 @@ object FrameDesigner {
         val k = min(1f, min(alongRoom / alongTotal, crossRoom / crossMax))
         if (k < 1f) { base *= k * 0.98f; placed = build(base) }
 
-        val inkDefault = d.ink
+        fun boxOf(p: Placed): RectF {
+            val (bw, bh) = extent(p)
+            return RectF(area.left + (area.width() - bw) * p.fx, area.top + (area.height() - bh) * p.fy, 0f, 0f).also {
+                it.right = it.left + bw; it.bottom = it.top + bh
+            }
+        }
+        // The automatic layout: the words try the places they could go (and a size or two
+        // smaller), and take the one where nothing covers them: not the ornament, the date
+        // stamp's corner or each other, and on a picture, the calmest part of it.
+        if (d.autoPlace) placed = autoPlace(placed, base, ::build, ::boxOf, area, keepOut, onPhoto, across, source, photo, d)
+
+        val inkDefault = inkOverride ?: d.ink
+        val boxes = mutableListOf<RectF>()
         for (p in placed) {
             val (bw, bh) = extent(p)
-            val box = RectF(area.left + (area.width() - bw) * p.fx, area.top + (area.height() - bh) * p.fy, 0f, 0f)
-            box.right = box.left + bw; box.bottom = box.top + bh
+            val box = boxOf(p)
+            boxes += RectF(box)
             // what the words sit on decides their colour when it is left to us
             val under = if (onPhoto && source != null) regionLuma(source, photo, box) else cardLuma
             val ink = if (inkDefault == FrameDesign.AUTO) (if (under > 0.56f) 0xff1c1c1e.toInt() else 0xfff5f5f7.toInt()) else inkDefault
@@ -419,6 +478,91 @@ object FrameDesigner {
             drawBlock(c, p.block, if (d.vertical) bh else bw, alongAlign, ink, shadow, custom = inkDefault != FrameDesign.AUTO)
             c.restore()
         }
+        return boxes
+    }
+
+    /**
+     * Each candidate is scored: what it covers of [keepOut] and of the other blocks (heavily),
+     * how busy the picture is under it (on a photo), how much it had to shrink, and how far
+     * it moved from where the user put it. The lowest score wins.
+     */
+    private fun autoPlace(start: List<Placed>, base: Float, build: (Float) -> List<Placed>, boxOf: (Placed) -> RectF,
+                          area: RectF, keepOut: List<RectF>, onPhoto: Boolean, across: Boolean, source: Bitmap?,
+                          photo: RectF, d: FrameDesign): List<Placed> {
+        if (keepOut.isEmpty() && !onPhoto && start.size < 2) return start
+        val spots = if (onPhoto) listOf(0f, 0.5f, 1f) else listOf(0.5f)
+        val alongs = listOf(0f, 0.5f, 1f)
+        var best = start
+        var bestCost = Float.MAX_VALUE
+        for (scale in floatArrayOf(1f, 0.86f, 0.74f)) {
+            val blocks = if (scale == 1f) start else build(base * scale)
+            if (blocks.size != start.size) continue
+            val variants = mutableListOf<List<Placed>>()
+            if (blocks.size == 1) {
+                val b = blocks[0]
+                for (a in alongs) for (e in spots)
+                    variants += listOf(if (across) Placed(b.block, a, if (onPhoto) e else b.fy) else Placed(b.block, if (onPhoto) e else b.fx, a))
+            } else {
+                // the two ends stay ends: only the row (on a photo) and which end each takes
+                for (e in spots) for (swap in listOf(false, true)) {
+                    variants += blocks.mapIndexed { i, b ->
+                        val along = if (across) b.fx else b.fy
+                        val a = if (swap && blocks.size == 2) (if (i == 0) 1f else 0f) else along
+                        if (across) Placed(b.block, a, if (onPhoto) e else b.fy) else Placed(b.block, if (onPhoto) e else b.fx, a)
+                    }
+                }
+            }
+            for (v in variants) {
+                val boxes = v.map(boxOf)
+                var cost = (1f - scale) * 0.8f
+                for (bx in boxes) {
+                    val ba = (bx.width() * bx.height()).coerceAtLeast(1f)
+                    for (k in keepOut) cost += 6f * overlap(bx, k) / ba
+                    if (!area.contains(bx)) cost += 4f
+                    if (onPhoto && source != null) cost += 1.6f * regionDetail(source, photo, bx)
+                }
+                for (i in boxes.indices) for (j in i + 1 until boxes.size)
+                    cost += 6f * overlap(boxes[i], boxes[j]) / (boxes[i].width() * boxes[i].height()).coerceAtLeast(1f)
+                // where the user put it counts a little
+                for ((i, p) in v.withIndex()) {
+                    val o = start.getOrNull(i) ?: continue
+                    cost += 0.12f * (abs(p.fx - o.fx) + abs(p.fy - o.fy))
+                }
+                if (cost < bestCost - 1e-4f) { bestCost = cost; best = v }
+            }
+        }
+        return best
+    }
+
+    private fun overlap(a: RectF, b: RectF): Float {
+        val w = min(a.right, b.right) - max(a.left, b.left)
+        val h = min(a.bottom, b.bottom) - max(a.top, b.top)
+        return if (w > 0 && h > 0) w * h else 0f
+    }
+
+    /** How busy the picture is under [box]: the spread of its brightness, 0 (flat) .. ~1. */
+    private fun regionDetail(photo: Bitmap, at: RectF, box: RectF): Float {
+        val x0 = ((box.left - at.left) / at.width()).coerceIn(0f, 1f)
+        val x1 = ((box.right - at.left) / at.width()).coerceIn(0f, 1f)
+        val y0 = ((box.top - at.top) / at.height()).coerceIn(0f, 1f)
+        val y1 = ((box.bottom - at.top) / at.height()).coerceIn(0f, 1f)
+        if (x1 <= x0 || y1 <= y0) return 0f
+        var sum = 0f; var sq = 0f; var edges = 0f; var n = 0
+        var prev = -1f
+        for (iy in 0 until 8) {
+            prev = -1f
+            for (ix in 0 until 10) {
+                val px = ((x0 + (x1 - x0) * (ix + 0.5f) / 10) * (photo.width - 1)).toInt().coerceIn(0, photo.width - 1)
+                val py = ((y0 + (y1 - y0) * (iy + 0.5f) / 8) * (photo.height - 1)).toInt().coerceIn(0, photo.height - 1)
+                val l = luma(photo.getPixel(px, py))
+                sum += l; sq += l * l; n++
+                if (prev >= 0f) edges += abs(l - prev)
+                prev = l
+            }
+        }
+        val mean = sum / n
+        val sd = kotlin.math.sqrt((sq / n - mean * mean).coerceAtLeast(0f))
+        return (sd * 2.2f + edges / n * 3f).coerceAtMost(1.5f)
     }
 
     private val ink = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG)
@@ -515,14 +659,23 @@ object FrameDesigner {
 
     // ---- the date stamp ----------------------------------------------------------------------
 
-    private fun drawStamp(c: Canvas, d: FrameDesign, data: Data, photo: RectF, s: Float) {
+    private fun drawStamp(c: Canvas, d: FrameDesign, data: Data, photo: RectF, s: Float, avoid: List<RectF> = emptyList()) {
         if (d.stamp == Stamp.OFF) return
         val h = s * 0.036f
         val text = data.stampText
         val w = stampWidth(d.stamp, text, h)
         val m = s * 0.055f
-        val right = d.stampCorner % 2 == 1
-        val bottom = d.stampCorner >= 2
+        fun rect(corner: Int): RectF {
+            val x = if (corner % 2 == 1) photo.right - m - w else photo.left + m
+            val y = if (corner >= 2) photo.bottom - m - h else photo.top + m
+            return RectF(x - h * 0.3f, y - h * 0.3f, x + w + h * 0.3f, y + h * 1.3f)
+        }
+        // the chosen corner, unless the words are there: then the nearest one that is free
+        val corner = if (!d.autoPlace || avoid.none { RectF.intersects(it, rect(d.stampCorner)) }) d.stampCorner
+            else listOf(d.stampCorner xor 1, d.stampCorner xor 2, d.stampCorner xor 3)
+                .firstOrNull { k -> avoid.none { RectF.intersects(it, rect(k)) } } ?: d.stampCorner
+        val right = corner % 2 == 1
+        val bottom = corner >= 2
         val x = if (right) photo.right - m - w else photo.left + m
         val y = if (bottom) photo.bottom - m - h else photo.top + m
         val color = d.stampColor

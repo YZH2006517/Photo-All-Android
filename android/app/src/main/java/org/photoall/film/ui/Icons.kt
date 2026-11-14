@@ -14,7 +14,7 @@ import android.graphics.drawable.Drawable
  * strokes on every phone.
  */
 class Icon(private val kind: Kind, color: Int, private val stroke: Float = 1.6f, private val filled: Boolean = false) : Drawable() {
-    enum class Kind { FLASH, FLASH_OFF, HISTOGRAM, TUNE, GRID, CHEVRON, BACK, FLIP, HEART, SHARE, INFO, TRASH, OPEN, CHECK, FRAME }
+    enum class Kind { FLASH, FLASH_OFF, HISTOGRAM, TUNE, GRID, CHEVRON, BACK, FLIP, HEART, SHARE, INFO, TRASH, OPEN, CHECK, FRAME, ROTATE }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -67,6 +67,14 @@ class Icon(private val kind: Kind, color: Int, private val stroke: Float = 1.6f,
                 path.moveTo(16.5f, 4.5f); path.lineTo(18.6f, 8.4f); path.lineTo(14.4f, 8.6f)
                 path.moveTo(7.5f, 19.5f); path.lineTo(5.4f, 15.6f); path.lineTo(9.6f, 15.4f)
                 canvas.drawPath(path, paint)
+            }
+            Kind.ROTATE -> { // a quarter turn clockwise: an open arc, its arrow at the top, and a frame turning
+                rect.set(4.5f, 6f, 17.5f, 19f)
+                canvas.drawArc(rect, 160f, 250f, false, paint)
+                path.moveTo(14.2f, 3.6f); path.lineTo(17.4f, 6.4f); path.lineTo(13.6f, 8.4f)
+                canvas.drawPath(path, paint)
+                rect.set(9f, 10.5f, 13f, 14.5f)
+                canvas.drawRoundRect(rect, 0.8f, 0.8f, paint)
             }
             Kind.HEART -> {
                 path.moveTo(12f, 20f)

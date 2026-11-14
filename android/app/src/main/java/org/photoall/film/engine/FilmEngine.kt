@@ -199,10 +199,21 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
     }
 
     companion object {
+        /**
+         * Held while shaders are compiled for the GPU: the engine's Vulkan kernels here, the
+         * viewfinder's GL program in [org.photoall.film.camera.FilmViewfinder]. On Mali both go
+         * through the same compiler in libGLES_mali.so, which has crashed compiling the two at
+         * once (vivo, Dimensity, Android 17 beta driver).
+         */
+        val shaderCompileLock = Any()
+
         /** Loads filmsim/filmsim.lut and filmsim/spectra-em.lut from the app assets. */
         fun create(assets: AssetManager): FilmEngine {
             org.photoall.film.CrashReport.stage("启动 GPU 引擎")
-            return FilmEngine(FilmNative.create(assets)).also {
+            // the merge kernels only where a probe in its own process compiled them (GpuProbe)
+            val burst = org.photoall.film.CrashReport.burstKernelsAllowed() && GpuProbe.burstAllowed()
+            val handle = synchronized(shaderCompileLock) { FilmNative.create(assets, burst) }
+            return FilmEngine(handle).also {
                 runCatching { it.deviceName }.getOrNull()?.let { name -> org.photoall.film.CrashReport.gpuName(name) }
                 org.photoall.film.CrashReport.stage("GPU 引擎就绪")
             }
@@ -218,7 +229,14 @@ internal object FilmNative {
         System.loadLibrary("filmjni")
     }
 
-    @JvmStatic external fun create(assets: AssetManager): Long
+    /** [burst] false leaves the HDR+ merge kernels out (see CrashReport.burstKernelsAllowed). */
+    @JvmStatic external fun create(assets: AssetManager, burst: Boolean): Long
+
+    /** Called from native code with each step of [create] (kernel names while compiling). */
+    @JvmStatic fun stage(what: String) = stageSink(what)
+
+    /** Where [stage] goes: the crash report's engine step, or the probe's file (GpuProbe). */
+    @Volatile var stageSink: (String) -> Unit = { org.photoall.film.CrashReport.engineStage(it) }
     @JvmStatic external fun destroy(handle: Long)
     @JvmStatic external fun deviceName(handle: Long): String
     @JvmStatic external fun names(papers: Boolean): Array<String>

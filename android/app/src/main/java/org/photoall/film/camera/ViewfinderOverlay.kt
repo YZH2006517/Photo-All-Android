@@ -41,6 +41,8 @@ class ViewfinderOverlay(context: Context) : View(context) {
      * Rounded picture corners: the GL surface cannot be clipped, so the corners are painted
      * over in [cornerColor] (the well around it). 0 = square.
      */
+    /** What lies round the picture (the screen's ground, or the well in landscape): a style's frame fills its corners with it. */
+    var frameAround = 0xff0b0b0d.toInt()
     var cornerRadius = 0f
         set(value) { field = value; invalidate() }
     var cornerColor = 0xff0b0b0d.toInt()
@@ -273,6 +275,11 @@ class ViewfinderOverlay(context: Context) : View(context) {
     override fun dispatchDraw(canvas: Canvas) {
         super.dispatchDraw(canvas)
         drawFrost(canvas)
+        if (org.photoall.film.ui.Skin.active) {
+            // the style's own frame round the picture, in place of the plain corners
+            org.photoall.film.ui.Skin.drawFinderFrame(canvas, width.toFloat(), height.toFloat(), density, frameAround)
+            return
+        }
         if (cornerRadius <= 0f) return
         cornerPath.reset()
         cornerPath.addRect(0f, 0f, width.toFloat(), height.toFloat(), android.graphics.Path.Direction.CW)

@@ -112,12 +112,23 @@ struct DeviceInfo
   uint32_t api_version = 0;
   uint32_t subgroup_size = 0;
   bool timestamps = false;
+  // false: the HDR+ merge kernels (hp_*) were left out, a burst develops its first frame only
+  bool burst = true;
 };
+
+/**
+ * Called with each step of [FilmEngine::create] (the kernel about to be compiled, ...), on
+ * the creating thread, so a driver that crashes there leaves behind which step it was.
+ */
+void set_stage_hook(void (*hook)(const char *stage));
 
 class FilmEngine
 {
 public:
-  static std::unique_ptr<FilmEngine> create(const Lut &filmsim, const Lut &spectra, std::string &error);
+  // [burst_kernels] false leaves the HDR+ merge kernels out (a GPU driver that crashes
+  // compiling them); bursts then develop their reference frame alone.
+  static std::unique_ptr<FilmEngine> create(const Lut &filmsim, const Lut &spectra, std::string &error,
+                                            bool burst_kernels = true);
   ~FilmEngine();
   FilmEngine(const FilmEngine &) = delete;
   FilmEngine &operator=(const FilmEngine &) = delete;

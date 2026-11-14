@@ -36,6 +36,8 @@ object CrashReport {
     private const val TAG = "CrashReport"
     private const val PREFS = "crash"
     @Volatile private var app: Context? = null
+    /** The application, for code with no context of its own (the frame renderer's fonts). */
+    val context: Context? get() = app
     private val main = Handler(Looper.getMainLooper())
     private val recoveries = ArrayDeque<Long>()
 
@@ -52,8 +54,15 @@ object CrashReport {
         this.app = app
         // the last step of the run before this one, kept for a report of how that run ended
         app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).let { p ->
+            // The last run died compiling a merge kernel: the driver can't take them, so
+            // leave them out on this phone until the app or the system changes.
+            val died = p.getString("engine_stage", null)
+            if (died != null && died.startsWith("hp_"))
+                p.edit().putString("burst_off", burstKey(app)).putString("burst_off_kernel", died).commit()
             p.edit().putString("prev_stage", p.getString("stage", null)).putLong("prev_stage_at", p.getLong("stage_at", 0L))
-                .putString("stage", "启动").putLong("stage_at", System.currentTimeMillis()).commit()
+                .putString("prev_engine_stage", p.getString("engine_stage", null))
+                .putString("stage", "启动").putLong("stage_at", System.currentTimeMillis())
+                .remove("engine_stage").commit()
         }
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         val mainThread = Looper.getMainLooper().thread
@@ -140,6 +149,28 @@ object CrashReport {
             .putString("stage", what).putLong("stage_at", System.currentTimeMillis()).commit()
     }
 
+    /**
+     * The GPU engine's own step (the kernel being compiled), kept apart from [stage]: the
+     * engine starts on its own thread while the camera binds, and would be written over.
+     */
+    fun engineStage(what: String) {
+        app?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("engine_stage", what)?.commit()
+    }
+
+    private fun burstKey(context: Context): String {
+        val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode }.getOrDefault(0L)
+        return "$version|${Build.FINGERPRINT}"
+    }
+
+    /**
+     * Whether the engine may compile the HDR+ merge kernels: not after a run died compiling
+     * one on this app version and system build (a driver bug; RAW bursts then use one frame).
+     */
+    fun burstKernelsAllowed(): Boolean {
+        val app = app ?: return true
+        return app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("burst_off", null) != burstKey(app)
+    }
+
     private val events = ArrayDeque<String>()
 
     /** A line of what the user saw (status messages), the last 60 kept for diagnostics. */
@@ -194,7 +225,8 @@ object CrashReport {
             val seen = prefs.getLong("exit_seen", 0L)
             val exits = am.getHistoricalProcessExitReasons(context.packageName, 0, 5).filter { it.timestamp > seen }
             exits.maxOfOrNull { it.timestamp }?.let { prefs.edit().putLong("exit_seen", it).apply() }
-            val bad = exits.firstOrNull {
+            // the GPU probe's process is meant to take a driver crash: not the app's end
+            val bad = exits.filterNot { it.processName.endsWith(org.photoall.film.engine.GpuProbe.PROCESS_SUFFIX) }.firstOrNull {
                 it.reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
                     it.reason == ApplicationExitInfo.REASON_LOW_MEMORY ||
                     it.reason == ApplicationExitInfo.REASON_ANR ||
@@ -299,6 +331,15 @@ object CrashReport {
             append("最后一步：").append(prefs.getString(stageKey, null) ?: "—")
             if (stageAt > 0) append("（").append(stamp.format(Date(stageAt))).append("）")
             append('\n')
+            prefs.getString(if (previousRun) "prev_engine_stage" else "engine_stage", null)?.let {
+                append("GPU 引擎：").append(if (it in setOf("vulkan", "ready", "failed")) it else "编译 $it").append('\n')
+            }
+            if (prefs.getString("burst_off", null) == burstKey(context))
+                append("多帧合成：已关闭（GPU 驱动编译 ").append(prefs.getString("burst_off_kernel", "hp_*"))
+                    .append(" 时崩溃，RAW 改用单帧）\n")
+            else org.photoall.film.engine.GpuProbe.verdict(context)?.takeIf { it.startsWith("sealed") }?.let {
+                append("多帧合成：已封存（").append(it.removePrefix("sealed: ")).append("，RAW 改用单帧）\n")
+            }
         }
     }
 

@@ -414,8 +414,16 @@ class FilmExposure(
         }
     })
 
+    /**
+     * The camera driver restarted on a RAW shot with the lens shading map and the preset
+     * tone curve asked for (an OPPO with a MediaTek chip): left to the driver's defaults.
+     * The DNG then has no shading map (the vignetting stays) and the viewfinder the camera's
+     * own curve.
+     */
+    var plain = false
+
     private fun fill(o: RequestSink) {
-        o.put(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
+        if (!plain) o.put(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
                 CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             .put(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_PRESET_CURVE)
             .put(CaptureRequest.TONEMAP_PRESET_CURVE, CaptureRequest.TONEMAP_PRESET_CURVE_SRGB)

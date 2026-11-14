@@ -102,8 +102,18 @@ struct Stages
 {
   bool film = true;
   bool print = true;
+  // 8-bit sources only, 0..1: how much of a camera's own rendering (saturation, contrast,
+  // the shoulder ending at 1.0) is taken back off before the film, see decode.comp.
+  float restore = 0.0f;
+  // 8-bit sources only, -1..1: white balance at the door, in linear light (warmer / greener).
+  float temp = 0.0f;
+  float tint = 0.0f;
+  // Raw sources with match_key: the viewfinder's brightness only lifts the shot, never
+  // darkens it, and never pushes its brightest 0.5% past 0.9 (a flash frame: the flash
+  // lit the subject, the HAL's exposure often leaves the rest under the viewfinder).
+  bool match_lift = false;
 };
-// "stage film" / "stage print" (0 off, otherwise on); false for other names.
+// "stage film" / "stage print" (0 off, otherwise on), "stage restore" (0..1); false for other names.
 bool set_stage(Stages &stages, std::string_view name, float value);
 
 // Slide and reversal stocks: their developed film is the positive image.

@@ -19,8 +19,10 @@ class SettingsActivity : Activity() {
         val panel = SettingsPanel(this, store, onBench = null, onClose = { finish() },
             onGuide = { startActivity(android.content.Intent(this, GuideActivity::class.java)) },
             onDiagnostics = { showDiagnostics() })
+        // RAW capture and keeping the RAW switch each other (SettingsStore): show both
+        store.onChange { key -> if (key == Settings.RAW || key == Settings.KEEP_RAW) panel.refresh() }
         panel.setOnApplyWindowInsetsListener { view, insets ->
-            val bars = insets.getInsets(WindowInsets.Type.systemBars())
+            val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }

@@ -68,6 +68,15 @@ class ImportActivity : ComponentActivity() {
     private var lutStrength = 1f
     private var evThirds = 0
     private var page = 0
+    // fine adjustments (微调): white balance, how much of the phone's rendering is taken
+    // back off, and the EDR headroom; kept between imports
+    private val tunePrefs by lazy { getSharedPreferences("import_tune", MODE_PRIVATE) }
+    private var temp = 0f
+    private var tint = 0f
+    private var restore = 1f
+    private var edr = 1.5f
+    private lateinit var tuneBox: LinearLayout
+    private lateinit var tuneToggle: TextView
 
     private lateinit var preview: ImageView
     private lateinit var busy: TextView
@@ -144,6 +153,12 @@ class ImportActivity : ComponentActivity() {
         paper = store["paper"].toInt().coerceIn(0, FilmEngine.papers.lastIndex)
         lut = if (store.flag(Settings.LUT_ON)) store[Settings.LUT].toInt().coerceIn(0, LutLibrary.count - 1) else 0
         lutStrength = store[Settings.LUT_STRENGTH].takeIf { it > 0f } ?: 1f
+        temp = tunePrefs.getFloat("temp", 0f)
+        tint = tunePrefs.getFloat("tint", 0f)
+        restore = tunePrefs.getFloat("restore", 1f)
+        edr = if (Edr.supported) tunePrefs.getFloat("edr", 1.5f) else 0f
+        // an HDR window: the preview's gain map is shown, not just its SDR base
+        if (Edr.supported) window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_HDR
         for (setting in Settings.all) if (engineParam(setting)) initial[setting.key] = store[setting.key]
         onBackPressedDispatcher.addCallback(this, closeParams)
         build()
@@ -227,7 +242,7 @@ class ImportActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), 0, dp(12), 0)
         }
-        groupScroll = HorizontalScrollView(this).apply {
+        groupScroll = HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             addView(groupTabs, FrameLayout.LayoutParams(-2, -1))
@@ -248,7 +263,7 @@ class ImportActivity : ComponentActivity() {
             addView(strip, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         }
         thumbs = LinearLayout(this).apply { setPadding(dp(12), 0, dp(12), 0) }
-        thumbScroll = HorizontalScrollView(this).apply {
+        thumbScroll = HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
             isHorizontalScrollBarEnabled = false
             addView(thumbs)
             visibility = View.GONE
@@ -294,6 +309,7 @@ class ImportActivity : ComponentActivity() {
             addView(strength, LinearLayout.LayoutParams(0, dp(36), 1f))
             addView(strengthValue, LinearLayout.LayoutParams(dp(SIDE), -2))
         }
+        buildTune()
         // one press develops with the recipe as it stands; the other opens every engine parameter
         developButton = TextView(this).apply {
             textSize = 15f
@@ -323,7 +339,12 @@ class ImportActivity : ComponentActivity() {
             setBackgroundColor(Style.BG)
             setPadding(dp(16), dp(12), dp(16), dp(12))
             addView(pages, LinearLayout.LayoutParams(-1, dp(40)))
-            addView(recipeLine, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            addView(LinearLayout(this@ImportActivity).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(recipeLine, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(tuneToggle, LinearLayout.LayoutParams(-2, dp(30)).apply { marginStart = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            addView(tuneBox, LinearLayout.LayoutParams(-1, -2))
             addView(LinearLayout(this@ImportActivity).apply {
                 gravity = Gravity.CENTER_VERTICAL
                 // label and value equally wide: the ruler, and its 0, sit in the middle of the
@@ -348,7 +369,7 @@ class ImportActivity : ComponentActivity() {
             addView(thumbScroll, LinearLayout.LayoutParams(-1, dp(64)).apply { topMargin = dp(6); bottomMargin = dp(6) })
             addView(panel, LinearLayout.LayoutParams(-1, -2))
             setOnApplyWindowInsetsListener { view, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
                 view.setPadding(bars.left, bars.top, bars.right, 0)
                 panel.setPadding(dp(16), dp(12), dp(16), dp(12) + bars.bottom)
                 bottomInset = bars.bottom
@@ -362,6 +383,70 @@ class ImportActivity : ComponentActivity() {
         fillPicker(animate = false)
         syncPanel()
     }
+
+    /** 微调: four sliders under the recipe line, folded away until asked for. */
+    private fun buildTune() {
+        tuneToggle = TextView(this).apply {
+            textSize = 12f
+            typeface = Style.medium
+            gravity = Gravity.CENTER
+            setPadding(dp(12), 0, dp(12), 0)
+            setTextColor(Style.TEXT)
+            background = GradientDrawable().apply { cornerRadius = dp(15).toFloat(); setColor(Style.SURFACE); setStroke(dp(1), Style.TEXT_3) }
+            Style.pressable(this)
+            setOnClickListener {
+                haptics.play(Haptics.Event.SEGMENT)
+                tuneBox.visibility = if (tuneBox.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                syncTune()
+            }
+        }
+        tuneBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE; setPadding(0, dp(4), 0, 0) }
+        tuneBox.addView(tuneRow("色温", -100, 100, { (temp * 100).roundToInt() }, { v -> temp = v / 100f },
+            { v -> if (v == 0) "±0" else (if (v > 0) "暖 " else "冷 ") + kotlin.math.abs(v) }))
+        tuneBox.addView(tuneRow("色调", -100, 100, { (tint * 100).roundToInt() }, { v -> tint = v / 100f },
+            { v -> if (v == 0) "±0" else (if (v > 0) "绿 " else "品 ") + kotlin.math.abs(v) }))
+        tuneBox.addView(tuneRow("场景还原", 0, 100, { (restore * 100).roundToInt() }, { v -> restore = v / 100f },
+            { v -> "$v%" }))
+        if (Edr.supported) tuneBox.addView(tuneRow("EDR 高光", 0, 25, { (edr * 10).roundToInt() }, { v -> edr = v / 10f },
+            { v -> if (v == 0) "关" else "+%.1f 档".format(Locale.US, v / 10f) }))
+        syncTune()
+    }
+
+    /** One slider: label, bar, value; a double tap on the label puts it back to its default. */
+    private fun tuneRow(name: String, min: Int, max: Int, get: () -> Int, set: (Int) -> Unit, show: (Int) -> String): View {
+        val value = TextView(this).apply { textSize = 13f; setTextColor(Style.TEXT); gravity = Gravity.END; maxLines = 1; Style.numeric(this) }
+        val bar = SeekBar(this).apply {
+            this.max = max - min
+            progress = get() - min
+            progressTintList = android.content.res.ColorStateList.valueOf(Style.ACCENT)
+            thumbTintList = android.content.res.ColorStateList.valueOf(Style.ACCENT)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, p: Int, fromUser: Boolean) {
+                    value.text = show(p + min)
+                    if (!fromUser) return
+                    set(p + min)
+                    syncTune()
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) {}
+                override fun onStopTrackingTouch(bar: SeekBar) { saveTune(); schedulePreview() }
+            })
+        }
+        value.text = show(get())
+        return LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label(name), LinearLayout.LayoutParams(dp(SIDE), -2))
+            addView(bar, LinearLayout.LayoutParams(0, dp(34), 1f))
+            addView(value, LinearLayout.LayoutParams(dp(SIDE), -2))
+        }
+    }
+
+    private fun syncTune() {
+        val changed = temp != 0f || tint != 0f || restore != 1f || edr != (if (Edr.supported) 1.5f else 0f)
+        tuneToggle.text = (if (tuneBox.visibility == View.VISIBLE) "收起" else "微调") + (if (changed) " ·" else "")
+    }
+
+    private fun saveTune() = tunePrefs.edit().putFloat("temp", temp).putFloat("tint", tint)
+        .putFloat("restore", restore).putFloat("edr", edr).apply()
 
     private val showOriginal = Runnable { source?.let { preview.setImageBitmap(it) } }
 
@@ -546,15 +631,21 @@ class ImportActivity : ComponentActivity() {
     // ---- developing ----------------------------------------------------------------------
 
     private data class Recipe(val filmOn: Boolean, val film: Int, val printOn: Boolean, val paper: Int,
-                              val lut: Int, val strength: Float, val ev: Float)
+                              val lut: Int, val strength: Float, val ev: Float,
+                              val temp: Float, val tint: Float, val restore: Float, val edr: Float)
 
-    private fun recipe() = Recipe(filmOn, film, printOn, paper, lut, lutStrength, evThirds / 3f)
+    private fun recipe() = Recipe(filmOn, film, printOn, paper, lut, lutStrength, evThirds / 3f, temp, tint, restore, edr)
 
     private fun params(r: Recipe): Map<String, Float> = values.filmParams().toMutableMap().apply {
         this["film"] = r.film.toFloat()
         this["paper"] = r.paper.toFloat()
         this["stage film"] = if (r.filmOn) 1f else 0f
         this["stage print"] = if (r.printOn) 1f else 0f
+        // a phone photo is already rendered: take its own contrast, saturation and clipped
+        // shoulder back off before the film, which adds its own (the engine's scene restore)
+        this["stage restore"] = if (r.filmOn) r.restore else 0f
+        this["stage temp"] = r.temp
+        this["stage tint"] = r.tint
     }
 
     /** Worker thread: [bitmap] through the recipe (a CCD camera LUT runs on the CPU after it). */
@@ -568,6 +659,7 @@ class ImportActivity : ComponentActivity() {
         val image = if (digicam == null) developed.bitmap else
             Digicam.apply(this, developed.bitmap, digicam, iso = iso, strength = r.strength, seed = Random.nextInt())
                 .also { if (it !== developed.bitmap) developed.bitmap.recycle() }
+        Edr.attach(image, bitmap, r.edr)
         return image to developed
     }
 
@@ -639,6 +731,8 @@ class ImportActivity : ComponentActivity() {
         log.put("胶片配方", "配方", text)
         log.put("胶片配方", "曝光", "%+.2f EV".format(Locale.US, r.ev))
         if (r.lut != 0) log.put("胶片配方", "LUT 强度", "%.0f%%".format(Locale.US, r.strength * 100))
+        log.put("胶片配方", "微调", "色温 %+.0f · 色调 %+.0f · 场景还原 %.0f%% · EDR %s".format(Locale.US,
+            r.temp * 100, r.tint * 100, r.restore * 100, if (Edr.supported && image.hasGainmap()) "+%.1f 档".format(Locale.US, r.edr) else "关"))
         log.putEngine(developed.info)
         log.put("冲洗结果", "文件", name)
         log.put("冲洗结果", "成片尺寸", "${image.width}x${image.height}")

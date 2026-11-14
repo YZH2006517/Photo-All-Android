@@ -193,6 +193,32 @@ object Photos {
     }
 
     /**
+     * A quarter turn clockwise, written into the photo's EXIF orientation (so every viewer
+     * shows it turned; the pixels are untouched). A photo of the app's own is written at once;
+     * one the app did not take asks the system first: the PendingIntent to show.
+     */
+    fun rotate(context: Context, photo: Photo): PendingIntent? {
+        fun next(o: Int) = when (o) {
+            android.media.ExifInterface.ORIENTATION_ROTATE_90 -> android.media.ExifInterface.ORIENTATION_ROTATE_180
+            android.media.ExifInterface.ORIENTATION_ROTATE_180 -> android.media.ExifInterface.ORIENTATION_ROTATE_270
+            android.media.ExifInterface.ORIENTATION_ROTATE_270 -> android.media.ExifInterface.ORIENTATION_NORMAL
+            else -> android.media.ExifInterface.ORIENTATION_ROTATE_90
+        }
+        fun turn(exif: android.media.ExifInterface) {
+            val o = exif.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, android.media.ExifInterface.ORIENTATION_NORMAL)
+            exif.setAttribute(android.media.ExifInterface.TAG_ORIENTATION, next(o).toString())
+            exif.saveAttributes()
+        }
+        photo.file?.let { turn(android.media.ExifInterface(it.path)); return null }
+        return try {
+            context.contentResolver.openFileDescriptor(photo.uri, "rw")!!.use { turn(android.media.ExifInterface(it.fileDescriptor)) }
+            null
+        } catch (e: SecurityException) {
+            MediaStore.createWriteRequest(context.contentResolver, listOf(photo.uri))
+        }
+    }
+
+    /**
      * Moves photos, and the RAW originals shot with them (same FILM_<time> stamp), to the
      * system recycle bin, where the system gallery can restore them for 30 days.
      */

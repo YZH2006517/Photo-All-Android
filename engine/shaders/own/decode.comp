@@ -11,7 +11,31 @@ layout(push_constant) uniform push_t
   vec4 row2;
   int  srgb_eotf; // 1: decode sRGB/P3 transfer, 0: already linear
   float gain;     // exposure multiplier applied in linear light
+  float pad0, pad1;
+  // Scene restore of a display-referred (8-bit, camera-rendered) source, see restore():
+  vec4 tone;      // x: on (> 0), y: mid-tone log slope, z: shoulder knee, w: shoulder a
+  vec4 tone2;     // x: saturation kept, yzw: white balance gains (linear source rgb)
 } push;
+
+// A camera JPEG is the scene already through the phone's own rendering: extra
+// saturation, extra mid-tone contrast and a shoulder that ends at 1.0. The film would
+// add its own on top (twice the contrast, flat clipped highlights). This takes a
+// typical rendering back off: saturation toward luminance, the log slope round mid
+// grey eased, and the top of the range opened past 1.0 again by the inverse of a
+// rational shoulder (C1 at the knee, 1.0 lands on the scene white chosen on the CPU).
+// Applied to the colour's norm (its largest channel) so hue ratios are kept.
+vec3 restore(vec3 rgb)
+{
+  const vec3 w709 = vec3(0.2126, 0.7152, 0.0722);
+  float y = dot(rgb, w709);
+  rgb = max(vec3(y) + push.tone2.x * (rgb - vec3(y)), vec3(0.0));
+  float n = max(rgb.r, max(rgb.g, rgb.b));
+  if(n <= 1e-6) return rgb;
+  float m = 0.18 * pow(n / 0.18, push.tone.y);
+  float u = m - push.tone.z;
+  if(u > 0.0) m = push.tone.z + u / max(1.0 - u / push.tone.w, 0.02);
+  return rgb * (m / n);
+}
 
 vec3 eotf(vec3 v)
 {
@@ -42,6 +66,8 @@ void main()
       }
     rgb = sum / 16.0;
   }
+  rgb *= push.tone2.yzw;
+  if(push.tone.x > 0.0) rgb = restore(rgb);
   rgb = vec3(dot(push.row0.xyz, rgb), dot(push.row1.xyz, rgb), dot(push.row2.xyz, rgb));
   imageStore(img_out, p, vec4(max(rgb * push.gain, vec3(0.0)), 1.0));
 }

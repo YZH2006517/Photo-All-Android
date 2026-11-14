@@ -71,7 +71,18 @@ object Style {
      */
     fun apply(activity: android.app.Activity) {
         val index = org.photoall.film.settings.SettingsStore(activity)[org.photoall.film.settings.Settings.THEME].toInt()
-        palette = palettes[index.coerceIn(0, palettes.lastIndex)]
+        // The theme list runs on into the camera styles: past the themes, a style with its own colours.
+        val store = org.photoall.film.settings.SettingsStore(activity)
+        var theme = index
+        val raw = activity.getSharedPreferences("film-settings", android.content.Context.MODE_PRIVATE)
+        val oldSkin = raw.getFloat(org.photoall.film.settings.Settings.SKIN, 0f).toInt()
+        if (oldSkin > 0) { // from the build that kept them apart
+            theme = palettes.size + oldSkin - 1
+            raw.edit().remove(org.photoall.film.settings.Settings.SKIN).apply()
+            store[org.photoall.film.settings.Settings.THEME] = theme.toFloat()
+        }
+        palette = palettes[theme.coerceIn(0, palettes.lastIndex)]
+        Skin.load(if (theme >= palettes.size) theme - palettes.size + 1 else 0)?.let { palette = it }
         activity.setTheme(if (palette.light) org.photoall.film.R.style.FilmThemeLight else org.photoall.film.R.style.FilmTheme)
         activity.window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(BG))
         activity.window.navigationBarColor = BG

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Cartridge</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #141311; touch-action: none; }
+  body { background: radial-gradient(120% 90% at 50% 38%, #3a3631 0%, #1c1a17 55%, #0e0d0c 100%); }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hint { position: fixed; left: 0; right: 0; bottom: max(28px, env(safe-area-inset-bottom)); text-align: center;
+          font: 13px/1.4 sans-serif; color: rgba(236, 230, 218, 0.62); letter-spacing: 0.06em; pointer-events: none;
+          transition: opacity 0.6s; }
+  #pull { position: fixed; right: 20px; bottom: max(64px, calc(env(safe-area-inset-bottom) + 48px)); padding: 10px 16px;
+          border-radius: 20px; border: 1px solid rgba(236, 230, 218, 0.35); background: rgba(20, 19, 17, 0.55);
+          color: #ece6da; font: 14px sans-serif; letter-spacing: 0.04em; }
+  #name { position: fixed; left: 20px; top: max(22px, env(safe-area-inset-top)); color: #ece6da;
+          font: italic 20px Georgia, serif; }
+  #name small { display: block; font: 11px monospace; letter-spacing: 0.18em; color: rgba(236, 230, 218, 0.55); margin-top: 4px; font-style: normal; }
+</style>
+</head>
+<body>
+<div id="name"></div>
+<button id="pull">抽出胶片</button>
+<div id="hint">单指旋转 · 双指缩放 · 双击抽出胶片</div>
+<script src="three.min.js"></script>
+<script src="cartmodel.js"></script>
+<script src="cartridge.js"></script>
+</body>
+</html>

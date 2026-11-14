@@ -56,6 +56,37 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     @Volatile var gain = 1f
         set(value) { field = value; requestRender() }
 
+    /**
+     * The viewfinder's own tone: the camera's picture softened ([soften] 0..1, its sharpening
+     * taken off) and quieter ([saturation], 1 = as the camera gives it). The film look is
+     * left to the developed photo; the viewfinder no longer previews it.
+     */
+    @Volatile var soften = 0.5f
+        set(value) { field = value; requestRender() }
+    /** RGBA8 [size]^3 film LUT from FilmEngine.previewLut, shown on the picture; null: the camera's own picture. */
+    fun setLut(data: ByteArray?, size: Int) {
+        val lut = (data ?: ByteArray(0)) to size
+        if (lastLut?.let { it.first === lut.first && it.second == size } == true) return
+        lastLut = lut
+        pendingLut = lut
+        requestRender()
+    }
+
+    /** Brighter or darker to look at, in stops; the photo is not touched. */
+    @Volatile var exposure = 0f
+        set(value) { field = value; requestRender() }
+
+    /** Called once, on the main thread, when the next camera frame arrives. */
+    @Volatile var onFrame: (() -> Unit)? = null
+
+    @Volatile var saturation = 0.7f
+        set(value) { field = value; requestRender() }
+
+    /** Film grain over the viewfinder, 0..1 (0 = none); a new grain every frame, like film running. */
+    @Volatile var grain = 0f
+        set(value) { field = value; requestRender() }
+    private var grainFrame = 0
+
     /** Focus peaking: outline in-focus edges in red (manual focus aid). */
     @Volatile var peaking = false
         set(value) { field = value; requestRender() }
@@ -98,13 +129,6 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         return true
     }
 
-    /** RGBA8 [size]^3 LUT from FilmEngine.previewLut; null shows the camera unprocessed. */
-    fun setLut(data: ByteArray?, size: Int) {
-        val lut = (data ?: ByteArray(0)) to size
-        lastLut = lut
-        pendingLut = lut
-        requestRender()
-    }
 
     // A Camera2 session waiting for the GL surface: size, rotation and where to hand it.
     private var pendingDirect: Triple<android.util.Size, Int, (Surface) -> Unit>? = null
@@ -177,20 +201,26 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         surfaceGeneration++
-        program = buildProgram()
+        // not while the engine compiles its Vulkan kernels (same Mali compiler, see the lock)
+        program = synchronized(org.photoall.film.engine.FilmEngine.shaderCompileLock) { buildProgram() }
         val textures = IntArray(2)
         GLES30.glGenTextures(2, textures, 0)
         cameraTexture = textures[0]
         lutTexture = textures[1]
+        lutSize = 0
+        if (pendingLut == null) pendingLut = lastLut // re-upload after a context loss
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTexture)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
-        lutSize = 0
-        if (pendingLut == null) pendingLut = lastLut // re-upload after a context loss
         surfaceTexture?.release()
-        surfaceTexture = SurfaceTexture(cameraTexture).apply { setOnFrameAvailableListener { requestRender() } }
+        surfaceTexture = SurfaceTexture(cameraTexture).apply {
+            setOnFrameAvailableListener {
+                requestRender()
+                onFrame?.let { f -> onFrame = null; post(f) }
+            }
+        }
         pendingRequest?.let { pendingRequest = null; provide(it) }
         pendingDirect?.let { (size, rotation, ready) -> pendingDirect = null; direct(size, rotation, ready) }
     }
@@ -211,25 +241,29 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             return
         }
         texture.getTransformMatrix(transform)
-        pendingLut?.let { (data, size) ->
-            pendingLut = null
-            uploadLut(data, size)
-        }
         if (bufferWidth == 0) return
 
         GLES30.glUseProgram(program)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTexture)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uCamera"), 0)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uSoften"), soften)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uSat"), saturation)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGrain"), grain)
+        grainFrame = (grainFrame + 1) and 1023
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGrainSeed"), grainFrame * 0.6180339f)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGrainCell"), (resources.displayMetrics.density * 0.9f).coerceAtLeast(1f))
+        pendingLut?.let { (data, size) -> pendingLut = null; uploadLut(data, size) }
         GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTexture)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uLut"), 1)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uHasLut"), if (lutSize > 0) 1 else 0)
         val n = lutSize.coerceAtLeast(1).toFloat()
         GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uLutMap"), (n - 1f) / n, 0.5f / n)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uTransform"), 1, false, transform, 0)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uPeaking"), if (peaking) 1 else 0)
-        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGain"), gain)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGain"), gain * Math.pow(2.0, exposure.toDouble()).toFloat())
         // One sensor-buffer texel in texture coordinates, for the edge detector.
         GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uTexel"),
             1f / bufferWidth.coerceAtLeast(1), 1f / bufferHeight.coerceAtLeast(1))
@@ -307,23 +341,58 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             #extension GL_OES_EGL_image_external_essl3 : require
             precision highp float;
             uniform samplerExternalOES uCamera;
+            uniform float uSoften; // 0..1: how much of a small blur replaces the picture
+            uniform float uSat;    // saturation, 1 = unchanged
             uniform highp sampler3D uLut;
             uniform bool uHasLut;
             uniform vec2 uLutMap; // scale, offset onto texel centres
             uniform bool uPeaking;
             uniform vec2 uTexel;
             uniform float uGain;
+            uniform float uGrain;     // 0..1
+            uniform float uGrainSeed; // changes every frame
+            uniform float uGrainCell; // screen pixels per grain
             in vec2 vTexcoord;
             out vec4 colour;
             float luma(vec2 t) { return dot(texture(uCamera, t).rgb, vec3(0.299, 0.587, 0.114)); }
+            float hash(vec2 p) {
+              vec3 q = fract(vec3(p.xyx) * 0.1031);
+              q += dot(q, q.yzx + 33.33);
+              return fract((q.x + q.y) * q.z);
+            }
+            // value noise on a grain-sized lattice, smoothly interpolated: soft clumps, not pixels
+            float grainNoise(vec2 p) {
+              vec2 i = floor(p), f = fract(p);
+              f = f * f * (3.0 - 2.0 * f);
+              float a = hash(i), b = hash(i + vec2(1.0, 0.0)), c = hash(i + vec2(0.0, 1.0)), d = hash(i + vec2(1.0, 1.0));
+              return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) - 0.5;
+            }
             void main() {
               vec3 c = texture(uCamera, vTexcoord).rgb;
+              if (uSoften > 0.0) {
+                // a soft cross of four taps two texels out: the camera's edge sharpening undone
+                vec2 ox = vec2(2.0 * uTexel.x, 0.0), oy = vec2(0.0, 2.0 * uTexel.y);
+                vec3 b = 0.25 * (texture(uCamera, vTexcoord + ox).rgb + texture(uCamera, vTexcoord - ox).rgb
+                               + texture(uCamera, vTexcoord + oy).rgb + texture(uCamera, vTexcoord - oy).rgb);
+                c = mix(c, b, 0.8 * uSoften);
+              }
               if (uGain != 1.0) { // sRGB -> linear, the gain, back
                 vec3 l = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)) * uGain;
                 l = clamp(l, 0.0, 1.0);
                 c = mix(12.92 * l, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, l));
               }
               if (uHasLut) c = texture(uLut, clamp(c, 0.0, 1.0) * uLutMap.x + uLutMap.y).rgb;
+              else c = mix(vec3(dot(c, vec3(0.299, 0.587, 0.114))), c, uSat);
+              if (uGrain > 0.0) {
+                // two sizes of grain, fresh each frame; strongest in the mid tones and shadows
+                // (as on a negative), little in the deepest black and the brightest white
+                vec2 p = gl_FragCoord.xy / uGrainCell + vec2(uGrainSeed * 91.7, uGrainSeed * 37.3);
+                float n = 0.75 * grainNoise(p) + 0.45 * grainNoise(p * 2.3 + 17.0);
+                float y = dot(c, vec3(0.299, 0.587, 0.114));
+                float w = smoothstep(0.0, 0.18, y) * (1.0 - 0.75 * smoothstep(0.55, 1.0, y));
+                vec3 tint = vec3(1.0) + 0.15 * vec3(grainNoise(p + 5.1), grainNoise(p + 9.7), grainNoise(p + 2.3));
+                c = clamp(c + n * 0.22 * uGrain * w * tint, 0.0, 1.0);
+              }
               if (uPeaking) {
                 // Sobel on camera luma two texels apart: strong local contrast = in focus.
                 vec2 dx = vec2(2.0 * uTexel.x, 0.0), dy = vec2(0.0, 2.0 * uTexel.y);

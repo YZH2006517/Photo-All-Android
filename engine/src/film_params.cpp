@@ -77,6 +77,10 @@ bool set_stage(Stages &stages, std::string_view name, float value)
 {
   if(name == "stage film") stages.film = value != 0.0f;
   else if(name == "stage print") stages.print = value != 0.0f;
+  else if(name == "stage restore") stages.restore = std::clamp(value, 0.0f, 1.0f);
+  else if(name == "stage temp") stages.temp = std::clamp(value, -1.0f, 1.0f);
+  else if(name == "stage tint") stages.tint = std::clamp(value, -1.0f, 1.0f);
+  else if(name == "stage match lift") stages.match_lift = value != 0.0f;
   else return false;
   return true;
 }

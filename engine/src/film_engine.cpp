@@ -19,6 +19,13 @@ using namespace vk;
 
 namespace {
 
+void (*g_stage_hook)(const char *) = nullptr;
+
+void report_stage(const char *stage)
+{
+  if(g_stage_hook) g_stage_hook(stage);
+}
+
 #define VK_TRY(expr, what) \
   do { \
     const VkResult vk_try_result = (expr); \
@@ -49,7 +56,7 @@ constexpr KernelSpec kKernels[kKernelCount] = {
     {"setup", "SBS", 16},      {"dirlut", "IB", 0},       {"fast", "SBSI", 0},
     {"expose", "SSBII", 0},    {"develop", "SBSSI", 0},   {"halin", "SBSI", 0},
     {"halout", "SBSISSSSSS", 0}, {"scatter", "SISSSS", 0}, {"negprint", "SSBI", 0},
-    {"blur", "SI", 16},        {"downsample", "SI", 4},   {"decode", "SI", 56},
+    {"blur", "SI", 16},        {"downsample", "SI", 4},   {"decode", "SI", 96},
     {"encode", "SIS", 112},     {"raw", "SSI", 128},
     {"hp_quad", "SI", 32},     {"hp_pyramid", "SI", 32},  {"hp_align", "SSSI", 32},
     {"hp_warp", "SSI", 16},    {"hp_merge", "SSSSSSI", 56}, {"hp_bayer", "SI", 16},
@@ -733,7 +740,9 @@ struct FilmEngine::Impl
         error = std::string("missing SPIR-V for ") + spec.name;
         return false;
       }
+      if(!info.burst && std::strncmp(spec.name, "hp_", 3) == 0) continue; // left out, see create
       Pipeline &p = pipelines[k];
+      report_stage(spec.name);
       VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
       module_info.codeSize = blob->size;
       module_info.pCode = reinterpret_cast<const uint32_t *>(blob->code);
@@ -1165,10 +1174,27 @@ struct FilmEngine::Impl
       Rows m;
       int32_t srgb_eotf;
       float gain;
+      float pad[2];
+      float tone[4];
+      float tone2[4];
     } decode{rows(source.space == ColourSpace::Srgb        ? kSrgbToRec2020
                   : source.space == ColourSpace::DisplayP3 ? kP3ToRec2020
                                                            : kIdentity),
-             source.rgba8 ? 1 : 0, std::exp2(options.exposure_ev)};
+             source.rgba8 ? 1 : 0, std::exp2(options.exposure_ev), {0, 0}, {0, 1, 1, 1}, {1, 1, 1, 1}};
+    static_assert(sizeof(decode) == 96, "decode push constants");
+    if(source.rgba8 && (options.stages.temp != 0.0f || options.stages.tint != 0.0f))
+    {
+      // warmer: red up, blue down; greener: green up; overall luminance kept
+      const float r = std::exp2(0.30f * options.stages.temp), b = std::exp2(-0.30f * options.stages.temp);
+      const float gr = std::exp2(0.20f * options.stages.tint);
+      const float y = 0.2126f * r + 0.7152f * gr + 0.0722f * b;
+      decode.tone2[1] = r / y;
+      decode.tone2[2] = gr / y;
+      decode.tone2[3] = b / y;
+      note("场景还原", "白平衡（色温 / 色调）", "%+.2f / %+.2f", options.stages.temp, options.stages.tint);
+    }
+    if(source.rgba8 && options.stages.restore > 0.0f)
+      decode.gain *= choose_restore(source, std::min(options.stages.restore, 1.0f), decode.tone, decode.tone2);
     if(source.raw)
     {
       const RawImage &raw = *source.raw;
@@ -1204,7 +1230,9 @@ struct FilmEngine::Impl
       // Flash white balance: frame 0 is the flash frame, frame 1 the ambient one (not merged).
       const bool white_map = options.flash_white.enabled && !flash && source.burst_count == 2;
       const int ambient_frames = white_map ? 1 : std::min(source.burst_count, kMaxBurst) - (flash ? 1 : 0);
-      if(ambient_frames > 1)
+      // without the merge kernels (left out on this GPU) the reference frame stands alone
+      const bool merge = ambient_frames > 1 && info.burst;
+      if(merge)
       { // merge first; the merged mosaic is black-subtracted, at frame 0's exposure, and spans 0..kMergeScale
         const int frames = ambient_frames;
         note("合并", "合并帧数", "%d", frames);
@@ -1304,7 +1332,7 @@ struct FilmEngine::Impl
         const float s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
         const float o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
         float frames = 1.0f;
-        if(source.burst_count > 1)
+        if(merge)
         {
           float light = 0.0f;
           for(int i = 0; i < ambient_frames; i++)
@@ -1339,6 +1367,8 @@ struct FilmEngine::Impl
         decode.m = rows(kIdentity);
         decode.srgb_eotf = 0;
         decode.gain = 1.0f;
+        decode.tone[0] = 0.0f;
+        decode.tone2[1] = decode.tone2[2] = decode.tone2[3] = 1.0f;
         g.pixels(kDecode, {img(developed), img(input)}, input, decode);
       }
     }
@@ -1379,6 +1409,64 @@ struct FilmEngine::Impl
     if(mode == 2) std::memcpy(encode.scan, scan_cal, sizeof(scan_cal));
     g.pixels(kEncode, {img(developed), img(output), kCreative}, output, encode);
     return g;
+  }
+
+  // Scene restore of a camera-rendered 8-bit source at `strength` (0..1), measured on the
+  // source itself in linear light (transfer decoded first, as everything after the door
+  // is linear). Fills decode.comp's tone constants; returns an exposure gain that moves
+  // the frame's centre-weighted log-average part of the way to a typical key.
+  float choose_restore(const SourceImage &src, float strength, float tone[4], float tone2[4])
+  {
+    static float eotf[256];
+    static bool ready = false;
+    if(!ready)
+    {
+      for(int i = 0; i < 256; i++)
+      {
+        const float v = i / 255.0f;
+        eotf[i] = v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+      }
+      ready = true;
+    }
+    const int w = src.width, h = src.height;
+    const int step = std::max(1, std::max(w, h) / 256);
+    double log_sum = 0.0, weight_sum = 0.0;
+    size_t clipped = 0, count = 0;
+    for(int y = step / 2; y < h; y += step)
+      for(int x = step / 2; x < w; x += step)
+      {
+        const uint8_t *px = src.rgba8 + (static_cast<size_t>(y) * w + x) * 4;
+        const float lum = 0.2126f * eotf[px[0]] + 0.7152f * eotf[px[1]] + 0.0722f * eotf[px[2]];
+        if(std::max(px[0], std::max(px[1], px[2])) >= 250) clipped++;
+        count++;
+        const float dx = 2.0f * x / w - 1.0f, dy = 2.0f * y / h - 1.0f;
+        const double wt = 1.0 / (1.0 + dx * dx + dy * dy); // centre-weighted, like a camera meter
+        log_sum += wt * std::log(std::max(lum, 1e-4f));
+        weight_sum += wt;
+      }
+    const float clip = count ? static_cast<float>(clipped) / count : 0.0f;
+    const float slope = 1.0f - 0.14f * strength;              // the phone's extra mid-tone contrast
+    const float sat = 1.0f - 0.12f * strength;                // and its extra saturation
+    const float knee = 0.30f;                                 // where a phone's shoulder starts
+    const float top = 0.18f * std::pow(1.0f / 0.18f, slope);  // 1.0 after the slope
+    // The scene white 1.0 stood for: more headroom where more of the frame is clipped.
+    const float stops = strength * (1.2f + 1.3f * std::clamp(clip / 0.05f, 0.0f, 1.0f));
+    const float white = std::max(std::exp2(stops), top + 0.05f);
+    const float a = 1.0f / (1.0f / (top - knee) - 1.0f / (white - knee));
+    tone[0] = 1.0f;
+    tone[1] = slope;
+    tone[2] = knee;
+    tone[3] = a;
+    tone2[0] = sat;
+    const float key = weight_sum > 0 ? static_cast<float>(std::exp(log_sum / weight_sum)) : 0.18f;
+    const float placed = 0.18f * std::pow(key / 0.18f, slope); // the key after the slope
+    const float ev = strength * std::clamp(0.5f * std::log2(0.12f / std::max(placed, 1e-4f)), -0.75f, 0.75f);
+    note("场景还原", "强度", "%.2f", strength);
+    note("场景还原", "画面亮度 key（线性）", "%.4f → %.4f", key, placed);
+    note("场景还原", "过曝比例", "%.2f%%", clip * 100.0f);
+    note("场景还原", "高光余量 / 斜率 / 饱和", "%+.2f EV / %.2f / %.2f", std::log2(white), slope, sat);
+    note("场景还原", "自动曝光", "%+.2f EV", ev);
+    return std::exp2(ev);
   }
 
   // The exposure fusion's synthetic exposures at `strength` (0..1): the dark one brings
@@ -1562,7 +1650,18 @@ struct FilmEngine::Impl
     if(src.raw && opts.match_key > 0.0f)
     {
       const float key = raw_key(*src.raw);
-      if(key > 0.0f) opts.exposure_ev += std::clamp(std::log2(opts.match_key / key), -6.0f, 6.0f);
+      if(key > 0.0f)
+      {
+        float lift = std::clamp(std::log2(opts.match_key / key), -6.0f, 6.0f);
+        if(opts.stages.match_lift)
+        {
+          const float high = raw_luminance_quantile(*src.raw, 0.995f) * std::exp2(opts.exposure_ev);
+          const float room = high > 0.0f ? std::log2(0.9f / high) : 3.0f;
+          note("冲洗曝光", "只提亮（闪光）", "想要 %+.2f EV，高光余量 %+.2f EV", lift, room);
+          lift = std::clamp(std::min(lift, room), 0.0f, 3.0f);
+        }
+        opts.exposure_ev += lift;
+      }
     }
     // Flash gain: the develop scales the raw by 2^ev, so the flash-only light at its 98th
     // percentile lands on the target with this gain.
@@ -1633,7 +1732,7 @@ struct FilmEngine::Impl
       note("冲洗曝光", "取景器亮度 key", "%.5f", options.match_key);
       note("冲洗曝光", "参考帧亮度 key", "%.5f", key);
       note("冲洗曝光", "对齐取景器提亮", options.match_key > 0 && key > 0 ? "%+.2f EV" : "未对齐（%.0f）",
-           options.match_key > 0 && key > 0 ? std::clamp(std::log2(options.match_key / key), -6.0f, 6.0f) : 0.0f);
+           options.match_key > 0 && key > 0 ? opts.exposure_ev - options.exposure_ev : 0.0f);
       note("冲洗曝光", "最终曝光", "%+.2f EV", opts.exposure_ev);
     }
     if(opts.local_tone > 0.0f) choose_tone(src.raw, opts.exposure_ev, std::min(opts.local_tone, 1.0f));
@@ -1964,14 +2063,19 @@ struct FilmEngine::Impl
           if(!ok) break;
         }
       }
-      memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-      copy_region(region, w, h);
-      vkCmdCopyImageToBuffer(cmd, physical[mapping[output]].image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1,
-                             &region);
-      memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                     VK_ACCESS_HOST_READ_BIT);
-      ok = submit_and_wait(error);
+      // A submission that failed mid-way (a lost device, out of memory) leaves no command
+      // buffer recording: nothing more may go into it (Adreno 619 crashed on the copy).
+      if(ok)
+      {
+        memory_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        copy_region(region, w, h);
+        vkCmdCopyImageToBuffer(cmd, physical[mapping[output]].image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1,
+                               &region);
+        memory_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                       VK_ACCESS_HOST_READ_BIT);
+        ok = submit_and_wait(error);
+      }
       lap("GPU");
     }
     if(ok)
@@ -2237,10 +2341,17 @@ float raw_luminance_quantile(const RawImage &raw, float q)
 FilmEngine::FilmEngine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 FilmEngine::~FilmEngine() = default;
 
-std::unique_ptr<FilmEngine> FilmEngine::create(const Lut &filmsim, const Lut &spectra, std::string &error)
+void set_stage_hook(void (*hook)(const char *stage)) { g_stage_hook = hook; }
+
+std::unique_ptr<FilmEngine> FilmEngine::create(const Lut &filmsim, const Lut &spectra, std::string &error,
+                                               bool burst_kernels)
 {
   auto impl = std::make_unique<Impl>();
-  if(!impl->init(filmsim, spectra, error)) return nullptr;
+  impl->info.burst = burst_kernels;
+  report_stage("vulkan");
+  const bool ok = impl->init(filmsim, spectra, error);
+  report_stage(ok ? "ready" : "failed");
+  if(!ok) return nullptr;
   return std::unique_ptr<FilmEngine>(new FilmEngine(std::move(impl)));
 }
 
