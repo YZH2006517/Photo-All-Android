@@ -99,6 +99,8 @@ class ViewerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         org.photoall.film.ui.Style.apply(this)
         super.onCreate(savedInstanceState)
+        // Ultra HDR photos (EDR imports, the phone's own) shown with their highlights, not just the SDR base
+        if (android.os.Build.VERSION.SDK_INT >= 34) window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_HDR
         index = intent.getIntExtra(INDEX, 0)
         favoritesOnly = intent.getBooleanExtra(FAVORITES, false)
         film = intent.getStringExtra(FILM)
@@ -109,6 +111,7 @@ class ViewerActivity : Activity() {
             onDrag = { dx -> dragPage(dx) }
             onDragEnd = { dx, vx -> releasePage(dx, vx) }
             onDisplayChanged = { if (frostReady && frost.visibility == View.VISIBLE) frost.invalidate() }
+            onTap = { setFullView(!immersive) }
         }
         // the neighbouring photo, sliding in beside the page being dragged away
         peek = ImageView(this).apply {
@@ -179,6 +182,7 @@ class ViewerActivity : Activity() {
                 addView(counter)
                 addView(date)
             }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(iconButton(Icon.Kind.ROTATE, "旋转照片（顺时针 90°）") { rotate() }, LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(favoriteButton, LinearLayout.LayoutParams(dp(48), dp(48)))
         }
         // The film's edge print under the picture: stock on the left, frame on the right.
@@ -201,7 +205,7 @@ class ViewerActivity : Activity() {
         val meta = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(12))
-            addView(android.widget.HorizontalScrollView(this@ViewerActivity).apply {
+            addView(android.widget.HorizontalScrollView(this@ViewerActivity).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
                 isHorizontalScrollBarEnabled = false
                 addView(recipeChips)
             })
@@ -217,7 +221,10 @@ class ViewerActivity : Activity() {
                 Triple(Icon.Kind.TRASH, "删除") { trash() },
             )) addView(action(kind, label, action), LinearLayout.LayoutParams(0, dp(60), 1f))
         }
+        val hairline = Style.hairline(this)
+        chrome = listOf(topBar, edge, meta, hairline, actions)
         setContentView(LinearLayout(this).apply {
+            root = this
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Style.BG)
             addView(topBar, LinearLayout.LayoutParams(-1, dp(56)))
@@ -231,15 +238,73 @@ class ViewerActivity : Activity() {
             }, LinearLayout.LayoutParams(-1, 0, 1f))
             addView(edge, LinearLayout.LayoutParams(-1, dp(20)))
             addView(meta)
-            addView(Style.hairline(this@ViewerActivity), LinearLayout.LayoutParams(-1, 1))
+            addView(hairline, LinearLayout.LayoutParams(-1, 1))
             addView(actions)
             setOnApplyWindowInsetsListener { view, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                // immersive: the photo runs under where the bars were (they come back over it on a swipe)
+                val bars = if (immersive) android.graphics.Insets.NONE else android.graphics.Insets.max(
+                    insets.getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars()),
+                    insets.getInsets(WindowInsets.Type.displayCutout()))
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
                 insets
             }
         })
         reload()
+    }
+
+    // ----- immersive viewing ---------------------------------------------------------------
+
+    private lateinit var root: LinearLayout
+    private lateinit var chrome: List<View>
+    private var immersive = false
+    private var fade: android.animation.Animator? = null
+
+    /**
+     * The photo alone on black, the whole screen: the bars, the edge print, the recipe and
+     * the actions fold away and the system bars hide. A tap, or back, brings them again.
+     */
+    private fun setFullView(on: Boolean) {
+        if (on == immersive) return
+        immersive = on
+        if (on && panelLevel > 0) setPanel(0)
+        // the bars fade where they are; the picture glides to its new size (no jump)
+        image.holdPlace()
+        android.transition.TransitionManager.beginDelayedTransition(root, android.transition.TransitionSet().apply {
+            addTransition(android.transition.Fade())
+            duration = 220
+            interpolator = android.view.animation.DecelerateInterpolator()
+            excludeTarget(image, true) // it refits itself to the new size
+            excludeTarget(peek, true)
+        })
+        for (v in chrome) v.visibility = if (on) View.GONE else View.VISIBLE
+        val rootTo = if (on) android.graphics.Color.BLACK else Style.BG
+        val frameTo = if (on) android.graphics.Color.BLACK else GalleryActivity.FILM_BASE
+        val rootFrom = (root.background as? android.graphics.drawable.ColorDrawable)?.color ?: rootTo
+        val frameFrom = (photoFrame.background as? android.graphics.drawable.ColorDrawable)?.color ?: frameTo
+        fade?.cancel()
+        fade = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 220
+            interpolator = android.view.animation.DecelerateInterpolator()
+            val argb = android.animation.ArgbEvaluator()
+            addUpdateListener {
+                val k = it.animatedFraction
+                root.setBackgroundColor(argb.evaluate(k, rootFrom, rootTo) as Int)
+                photoFrame.setBackgroundColor(argb.evaluate(k, frameFrom, frameTo) as Int)
+            }
+            start()
+        }
+        window.insetsController?.let { c ->
+            if (on) {
+                c.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                c.hide(WindowInsets.Type.systemBars())
+            } else c.show(WindowInsets.Type.navigationBars())
+        }
+        root.requestApplyInsets()
+    }
+
+    @Deprecated("back first leaves immersive viewing")
+    override fun onBackPressed() {
+        if (immersive) setFullView(false) else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
     private var paused = false
@@ -260,10 +325,35 @@ class ViewerActivity : Activity() {
         super.onDestroy()
     }
 
-    @Deprecated("System confirmation for favourites / recycle bin")
+    @Deprecated("System confirmation for favourites / recycle bin / rotation")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION") super.onActivityResult(requestCode, resultCode, data)
+        val turning = pendingTurn
+        pendingTurn = null
+        if (turning != null && resultCode == RESULT_OK) { rotate(turning); return }
+        if (turning != null) image.animate().rotation(0f).setDuration(200).start()
         reload()
+    }
+
+    private var pendingTurn: Photos.Photo? = null
+
+    /** A quarter turn clockwise: the picture turns on screen, the turn is written into the photo, it is shown again upright. */
+    private fun rotate(asked: Photos.Photo? = null) {
+        val photo = asked ?: current() ?: return
+        if (asked == null) image.animate().rotationBy(90f).setDuration(240)
+            .setInterpolator(android.view.animation.PathInterpolator(0.3f, 0f, 0.1f, 1f)).start()
+        loader.later {
+            val ask = runCatching { Photos.rotate(this, photo) }
+            runOnUiThread {
+                ask.onSuccess { request ->
+                    if (request != null) { pendingTurn = photo; ask(request) }
+                    else image.postDelayed({ image.rotation = 0f; show(index, keepImage = false) }, 250)
+                }.onFailure {
+                    image.animate().rotation(0f).setDuration(200).start()
+                    android.widget.Toast.makeText(this, "这张照片不能旋转：${it.message}", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
     private fun reload() {

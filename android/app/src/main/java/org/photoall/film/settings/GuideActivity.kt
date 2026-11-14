@@ -122,7 +122,7 @@ class GuideActivity : Activity() {
             addView(Style.hairline(this@GuideActivity), LinearLayout.LayoutParams(-1, 1))
             addView(ScrollView(this@GuideActivity).apply { addView(list) }, LinearLayout.LayoutParams(-1, 0, 1f))
             setOnApplyWindowInsetsListener { v, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
                 v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
                 insets
             }

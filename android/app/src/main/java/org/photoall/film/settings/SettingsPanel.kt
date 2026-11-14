@@ -149,7 +149,22 @@ class SettingsPanel(
             val sync = { isChecked = store.flag(setting.key) }
             sync()
             refreshers += sync
-            setOnCheckedChangeListener { _, on -> if (on != store.flag(setting.key)) store[setting.key] = if (on) 1f else 0f }
+            setOnCheckedChangeListener { _, on ->
+                if (on == store.flag(setting.key)) return@setOnCheckedChangeListener
+                if (on && setting.key == Settings.HDR) {
+                    // multi-frame merging is the heaviest GPU work in the app: said before it is on
+                    android.app.AlertDialog.Builder(context)
+                        .setTitle("打开 HDR+ 多帧合成？")
+                        .setMessage("每张照片连拍多帧 RAW，在 GPU 上对齐合成。这一功能仍在实验中，部分机型可能存在兼容问题：" +
+                            "相机打不开、拍摄变慢、冲洗失败，个别 GPU 驱动会让应用闪退。遇到问题请回到这里关闭。")
+                        .setPositiveButton("仍要打开") { _, _ -> store[setting.key] = 1f }
+                        .setNegativeButton("取消") { _, _ -> isChecked = false }
+                        .setOnCancelListener { isChecked = false }
+                        .show()
+                    return@setOnCheckedChangeListener
+                }
+                store[setting.key] = if (on) 1f else 0f
+            }
             resettable(setting)
         }
         is Setting.Choice -> LinearLayout(context).apply {

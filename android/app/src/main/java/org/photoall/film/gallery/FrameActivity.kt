@@ -63,10 +63,15 @@ class FrameActivity : Activity() {
     private lateinit var panelBody: FrameLayout
     private lateinit var toolbar: LinearLayout
     private var small: Bitmap? = null      // the photo at preview size
+    private var upright: Bitmap? = null    // the same, turned as asked
+    private var turns = 0                  // quarter turns clockwise
     private var tiny: Bitmap? = null       // for the design thumbnails
     private var palette: List<Int> = emptyList()
     private var data: FrameDesigner.Data? = null
-    private var ticket = 0
+    @Volatile private var ticket = 0
+    /** The design thumbnails: drawn on their own thread so the preview never waits behind them, and kept. */
+    private val thumbs = Executors.newSingleThreadExecutor()
+    private val thumbCache = HashMap<String, Bitmap>()
     private var tab: Tab? = null
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
 
@@ -95,7 +100,7 @@ class FrameActivity : Activity() {
         window.statusBarColor = canvasColor
         window.navigationBarColor = canvasColor
 
-        preview = ImageView(this).apply {
+        preview = CartridgePreview(this).apply {
             scaleType = ImageView.ScaleType.FIT_XY
             elevation = dp(14).toFloat()
             outlineProvider = ViewOutlineProvider.BOUNDS
@@ -110,6 +115,12 @@ class FrameActivity : Activity() {
                 setPadding(dp(11), dp(11), dp(11), dp(11))
                 setOnClickListener { finish() }
             }, radius = 22f), FrameLayout.LayoutParams(dp(44), dp(44), Gravity.START or Gravity.CENTER_VERTICAL).apply { marginStart = dp(16) })
+            addView(floating(ImageView(this@FrameActivity).apply {
+                contentDescription = "旋转照片（顺时针 90°）"
+                setImageDrawable(Icon(Icon.Kind.ROTATE, textColor))
+                setPadding(dp(11), dp(11), dp(11), dp(11))
+                setOnClickListener { rotate() }
+            }, radius = 22f), FrameLayout.LayoutParams(dp(44), dp(44), Gravity.START or Gravity.CENTER_VERTICAL).apply { marginStart = dp(70) })
             addView(floating(LinearLayout(this@FrameActivity).apply {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(6), 0, dp(6), 0)
@@ -125,12 +136,16 @@ class FrameActivity : Activity() {
         panelBody = FrameLayout(this)
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(14))
-            background = GradientDrawable().apply { setColor(cardColor); cornerRadius = dp(26).toFloat() }
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            background = GradientDrawable().apply { setColor(cardColor); cornerRadius = dp(24).toFloat() }
             elevation = dp(10).toFloat()
             visibility = View.GONE
-            addView(panelTitle, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-            addView(panelBody, LinearLayout.LayoutParams(-1, -2))
+            addView(panelTitle, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
+            addView(MaxHeightScroll(this@FrameActivity, (resources.displayMetrics.heightPixels * 0.34f).toInt()).apply {
+                isVerticalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                addView(panelBody, FrameLayout.LayoutParams(-1, -2))
+            }, LinearLayout.LayoutParams(-1, -2))
         }
         toolbar = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -157,13 +172,13 @@ class FrameActivity : Activity() {
             addView(top, LinearLayout.LayoutParams(-1, dp(64)))
             addView(stage, LinearLayout.LayoutParams(-1, 0, 1f))
             addView(panel, LinearLayout.LayoutParams(-1, -2).apply { marginStart = dp(12); marginEnd = dp(12); bottomMargin = dp(10) })
-            addView(toolbar, LinearLayout.LayoutParams(-1, dp(62)).apply { marginStart = dp(16); marginEnd = dp(16); bottomMargin = dp(14) })
+            addView(toolbar, LinearLayout.LayoutParams(-1, dp(54)).apply { marginStart = dp(16); marginEnd = dp(16); bottomMargin = dp(10) })
         }
         setContentView(FrameLayout(this).apply {
             background = GridBackdrop(canvasColor, gridColor, dp(22).toFloat())
             addView(column, FrameLayout.LayoutParams(-1, -1))
             setOnApplyWindowInsetsListener { v, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
                 v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
                 insets
             }
@@ -186,8 +201,15 @@ class FrameActivity : Activity() {
         main.postDelayed({ if (tab == null) open(Tab.LAYOUT) }, 350)
     }
 
+    override fun onResume() {
+        super.onResume()
+        org.photoall.film.ui.CartridgeSprites.attach(this)
+    }
+
     override fun onDestroy() {
+        org.photoall.film.ui.CartridgeSprites.detach(this)
         worker.shutdownNow()
+        thumbs.shutdownNow()
         super.onDestroy()
     }
 
@@ -203,17 +225,59 @@ class FrameActivity : Activity() {
         if (rebuild) tab?.let { fillPanel(it, animate = false) }
     }
 
-    private fun refresh() {
+    /** [b] turned [turns] quarter turns clockwise (itself when none). */
+    private fun turned(b: Bitmap): Bitmap {
+        if (turns % 4 == 0) return b
+        val m = android.graphics.Matrix().apply { setRotate(90f * turns) }
+        return Bitmap.createBitmap(b, 0, 0, b.width, b.height, m, true)
+    }
+
+    private fun quarter(b: Bitmap): Bitmap =
+        Bitmap.createBitmap(b, 0, 0, b.width, b.height, android.graphics.Matrix().apply { setRotate(90f) }, true)
+
+    /** A quarter turn clockwise: the preview turns as it goes, then the border is drawn round the new shape. */
+    private fun rotate() {
         val photo = small ?: return
+        turns = (turns + 1) % 4
+        preview.animate().rotationBy(90f).scaleX(0.86f).scaleY(0.86f).setDuration(220)
+            .setInterpolator(android.view.animation.DecelerateInterpolator(1.6f))
+            .withEndAction {
+                upright = turned(photo)
+                tiny = tiny?.let { quarter(it) } // the design thumbnails turn with it
+                refreshTurned = true
+                refresh()
+            }.start()
+    }
+
+    private var refreshTurned = false
+
+    private fun refresh() {
+        val photo = (if (turns % 4 == 0) small else upright ?: small?.let { turned(it).also { u -> upright = u } }) ?: return
         val d = data ?: return
-        val snapshot = design.copy()
+        // the cartridge is drawn live over the preview (CartridgePreview), not into it
+        val snapshot = design.copy().apply { cartridge = false }
         val t = ++ticket
         worker.later {
-            val shown = runCatching { FrameDesigner.render(photo, snapshot, d, maxLong = 1400) }.getOrNull() ?: return@later
+            if (t != ticket) return@later // a newer change is already on its way
+            // the 3D cartridge of a poster is drawn when ready, without holding this one up
+            org.photoall.film.ui.CartridgeSprites.onScreen.set { if (t == ticket) refresh() }
+            val shown = try {
+                runCatching { FrameDesigner.render(photo, snapshot, d, maxLong = 1400) }.getOrNull()
+            } finally {
+                org.photoall.film.ui.CartridgeSprites.onScreen.set(null)
+            } ?: return@later
             runOnUiThread {
                 if (t != ticket) return@runOnUiThread
                 val first = preview.drawable == null
                 preview.setImageBitmap(shown)
+                if (refreshTurned) {
+                    // the new shape lands without the turn: settle from small to full size
+                    refreshTurned = false
+                    preview.rotation = 0f
+                    preview.scaleX = 0.86f; preview.scaleY = 0.86f
+                    preview.animate().scaleX(1f).scaleY(1f).setDuration(260)
+                        .setInterpolator(android.view.animation.OvershootInterpolator(1.2f)).start()
+                }
                 if (first) {
                     preview.alpha = 0f; preview.scaleX = 0.94f; preview.scaleY = 0.94f
                     preview.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(320)
@@ -275,7 +339,7 @@ class FrameActivity : Activity() {
     // 版式: whole designs, each shown on this photo
     private fun layoutCard(): View = column {
         val strip = LinearLayout(this@FrameActivity)
-        addView(HorizontalScrollView(this@FrameActivity).apply {
+        addView(HorizontalScrollView(this@FrameActivity).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
             isHorizontalScrollBarEnabled = false
             clipToPadding = false
             addView(strip)
@@ -289,31 +353,55 @@ class FrameActivity : Activity() {
             strip.addView(LinearLayout(this@FrameActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
-                addView(thumb, LinearLayout.LayoutParams(dp(78), dp(96)))
+                addView(thumb, LinearLayout.LayoutParams(dp(62), dp(76)))
                 addView(TextView(this@FrameActivity).apply {
                     text = preset.name; textSize = 11f; setTextColor(textColor); gravity = Gravity.CENTER; maxLines = 1
                 }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
                 Style.pressable(this)
                 setOnClickListener {
-                    design = preset.build(palette, design.caption)
+                    // a new layout keeps the cartridge where it was put
+                    val keep = design
+                    design = preset.build(palette, design.caption).apply {
+                        cartridge = keep.cartridge; cartX = keep.cartX; cartY = keep.cartY; cartSize = keep.cartSize
+                    }
                     changed()
                 }
-            }, LinearLayout.LayoutParams(dp(84), -2).apply { marginEnd = dp(6) })
+            }, LinearLayout.LayoutParams(dp(68), -2).apply { marginEnd = dp(6) })
             val photo = tiny
             val d = data
-            if (photo != null && d != null) worker.later {
-                val bmp = runCatching { FrameDesigner.render(photo, preset.build(palette, design.caption), d, maxLong = 220) }.getOrNull()
-                runOnUiThread { thumb.setImageBitmap(bmp) }
+            val key = "${preset.name}|$turns|${design.caption}"
+            val kept = thumbCache[key]
+            if (kept != null) thumb.setImageBitmap(kept)
+            else if (photo != null && d != null) {
+                fun draw() {
+                    thumbs.later {
+                        org.photoall.film.ui.CartridgeSprites.onScreen.set { draw() }
+                        val bmp = try {
+                            runCatching { FrameDesigner.render(photo, preset.build(palette, design.caption), d, maxLong = 220) }.getOrNull()
+                        } finally {
+                            org.photoall.film.ui.CartridgeSprites.onScreen.set(null)
+                        }
+                        runOnUiThread { if (bmp != null) { thumbCache[key] = bmp; thumb.setImageBitmap(bmp) } }
+                    }
+                }
+                draw()
             }
         }
-        addView(switchRow("拍照时自动套用", "每张另存一份带这个边框的，原图照常保存", store.flag(Settings.FRAME_AUTO)) { on ->
-            store[Settings.FRAME_AUTO] = if (on) 1f else 0f
-        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        fold("更多", listOfNotNull("暗盒".takeIf { design.cartridge }, "自动套用".takeIf { store.flag(Settings.FRAME_AUTO) }).joinToString(" · ")) {
+            addView(switchRow("画面上放胶卷暗盒", "在预览上拖动挪位置，双指捏合调大小", design.cartridge) { on ->
+                design.cartridge = on
+                changed()
+                preview.invalidate()
+            }, LinearLayout.LayoutParams(-1, -2))
+            addView(switchRow("拍照时自动套用", "每张另存一份带这个边框的，原图照常保存", store.flag(Settings.FRAME_AUTO)) { on ->
+                store[Settings.FRAME_AUTO] = if (on) 1f else 0f
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
     }
 
     // 边框: the kind of border, its width, the photo's corners and shadow
     private fun borderCard(): View = column {
-        fun group(b: Border) = when { b.film -> 0; b == Border.NONE -> 1; b == Border.CUSTOM -> 2; else -> 3 }
+        fun group(b: Border) = when { b.film -> 0; b == Border.NONE -> 1; b == Border.CUSTOM -> 2; b.theme != null -> 4; else -> 3 }
         addView(choices(Border.entries.map { it.label }, setOf(design.border.ordinal)) { picked ->
             val before = design.border
             design.border = Border.entries[picked.first()]
@@ -322,8 +410,9 @@ class FrameActivity : Activity() {
         if (design.border.film) {
             val stock = data?.filmKey?.takeIf { it.isNotBlank() && it != "直出" }
                 ?.let { org.photoall.film.ui.CanisterView.displayName(it) }
+            fold("片边细节", stock ?: "PHOTO ALL") {
             addView(hint(if (stock != null) "片边按这张照片的胶卷印：$stock" else "这张照片没用胶卷，片边印 PHOTO ALL"),
-                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+                LinearLayout.LayoutParams(-1, -2))
             addView(LinearLayout(this@FrameActivity).apply {
                 isBaselineAligned = false
                 addView(choices(listOf("边缘灰雾"), if (design.fog) setOf(0) else emptySet(), multi = true, scroll = false) {
@@ -335,12 +424,17 @@ class FrameActivity : Activity() {
                     LinearLayout.LayoutParams(-2, dp(34)).apply { marginStart = dp(8) })
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
             addView(slider("漏光", design.leak) { design.leak = it; changed() })
+            }
+        } else if (design.border.theme != null) {
+            addView(chip("换一张纸", false) { design.leakSeed++; changed() },
+                LinearLayout.LayoutParams(-2, dp(34)).apply { topMargin = dp(8) })
         } else if (design.border == Border.CUSTOM) {
             // the card made to measure: its proportions, the photo's size and place, its colour
             addView(section("画幅比例"))
             addView(choices(FrameDesign.Ratio.entries.map { it.label }, setOf(design.ratio.ordinal)) {
                 design.ratio = FrameDesign.Ratio.entries[it.first()]; changed()
             })
+            fold("照片大小与位置") {
             addView(LinearLayout(this@FrameActivity).apply {
                 gravity = Gravity.CENTER_VERTICAL
                 addView(LinearLayout(this@FrameActivity).apply {
@@ -359,15 +453,19 @@ class FrameActivity : Activity() {
                         LinearLayout.LayoutParams(dp(84), dp(84)))
                 }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(14) })
             })
-            addView(section("颜色"))
+            }
+            fold("颜色") {
             addView(swatches(listOf(FrameDesign.WHITE, FrameDesign.PAPER, FrameDesign.BLACK, FrameDesign.BLUR) + palette,
                 design.background) { design.background = it; changed() })
+            }
         } else if (design.border != Border.NONE) {
             addView(slider("宽度", design.thickness) { design.thickness = it; changed() })
+            fold("圆角与投影") {
             addView(slider("圆角", design.corner) { design.corner = it; changed() })
             addView(choices(listOf("照片投影"), if (design.shadow) setOf(0) else emptySet(), multi = true) { picked ->
                 design.shadow = 0 in picked; changed()
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            }
         }
     }
 
@@ -406,7 +504,8 @@ class FrameActivity : Activity() {
                 override fun afterTextChanged(e: android.text.Editable?) { design.caption = e?.toString() ?: ""; changed() }
             })
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        addView(section("品牌"))
+        fold("品牌、字体与标志", "${design.font.label} · ${design.logo.label}") {
+        addView(section("品牌", first = true))
         val maker = data?.maker?.let { FrameDesigner.BRANDS[it]?.text } ?: data?.brand ?: ""
         addView(choices(listOf("$maker 品牌字标", "跟随字体"), setOf(if (design.brandMark) 0 else 1), scroll = false) {
             design.brandMark = it.first() == 0; changed()
@@ -415,6 +514,7 @@ class FrameActivity : Activity() {
         addView(choices(Font.entries.map { it.label }, setOf(design.font.ordinal)) { design.font = Font.entries[it.first()]; changed() })
         addView(section("标志"))
         addView(choices(Logo.entries.map { it.label }, setOf(design.logo.ordinal)) { design.logo = Logo.entries[it.first()]; changed() })
+        }
         addView(slider("字号", design.size) { design.size = it; changed() })
     }
 
@@ -442,10 +542,22 @@ class FrameActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
                 addView(section("位置"))
-                addView(AnchorPad(this@FrameActivity, 3, design.anchor) { design.anchor = it; changed() },
-                    LinearLayout.LayoutParams(dp(92), dp(92)))
+                // a place picked by hand is kept: the automatic layout steps aside
+                addView(AnchorPad(this@FrameActivity, 3, design.anchor) {
+                    design.anchor = it
+                    val was = design.autoPlace
+                    design.autoPlace = false
+                    changed(rebuild = was)
+                }, LinearLayout.LayoutParams(dp(92), dp(92)))
             }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(16) })
         })
+        addView(choices(listOf("自动避让"), if (design.autoPlace) setOf(0) else emptySet(), multi = true, scroll = false) {
+            design.autoPlace = 0 in it; changed()
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        fold("说明") {
+            addView(hint(if (design.autoPlace) "文字和日期会自己找没被遮挡、画面最干净的位置；在上面点一个位置就改为手动"
+                else "手动：文字放在你点的位置。打开自动避让，让它自己找位置"))
+        }
     }
 
     // 时间戳: an old camera's date back
@@ -471,6 +583,44 @@ class FrameActivity : Activity() {
     // ---- controls ------------------------------------------------------------------------------
 
     private fun column(fill: LinearLayout.() -> Unit) = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fill() }
+
+    /** Folds opened by hand, kept while the page is open. */
+    private val unfolded = HashSet<String>()
+
+    /** A titled group shut by default: one line with what is set, opened with a tap. */
+    private fun LinearLayout.fold(title: String, summary: String = "", fill: LinearLayout.() -> Unit) {
+        val body = column(fill).apply { visibility = if (title in unfolded) View.VISIBLE else View.GONE }
+        val arrow = TextView(this@FrameActivity).apply {
+            text = "\u203a"; textSize = 18f; setTextColor(text2Color); gravity = Gravity.CENTER
+            rotation = if (title in unfolded) 90f else 0f
+        }
+        addView(LinearLayout(this@FrameActivity).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(4))
+            addView(TextView(this@FrameActivity).apply {
+                text = title; textSize = 13f; setTextColor(textColor); typeface = Style.medium
+            }, LinearLayout.LayoutParams(-2, -2))
+            addView(TextView(this@FrameActivity).apply {
+                text = summary; textSize = 12f; setTextColor(text2Color); maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END; gravity = Gravity.END
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(10); marginEnd = dp(6) })
+            addView(arrow, LinearLayout.LayoutParams(dp(20), dp(24)))
+            setOnClickListener {
+                val open = body.visibility != View.VISIBLE
+                if (open) unfolded += title else unfolded -= title
+                body.visibility = if (open) View.VISIBLE else View.GONE
+                arrow.animate().rotation(if (open) 90f else 0f).setDuration(180).start()
+            }
+        }, LinearLayout.LayoutParams(-1, -2))
+        addView(body, LinearLayout.LayoutParams(-1, -2))
+    }
+
+    /** Scrolls what does not fit under [max] pixels. */
+    private class MaxHeightScroll(context: Context, private val max: Int) : android.widget.ScrollView(context) {
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(max, MeasureSpec.AT_MOST))
+        }
+    }
 
     private fun section(text: String, first: Boolean = false) = TextView(this).apply {
         this.text = text; textSize = 12f; setTextColor(text2Color); letterSpacing = 0.04f
@@ -526,7 +676,7 @@ class FrameActivity : Activity() {
                 else LinearLayout.LayoutParams(0, dp(34), 1f).apply { if (k > 0) marginStart = dp(6) })
         }
         if (!scroll) return row
-        return HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(row) }
+        return HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt()); isHorizontalScrollBarEnabled = false; addView(row) }
     }
 
     private fun swatches(colors: List<Int>, selected: Int, onPick: (Int) -> Unit): View {
@@ -541,7 +691,7 @@ class FrameActivity : Activity() {
             }
             row.addView(v, LinearLayout.LayoutParams(dp(38), dp(38)).apply { marginEnd = dp(8) })
         }
-        return HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(row) }
+        return HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt()); isHorizontalScrollBarEnabled = false; addView(row) }
     }
 
     private fun slider(label: String, value: Float, onChange: (Float) -> Unit) = LinearLayout(this).apply {
@@ -586,6 +736,9 @@ class FrameActivity : Activity() {
     // ---- actions -------------------------------------------------------------------------------
 
     private fun reset() {
+        repeat((4 - turns) % 4) { tiny = tiny?.let { t -> quarter(t) } }
+        turns = 0
+        upright = null
         design = FrameDesign.presets[0].build(palette, design.caption)
         changed()
         tab?.let { fillPanel(it, animate = true) }
@@ -602,10 +755,15 @@ class FrameActivity : Activity() {
         val name = intent.getStringExtra(NAME) ?: "FILM_frame.jpg"
         val private = intent.getBooleanExtra(PRIVATE, false)
         val description = intent.getStringExtra(DESCRIPTION) ?: ""
-        Toast.makeText(this, "正在存储…", Toast.LENGTH_SHORT).show()
+        if (saving != null) return
+        // a 3D cartridge at the photo's full size takes a few seconds to draw: said, and the page held
+        val cartridge = snapshot.cartridge || snapshot.border == Border.FILM
+        saving = savingVeil(if (cartridge) "正在渲染 3D 暗盒，请稍候…" else "正在存储…",
+            if (cartridge) "按原图尺寸渲染，可能需要十几秒" else null)
         worker.later {
             val result = runCatching {
-                val full = decode(8192) ?: error("读不出原图")
+                val raw = decode(8192) ?: error("读不出原图")
+                val full = turned(raw).also { if (it !== raw) raw.recycle() }
                 val framed = FrameDesigner.render(full, snapshot, d, maxLong = 8192)
                 full.recycle()
                 Photos.saveJpeg(this, framed, name.removeSuffix(".jpg") + "_frame.jpg", store[Settings.JPEG_QUALITY].roundToInt(),
@@ -614,10 +772,44 @@ class FrameActivity : Activity() {
                 framed.recycle()
             }
             runOnUiThread {
+                saving?.let { v -> (v.parent as? ViewGroup)?.removeView(v) }
+                saving = null
                 result.onSuccess { Toast.makeText(this, "已存储带边框的照片", Toast.LENGTH_SHORT).show(); finish() }
                     .onFailure { Toast.makeText(this, "存储失败：${it.message}", Toast.LENGTH_LONG).show() }
             }
         }
+    }
+
+    /** The veil over the page while a save runs: what it is doing, a spinner, no taps through. */
+    private var saving: View? = null
+
+    private fun savingVeil(title: String, detail: String?): View {
+        val veil = FrameLayout(this).apply {
+            setBackgroundColor(0x99000000.toInt())
+            isClickable = true // the page under it waits
+            alpha = 0f
+            addView(LinearLayout(this@FrameActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(28), dp(22), dp(28), dp(22))
+                background = GradientDrawable().apply { setColor(cardColor); cornerRadius = dp(22).toFloat() }
+                elevation = dp(12).toFloat()
+                addView(android.widget.ProgressBar(this@FrameActivity).apply {
+                    isIndeterminate = true
+                    indeterminateTintList = android.content.res.ColorStateList.valueOf(org.photoall.film.ui.Style.ACCENT)
+                }, LinearLayout.LayoutParams(dp(40), dp(40)))
+                addView(TextView(this@FrameActivity).apply {
+                    text = title; textSize = 15f; setTextColor(textColor); gravity = Gravity.CENTER
+                    typeface = org.photoall.film.ui.Style.medium
+                }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(14) })
+                if (detail != null) addView(TextView(this@FrameActivity).apply {
+                    text = detail; textSize = 12f; setTextColor(text2Color); gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(6) })
+            }, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+        }
+        (window.decorView as ViewGroup).addView(veil, ViewGroup.LayoutParams(-1, -1))
+        veil.animate().alpha(1f).setDuration(180).start()
+        return veil
     }
 
     private fun decode(maxLong: Int): Bitmap? = runCatching {
@@ -631,6 +823,77 @@ class FrameActivity : Activity() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
 
     // ---- views of this page --------------------------------------------------------------------
+
+    /**
+     * The preview, with the cartridge drawn live over it: one finger on the cartridge moves
+     * it, two fingers anywhere make it bigger or smaller. The preview has the sheet's own
+     * proportions, so its place and size, kept as shares of the sheet, are the saved ones.
+     */
+    private inner class CartridgePreview(context: Context) : ImageView(context) {
+        private var dragging = false
+        private var lastX = 0f
+        private var lastY = 0f
+        private var moved = false
+        private val pinch = android.view.ScaleGestureDetector(context, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(det: android.view.ScaleGestureDetector): Boolean {
+                design.cartSize = (design.cartSize * det.scaleFactor).coerceIn(0.08f, 0.8f)
+                moved = true
+                invalidate()
+                return true
+            }
+        })
+
+        private fun cartBounds(): RectF {
+            val h = design.cartSize * min(width, height)
+            val cx = design.cartX * width
+            val base = design.cartY * height
+            return RectF(cx - h * 0.4f, base - h, cx + h * 0.6f, base).apply { inset(-h * 0.25f, -h * 0.2f) }
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (!design.cartridge || width == 0 || drawable == null) return
+            FrameDesigner.drawCartridge(canvas, width, height, design, data?.filmKey ?: "") { invalidate() }
+            if (dragging) canvas.drawRoundRect(cartBounds(), 8f, 8f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE; strokeWidth = 2f; color = 0x99ffffff.toInt()
+                pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f)
+            })
+        }
+
+        override fun onTouchEvent(e: MotionEvent): Boolean {
+            if (!design.cartridge) return super.onTouchEvent(e)
+            pinch.onTouchEvent(e)
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragging = cartBounds().contains(e.x, e.y)
+                    lastX = e.x; lastY = e.y
+                    moved = false
+                    if (!dragging) return false
+                    parent.requestDisallowInterceptTouchEvent(true)
+                    invalidate()
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> { dragging = true; parent.requestDisallowInterceptTouchEvent(true) }
+                MotionEvent.ACTION_MOVE -> if (dragging && !pinch.isInProgress && e.pointerCount == 1) {
+                    design.cartX = (design.cartX + (e.x - lastX) / width).coerceIn(0f, 1f)
+                    design.cartY = (design.cartY + (e.y - lastY) / height).coerceIn(0.05f, 1.05f)
+                    lastX = e.x; lastY = e.y
+                    moved = true
+                    invalidate()
+                }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    // the finger left on the glass carries on moving it from where it is
+                    val stay = if (e.actionIndex == 0) 1 else 0
+                    lastX = e.getX(stay); lastY = e.getY(stay)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    dragging = false
+                    if (moved) FrameDesign.save(this@FrameActivity, design)
+                    invalidate()
+                }
+            }
+            return true
+        }
+    }
 
     /** Lays the preview out as large as fits, at its picture's own proportions. */
     private class PreviewBox(context: Context, private val image: ImageView) : FrameLayout(context) {

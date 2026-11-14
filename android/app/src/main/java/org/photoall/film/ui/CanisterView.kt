@@ -51,6 +51,12 @@ class CanisterView(context: Context) : View(context) {
     }
 
     override fun onDraw(canvas: Canvas) {
+        // a film chosen: its cartridge as the 3D model draws it (the flat one below until that is ready)
+        stock?.let { name ->
+            val h = min(height * 0.9f, width / 0.62f)
+            CartridgeSprites.draw(canvas, width * 0.44f, height * 0.5f + h * 0.5f, h, name, leader = 0.25f, shadow = 0f) { invalidate() }
+            return
+        }
         val s = min(width / BOX_W, height / BOX_H)
         canvas.save()
         canvas.translate((width - BOX_W * s) / 2, (height - BOX_H * s) / 2)

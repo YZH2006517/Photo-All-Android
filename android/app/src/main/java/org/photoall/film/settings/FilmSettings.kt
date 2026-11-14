@@ -28,7 +28,16 @@ object Settings {
     const val RAW = "app.raw"
     const val RAW_EV = "app.rawev"
     const val KEEP_RAW = "app.keepraw"
+    const val FINDER_SOFT = "app.finder.soft" // viewfinder: how much softer than the camera's picture
+    const val FINDER_SAT = "app.finder.sat"   // viewfinder: saturation, 1 = as the camera gives it
+    const val FINDER_EV = "app.finder.ev"     // viewfinder only: brighter or darker to look at, the photo unchanged
+    const val FINDER_GRAIN = "app.finder.grain" // viewfinder only: film grain over the live picture
+    const val FINDER_LUT = "app.finder.lut"   // viewfinder: show the film simulation (off: the camera's own picture)
+    const val REEL_ON = "app.reel.on"         // 拍摄录屏: off hides every record button
+    const val REEL_BEFORE = "app.reel.before" // 拍摄录屏: seconds kept from before the shutter
+    const val REEL_AFTER = "app.reel.after"   // and recorded after it
     const val PRIVATE_PHOTOS = "app.privatephotos" // photos only in the app's own gallery
+    const val SKIN = "app.skin"       // ui.Skin: 0 classic (the theme's), 1 sacred, 2 camera body, 3 anime
     const val THEME = "app.theme"     // index into ui.Style.palettes
     const val HAPTICS = "app.haptics" // 0 off, 1 light, 2 standard
     const val FRAME = "app.frame"           // index into gallery.Frames.Kind
@@ -120,7 +129,7 @@ object Settings {
         val papers = FilmEngine.papers
         listOf(
             Setting.Choice(THEME, "主题", "界面", listOf("暗盒（暖黑 · 片盒黄）", "暗房红灯（夜拍，只用红光）",
-                "相纸（白天户外，浅色）", "黄铜（旁轴蒙皮与黄铜）", "冷银（冷灰 · 冰蓝）"), 0),
+                "相纸（白天户外，浅色）", "黄铜（旁轴蒙皮与黄铜）", "冷银（冷灰 · 冰蓝）") + org.photoall.film.ui.Skin.names.drop(1), 0),
             Setting.Choice(HAPTICS, "震动反馈（快门、拨盘、对焦确认）", "界面", listOf("关", "轻", "标准"), 2),
             Setting.Choice(FRAME, "边框样式", "边框", org.photoall.film.gallery.Frames.Kind.entries.map { it.label }, 1),
             Setting.Choice(FRAME_TEXT, "片边文字", "边框", listOf("跟随胶片", "不印"), 0),
@@ -130,10 +139,18 @@ object Settings {
             Setting.Toggle(FRAME_DEVICE, "白边印手机型号", "边框", false),
             Setting.Toggle(FRAME_RECIPE, "白边印胶片配方（胶卷 · 相纸 · LUT）", "边框", false),
             Setting.Toggle(RAW, "RAW（DNG）拍摄并从 RAW 冲洗", "相机", true),
-            Setting.Toggle(KEEP_RAW, "冲洗后保留 RAW 原片（关闭则只留 JPG）", "", false),
+            Setting.Slider(FINDER_EV, "取景画面曝光（只调取景显示，不影响照片）", "取景", -2f, 2f, 0f, format = "%+.1f EV"),
+            Setting.Toggle(FINDER_LUT, "取景画面套用胶片模拟", "取景", false),
+            Setting.Slider(FINDER_SOFT, "取景画面柔化（降低锐度，0 = 原样）", "取景", 0f, 1f, 0.5f),
+            Setting.Slider(FINDER_SAT, "取景画面饱和度（1 = 原样）", "取景", 0f, 1f, 0.7f),
+            Setting.Slider(FINDER_GRAIN, "取景画面颗粒感（只调取景显示，0 = 无）", "取景", 0f, 1f, 0f),
+            Setting.Toggle(REEL_ON, "开启拍摄录屏（关闭时隐藏所有录屏按钮）", "拍摄录屏", false),
+            Setting.Slider(REEL_BEFORE, "拍摄录屏：保留按快门前的秒数", "拍摄录屏", 0f, 20f, 10f, integer = true, format = "%.0f 秒"),
+            Setting.Slider(REEL_AFTER, "拍摄录屏：按快门后继续录的秒数", "拍摄录屏", 1f, 20f, 10f, integer = true, format = "%.0f 秒"),
+            Setting.Toggle(KEEP_RAW, "保存 RAW 格式（DNG 原片，可重新冲洗；打开会同时开启上面的 RAW 拍摄）", "相机", false),
             Setting.Toggle(PRIVATE_PHOTOS, "照片只存在本应用相册（不出现在手机相册；卸载或清除应用数据会一起删除）", "相机", false),
             Setting.Slider(RAW_EV, "RAW 冲洗曝光 EV", "相机", -3f, 3f, 0f),
-            Setting.Toggle(HDR, "HDR 连拍合成（需 RAW）", "相机", false),
+            Setting.Toggle(HDR, "HDR+ 多帧合成（实验 · 需 RAW · 部分机型可能不兼容）", "相机", false),
             Setting.Slider(HDR_FRAMES, "HDR 短曝光帧数（加长曝光共最多 6 帧）", "相机", 2f, 6f, 5f, integer = true, format = "%.0f"),
             Setting.Slider(HDR_UNDER, "HDR 最多欠曝档数（按取景器高光自动决定，不超过这个值）", "相机", 0f, 3f, 2f, format = "%.1f"),
             Setting.Slider(HDR_LONG, "HDR 包围长曝光：比短曝光亮几档（暗部细节，0 = 不拍）", "相机", 0f, 4f, 2f, format = "%.1f"),
@@ -292,6 +309,12 @@ class SettingsStore(context: Context) : SettingValues {
         if (prefs.getInt(SCHEMA, 1) < 6) { // the HDR tone step became exposure fusion: start from its default
             prefs.edit().remove(Settings.HDR_TONE).putInt(SCHEMA, 6).apply()
         }
+        if (prefs.getInt(SCHEMA, 1) < 7) { // autofocus and auto exposure by default, whatever was left set
+            prefs.edit().remove(Settings.MANUAL).remove(Settings.FOCUS).putInt(SCHEMA, 7).apply()
+        }
+        if (prefs.getInt(SCHEMA, 1) < 8) { // HDR+ only by choice in the settings, after its warning: off for everyone
+            prefs.edit().putFloat(Settings.HDR, 0f).putInt(SCHEMA, 8).apply()
+        }
     }
 
     override operator fun get(key: String): Float = prefs.getFloat(key, Settings.byKey.getValue(key).default)
@@ -299,6 +322,9 @@ class SettingsStore(context: Context) : SettingValues {
     override operator fun set(key: String, value: Float) {
         prefs.edit().putFloat(key, value).apply()
         listeners.forEach { it(key) }
+        // keeping the DNG needs RAW capture, and without it there is none to keep
+        if (key == Settings.KEEP_RAW && value >= 0.5f && !flag(Settings.RAW)) set(Settings.RAW, 1f)
+        if (key == Settings.RAW && value < 0.5f && flag(Settings.KEEP_RAW)) set(Settings.KEEP_RAW, 0f)
     }
 
     override fun flag(key: String) = get(key) >= 0.5f

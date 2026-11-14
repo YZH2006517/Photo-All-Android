@@ -47,6 +47,12 @@ class Sheet(context: Context, title: String, content: View, header: View? = null
             }
             elevation = dp(12f).toFloat()
             isClickable = true
+            if (!side) setOnApplyWindowInsetsListener { v, insets ->
+                // the navigation bar (gestures or three keys) under the sheet's last row
+                val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+                v.setPadding(dp(16f) + bars.left, dp(10f), dp(16f) + bars.right, dp(16f) + bars.bottom)
+                insets
+            }
             if (side) {
                 setOnTouchListener(SwipeToClose())
                 // clear of a camera cutout on the left edge
@@ -138,6 +144,9 @@ class Sheet(context: Context, title: String, content: View, header: View? = null
         }
     }
 
+    /** Closes at once, no animation: for when the activity under it is about to go. */
+    fun dismissNow() { closing = true; super.dismiss() }
+
     /** Sinks away, then closes. */
     override fun dismiss() {
         if (closing || !isShowing) return super.dismiss()
@@ -153,7 +162,12 @@ class Sheet(context: Context, title: String, content: View, header: View? = null
     private fun dim(from: Float, to: Float, ms: Long) {
         android.animation.ValueAnimator.ofFloat(from, to).apply {
             duration = ms
-            addUpdateListener { window?.setDimAmount(it.animatedValue as Float) }
+            // the activity may be recreated under the sheet (a new theme): its window is gone, stop dimming it
+            addUpdateListener { a ->
+                val w = window
+                if (w == null || !isShowing || w.decorView.windowToken == null || !w.decorView.isAttachedToWindow) { a.cancel(); return@addUpdateListener }
+                try { w.setDimAmount(a.animatedValue as Float) } catch (_: IllegalArgumentException) { a.cancel() }
+            }
             start()
         }
     }

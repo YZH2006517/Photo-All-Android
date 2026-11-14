@@ -13,13 +13,17 @@ import org.json.JSONObject
  * Kept as JSON in preferences; the camera's 拍摄时套用 uses the same design.
  */
 class FrameDesign {
-    enum class Border(val label: String, val kind: Frames.Kind? = null) {
+    enum class Border(val label: String, val kind: Frames.Kind? = null, val theme: ThemePapers.Theme? = null) {
         NONE("无边框"), CUSTOM("自定义"), EVEN("等宽"), BOTTOM("底栏"), SIDE("侧栏"), INSTANT("宝丽来"),
         NEG135("135 负片", Frames.Kind.NEG135), SLIDE135("135 反转", Frames.Kind.SLIDE135),
         HALF135("135 半格", Frames.Kind.HALF135), XPAN("135 宽幅", Frames.Kind.XPAN),
         M645("645", Frames.Kind.MEDIUM645), MEDIUM120("6×6", Frames.Kind.MEDIUM120),
         M67("6×7", Frames.Kind.MEDIUM67), M69("6×9", Frames.Kind.MEDIUM69),
-        SHEET45("4×5 页片", Frames.Kind.SHEET45), FILED("底片夹", Frames.Kind.FILED);
+        SHEET45("4×5 页片", Frames.Kind.SHEET45), FILED("底片夹", Frames.Kind.FILED),
+        // the camera themes' own papers (ThemePapers)
+        SACRED("教堂", theme = ThemePapers.Theme.SACRED), FATE("飞鸟", theme = ThemePapers.Theme.FATE),
+        ANIME("晴空", theme = ThemePapers.Theme.ANIME), CAMERA("图纸", theme = ThemePapers.Theme.CAMERA),
+        FILM("暗盒", theme = ThemePapers.Theme.FILM);
         val film get() = kind != null
     }
 
@@ -75,8 +79,24 @@ class FrameDesign {
     var ratio = Ratio.PHOTO    // custom border: the card's proportions
     var photoScale = 0.84f     // custom border: how much of the card the photo takes, 0.4..1
     var photoAnchor = 4        // custom border: where the photo sits on the card (3 x 3)
+    var autoPlace = true       // the words (and the date stamp) find a place where nothing covers them
+    var cartridge = false      // the cartridge the photo was shot on, standing on the sheet
+    var cartX = 0.84f          // its centre across the sheet, 0..1
+    var cartY = 0.93f          // where it stands (its foot) down the sheet, 0..1
+    var cartSize = 0.26f       // its height, as a share of the sheet's short side
 
     fun copy(): FrameDesign = fromJson(toJson())
+
+    /** A theme's sheet with the words it is made for: the phone, the settings, the film. */
+    fun theme(b: Border) {
+        border = b
+        items.clear()
+        items += listOf(Item.BRAND, Item.MODEL, Item.PARAMS, Item.FILM)
+        inPhoto = false
+        vertical = false
+        arrange = Arrange.ENDS
+        stamp = Stamp.OFF
+    }
 
     /** Nothing would be added to the photo. */
     val empty get() = border == Border.NONE && items.none { it != Item.CAPTION || caption.isNotBlank() } &&
@@ -91,6 +111,8 @@ class FrameDesign {
         put("stamp", stamp.name); put("stampColor", stampColor); put("stampCorner", stampCorner); put("turn", turn)
         put("fog", fog); put("leak", leak.toDouble()); put("leakSeed", leakSeed); put("brandMark", brandMark)
         put("ratio", ratio.name); put("photoScale", photoScale.toDouble()); put("photoAnchor", photoAnchor)
+        put("autoPlace", autoPlace)
+        put("cartridge", cartridge); put("cartX", cartX.toDouble()); put("cartY", cartY.toDouble()); put("cartSize", cartSize.toDouble())
     }
 
     companion object {
@@ -136,6 +158,11 @@ class FrameDesign {
             ratio = enumOr(j.optString("ratio"), ratio)
             photoScale = j.optDouble("photoScale", photoScale.toDouble()).toFloat()
             photoAnchor = j.optInt("photoAnchor", photoAnchor).coerceIn(0, 8)
+            autoPlace = j.optBoolean("autoPlace", true)
+            cartridge = j.optBoolean("cartridge", false)
+            cartX = j.optDouble("cartX", cartX.toDouble()).toFloat()
+            cartY = j.optDouble("cartY", cartY.toDouble()).toFloat()
+            cartSize = j.optDouble("cartSize", cartSize.toDouble()).toFloat()
         }
 
         private fun prefs(context: Context) = context.getSharedPreferences("frames", Context.MODE_PRIVATE)
@@ -165,6 +192,12 @@ class FrameDesign {
             Preset("6×9") { border = Border.M69 },
             Preset("4×5 页片") { border = Border.SHEET45 },
             Preset("底片夹") { border = Border.FILED },
+            // the camera themes' own sheets, straight after the films
+            Preset("教堂") { theme(Border.SACRED) },
+            Preset("飞鸟") { theme(Border.FATE) },
+            Preset("晴空") { theme(Border.ANIME) },
+            Preset("图纸") { theme(Border.CAMERA) },
+            Preset("暗盒") { theme(Border.FILM) },
             // cards: the exposure, not the phone
             Preset("杂志竖排") {
                 border = Border.SIDE; thickness = 0.5f; background = WHITE

@@ -78,6 +78,45 @@ bool read_params(JNIEnv *env, jobjectArray names, jfloatArray values, film::Film
   return ok;
 }
 
+// FilmEngine::create's steps go to FilmNative.stage on the creating thread (a Java thread),
+// written to disk at once: a driver that crashes compiling a kernel leaves its name behind.
+thread_local JNIEnv *t_stage_env = nullptr;
+thread_local jclass t_stage_class = nullptr;
+thread_local jmethodID t_stage_method = nullptr;
+
+void stage_to_java(const char *stage)
+{
+  JNIEnv *env = t_stage_env;
+  if(!env || !t_stage_method) return;
+  jstring text = env->NewStringUTF(stage);
+  if(text) env->CallStaticVoidMethod(t_stage_class, t_stage_method, text);
+  if(env->ExceptionCheck()) env->ExceptionClear(); // a breadcrumb never fails the engine
+  if(text) env->DeleteLocalRef(text);
+}
+
+struct StageScope
+{
+  explicit StageScope(JNIEnv *env, jclass type)
+  {
+    t_stage_env = env;
+    t_stage_class = type;
+    t_stage_method = env->GetStaticMethodID(type, "stage", "(Ljava/lang/String;)V");
+    if(env->ExceptionCheck())
+    {
+      env->ExceptionClear();
+      t_stage_method = nullptr;
+    }
+    film::set_stage_hook(stage_to_java);
+  }
+  ~StageScope()
+  {
+    film::set_stage_hook(nullptr);
+    t_stage_env = nullptr;
+    t_stage_class = nullptr;
+    t_stage_method = nullptr;
+  }
+};
+
 } // namespace
 
 extern "C" {
@@ -130,9 +169,11 @@ JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferRelease(JN
   return;
 }
 
-JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *env, jclass, jobject asset_manager)
+JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *env, jclass type, jobject asset_manager,
+                                                                       jboolean burst)
 {
   JNI_TRY
+  StageScope stages(env, type);
   AAssetManager *assets = AAssetManager_fromJava(env, asset_manager);
   film::Lut filmsim, spectra;
   std::string error;
@@ -143,7 +184,7 @@ JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *
     return 0;
   }
   auto handle = std::make_unique<Handle>();
-  handle->engine = film::FilmEngine::create(filmsim, spectra, error);
+  handle->engine = film::FilmEngine::create(filmsim, spectra, error, burst == JNI_TRUE);
   if(!handle->engine)
   {
     throw_java(env, error);

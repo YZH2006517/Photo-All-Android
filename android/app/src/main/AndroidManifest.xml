@@ -5,6 +5,10 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 拍摄录屏: the screen through MediaProjection, held by a foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Only to list the app's own folder again after its data was cleared or it was
          reinstalled: the system then no longer counts those photos as the app's. -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
@@ -22,7 +26,7 @@
             android:exported="true"
             android:screenOrientation="portrait"
             android:rotationAnimation="jumpcut"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|colorMode|layoutDirection|locale|touchscreen">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -33,6 +37,10 @@
         <activity android:name=".gallery.GalleryActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.ViewerActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.FrameActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".ui.CameraBackActivity" android:exported="false" android:hardwareAccelerated="true"
+            android:screenOrientation="sensorLandscape" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+        <activity android:name=".ui.Cartridge3DActivity" android:exported="false" android:hardwareAccelerated="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".gallery.ImportActivity" android:exported="false" android:screenOrientation="portrait" />
         <!-- the app's own photo folder, for sharing and opening those photos -->
         <provider
@@ -42,6 +50,9 @@
             android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/photo_paths" />
         </provider>
+        <!-- compiles the GPU kernels apart from the app first: a driver crash there only ends this process -->
+        <service android:name=".reel.Reel$Service" android:foregroundServiceType="mediaProjection" android:exported="false" />
+        <service android:name=".engine.GpuProbe$Probe" android:process=":gpuprobe" android:exported="false" />
         <!-- engine test bench; also the adb benchmark entry point -->
         <activity android:name=".MainActivity" android:exported="true" />
     </application>

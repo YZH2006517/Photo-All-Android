@@ -7,9 +7,9 @@
 // Hasinoff et al. 2016. Adapted from correct_upsampling_error,
 // compute_tile_differences25 and find_best_tile_alignment of hdr-plus-swift (GPL-3.0);
 // here the tile and its search window are loaded into shared memory and the 64
-// threads of the workgroup share its pixels, the sums reduced with subgroup adds.
-#extension GL_KHR_shader_subgroup_basic : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
+// threads of the workgroup share its pixels, the sums reduced in shared memory.
+// No subgroup operations and no local arrays: Mali's compiler (vivo, MediaTek MT6993,
+// Android 17) crashed on the earlier form, a float[25] reduced with subgroupAdd.
 layout(local_size_x = 64) in;
 layout(set = 1, binding = 0) uniform sampler2D img_ref;
 layout(set = 1, binding = 1) uniform sampler2D img_comp;
@@ -31,7 +31,8 @@ const float kOutside = -4.0; // a comparison pixel outside the frame: never matc
 
 shared float s_ref[kMaxTile * kMaxTile];
 shared float s_comp[kWin * kWin];
-shared float s_part[16][25]; // per subgroup (subgroups of at least 4 lanes) partial sums
+shared float s_acc[25 * 64]; // [candidate * 64 + thread]: each thread's partial sum
+shared float s_total[25];
 uint t;
 ivec2 size;
 
@@ -53,22 +54,16 @@ float comp_at(ivec2 q)
   return any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)) ? kOutside : texelFetch(img_comp, q, 0).r;
 }
 
-// Sum of `n` values over the workgroup (each thread passes its own), into s_part[0][i].
-void reduce(float v[25], int n)
+// The sums of s_acc over the threads, for candidates 0..n-1, into s_total.
+void reduce(int n)
 {
-  for(int i = 0; i < n; i++)
-  {
-    float sum = subgroupAdd(v[i]);
-    if(subgroupElect()) s_part[gl_SubgroupID][i] = sum;
-  }
   barrier();
-  if(t == 0u)
-    for(int i = 0; i < n; i++)
-    {
-      float total = 0.0;
-      for(uint g = 0u; g < gl_NumSubgroups; g++) total += s_part[g][i];
-      s_part[0][i] = total;
-    }
+  if(int(t) < n)
+  {
+    float total = 0.0;
+    for(int i = 0; i < 64; i++) total += s_acc[int(t) * 64 + i];
+    s_total[t] = total;
+  }
   barrier();
 }
 
@@ -97,17 +92,19 @@ void main()
     c[0] = previous(tl);
     c[1] = previous(tl + ivec2((tl.x & 1) == 0 ? -1 : 1, 0));
     c[2] = previous(tl + ivec2(0, (tl.y & 1) == 0 ? -1 : 1));
-    float v[25];
-    for(int k = 0; k < 3; k++) v[k] = 0.0;
     int st = step(), side_n = push.tile / st;
-    for(int j = int(t); j < side_n * side_n; j += 64)
+    for(int k = 0; k < 3; k++)
     {
-      int x = (j % side_n) * st, y = (j / side_n) * st;
-      ivec2 p = origin + ivec2(x, y);
-      for(int k = 0; k < 3; k++) v[k] += err(s_ref[y * push.tile + x], comp_at(p + c[k]));
+      float sum = 0.0;
+      for(int j = int(t); j < side_n * side_n; j += 64)
+      {
+        int x = (j % side_n) * st, y = (j / side_n) * st;
+        sum += err(s_ref[y * push.tile + x], comp_at(origin + ivec2(x, y) + c[k]));
+      }
+      s_acc[k * 64 + int(t)] = sum;
     }
-    reduce(v, 3);
-    float d0 = s_part[0][0], d1 = s_part[0][1], d2 = s_part[0][2];
+    reduce(3);
+    float d0 = s_total[0], d1 = s_total[1], d2 = s_total[2];
     base = d0 <= d1 && d0 <= d2 ? c[0] : d1 <= d2 ? c[1] : c[2];
     barrier();
   }
@@ -118,21 +115,24 @@ void main()
   for(int i = int(t); i < win * win; i += 64)
     s_comp[i] = comp_at(origin + base + ivec2(i % win - r, i / win - r));
   barrier();
-  float v[25];
-  for(int k = 0; k < 25; k++) v[k] = 0.0;
   int st = step(), side_n = push.tile / st;
-  for(int j = int(t); j < side_n * side_n; j += 64)
+  for(int k = 0; k < count; k++)
   {
-    int x = (j % side_n) * st, y = (j / side_n) * st;
-    float ref = s_ref[y * push.tile + x];
-    for(int k = 0; k < count; k++) v[k] += err(ref, s_comp[(y + k / side) * win + x + k % side]);
+    int dx = k % side, dy = k / side;
+    float sum = 0.0;
+    for(int j = int(t); j < side_n * side_n; j += 64)
+    {
+      int x = (j % side_n) * st, y = (j / side_n) * st;
+      sum += err(s_ref[y * push.tile + x], s_comp[(y + dy) * win + x + dx]);
+    }
+    s_acc[k * 64 + int(t)] = sum;
   }
-  reduce(v, count);
+  reduce(count);
   if(t == 0u)
   {
     int best = 0;
     for(int k = 1; k < count; k++)
-      if(s_part[0][k] < s_part[0][best]) best = k;
+      if(s_total[k] < s_total[best]) best = k;
     ivec2 found = base + ivec2(best % side - r, best / side - r);
     imageStore(img_out, tl, vec4(vec2(found), 0.0, 1.0));
   }

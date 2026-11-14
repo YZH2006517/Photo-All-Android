@@ -45,6 +45,13 @@ class ZslCamera(
     private val meter: PreviewMeter,
     /** A failure, and whether it is the lens refusing these streams (true) or a passing one. */
     private val onError: (String, Boolean) -> Unit,
+    /**
+     * RAW on demand: the repeating request feeds only the viewfinder and the meter, and a
+     * shot is one STILL_CAPTURE request for a RAW frame. For a single RAW on a camera that
+     * cannot stream full-size RAW at the preview rate (a MediaTek HAL fails the device,
+     * error 4, when RAW is in the repeating request).
+     */
+    val onDemand: Boolean = false,
 ) {
     /**
      * A burst: one DNG per frame in native memory (newest = reference first; the caller
@@ -67,6 +74,19 @@ class ZslCamera(
     private var yuvReader: ImageReader? = null
     private var preview: Surface? = null
     @Volatile private var closed = false
+
+    /**
+     * Where the session is on its way up (open, configure, first frame): the report's
+     * answer when a shot finds no session, and the last step written down at each change.
+     */
+    @Volatile var state = "等取景画面"
+        private set
+    private fun step(what: String) {
+        state = what
+        org.photoall.film.CrashReport.stage("Camera2：$what")
+        Log.i(TAG, "state: $what")
+    }
+    private var firstFrame = false
 
     /**
      * The RAW size streamed: the largest up to ~26 MP. Some phones (quad-Bayer 50 MP
@@ -113,17 +133,34 @@ class ZslCamera(
     fun open(viewfinder: Surface) {
         preview = viewfinder
         // The ring, the frames of a burst being written out and a few for the camera.
-        rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2 * keep + 4).apply {
+        rawReader = ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, if (onDemand) 3 else 2 * keep + 4).apply {
             setOnImageAvailableListener({ onRaw(it) }, handler)
         }
         yuvReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 3).apply {
             setOnImageAvailableListener({ r -> r.acquireLatestImage()?.use { meter.analyzeYuv(it) } }, handler)
         }
         exposure.onSettings = { handler.post { repeat() } }
+        step("正在打开相机 $cameraId")
+        // a session that never comes up says where it stopped, instead of waiting forever
+        handler.postDelayed({
+            if (!closed && session == null) onError("Camera2 会话 6 秒没建好，停在：$state", false)
+        }, 6000)
+        openDevice(0)
+    }
+
+    /**
+     * Opens the camera; one still held by the previous user (CameraX closes it a moment after
+     * it is unbound: a Xiaomi with a Snapdragon 765G answered ERROR_CAMERA_IN_USE or
+     * ERROR_MAX_CAMERAS_IN_USE) is asked again a little later, a few times, before it fails.
+     */
+    @SuppressLint("MissingPermission")
+    private fun openDevice(attempt: Int) {
+        if (closed) return
         try {
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (closed) return camera.close()
+                    step("相机已打开，配置会话")
                     device = camera
                     // a camera HAL may refuse the streams by throwing rather than by
                     // onConfigureFailed; thrown here (a camera thread) it would end the app
@@ -134,11 +171,17 @@ class ZslCamera(
                         if (!closed) onError("这颗镜头不能同时连续输出 RAW 和预览：${e.message}", true)
                     }
                 }
-                override fun onDisconnected(camera: CameraDevice) { camera.close(); device = null }
+                override fun onDisconnected(camera: CameraDevice) { step("相机被断开（别的应用或系统占用）"); camera.close(); device = null }
                 override fun onError(camera: CameraDevice, error: Int) {
+                    step("相机报错 $error")
                     camera.close()
                     device = null
-                    if (!closed) onError("相机打开失败（$error）", false)
+                    if (closed) return
+                    val busy = error == ERROR_CAMERA_IN_USE || error == ERROR_MAX_CAMERAS_IN_USE
+                    if (busy && attempt < RETRIES.size) {
+                        step("相机还被占用（$error），${RETRIES[attempt]} ms 后重试第 ${attempt + 1} 次")
+                        handler.postDelayed({ openDevice(attempt + 1) }, RETRIES[attempt])
+                    } else onError("相机打开失败（$error${if (busy) "：被占用" else ""}）", false)
                 }
             }, handler)
         } catch (e: Exception) {
@@ -146,20 +189,39 @@ class ZslCamera(
         }
     }
 
+    /** False when the meter's stream was left out (the camera would not take all three). */
+    var metering = true
+        private set
+
     private fun configure(camera: CameraDevice) {
-        val outputs = listOf(preview!!, yuvReader!!.surface, rawReader!!.surface).map { OutputConfiguration(it) }
-        val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor,
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(s: CameraCaptureSession) {
-                    if (closed) return s.close()
-                    session = s
-                    repeat()
-                }
-                override fun onConfigureFailed(s: CameraCaptureSession) {
-                    if (!closed) onError("这颗镜头不能同时连续输出 RAW 和预览", true)
-                }
-            })
-        camera.createCaptureSession(config)
+        val callback = object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(s: CameraCaptureSession) {
+                if (closed) return s.close()
+                step("会话已配置${if (metering) "" else "（无测光流）"}，开始预览")
+                session = s
+                repeat()
+            }
+            override fun onConfigureFailed(s: CameraCaptureSession) {
+                step("会话配置失败")
+                if (!closed) onError("这颗镜头不能同时输出 RAW 和预览", true)
+            }
+        }
+        fun config(withMeter: Boolean) = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
+            listOfNotNull(preview!!, yuvReader!!.surface.takeIf { withMeter }, rawReader!!.surface).map { OutputConfiguration(it) },
+            executor, callback)
+        // ask first (Android 12+): a set of streams the camera cannot run is changed before it is
+        // tried, rather than left to a HAL that may never answer
+        fun supported(c: SessionConfiguration): Boolean? =
+            if (Build.VERSION.SDK_INT >= 31) runCatching { camera.isSessionConfigurationSupported(c) }.getOrNull() else null
+        var chosen = config(true)
+        val all = supported(chosen)
+        if (all == false) {
+            val lean = config(false)
+            val two = supported(lean)
+            step("预览+测光+RAW 不支持，预览+RAW ${when (two) { true -> "支持"; false -> "也不支持"; null -> "未知" }}")
+            if (two != false) { chosen = lean; metering = false }
+        } else step("会话组合：预览 ${previewSize} + 测光 + RAW $rawSize（${if (all == true) "支持" else "系统未答"}）")
+        camera.createCaptureSession(chosen)
     }
 
     // Diagnosis: frame cadence and how often the repeating request was restarted.
@@ -172,6 +234,7 @@ class ZslCamera(
     private val resultCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             exposure.captureCallback.onCaptureCompleted(s, request, result)
+            if (!firstFrame) { firstFrame = true; step("预览已出帧") }
             val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
             if (lastFrame > 0 && ts - lastFrame > 50_000_000L) gaps++
             lastFrame = ts
@@ -185,12 +248,21 @@ class ZslCamera(
             }
             results[ts] = result
             while (results.size > 3 * keep) results.remove(results.keys.first())
+            if (request.tag == STILL_TAG) results[ts] = result.also { stillResult = ts }
             if (request.tag == LONG_TAG) longWanted = ts
             takeLong()
+            takeStill()
             watchFocus(result)
         }
         override fun onCaptureFailed(s: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
             if (request.tag == LONG_TAG) longWanted = 0 // give up on it
+            if (request.tag == STILL_TAG) {
+                Log.w(TAG, "still RAW failed: reason ${failure.reason}")
+                stillFailed("拍摄请求失败（原因 ${failure.reason}）")
+            }
+        }
+        override fun onCaptureStarted(s: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
+            if (request.tag == STILL_TAG) stillStarted?.invoke()
         }
     }
 
@@ -201,8 +273,8 @@ class ZslCamera(
         try {
             val b = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(preview!!)
-            b.addTarget(yuvReader!!.surface)
-            b.addTarget(rawReader!!.surface)
+            if (metering) b.addTarget(yuvReader!!.surface)
+            if (!onDemand) b.addTarget(rawReader!!.surface)
             settings(b)
             s.setRepeatingRequest(b.build(), resultCallback, handler)
             restarts++
@@ -299,6 +371,10 @@ class ZslCamera(
             } catch (e: IllegalStateException) {
                 null // all buffers held (a burst being written): the rest waits a moment
             } ?: return
+            if (onDemand) {
+                if (pending != null && stillImage == null) { stillImage = image; takeStill() } else image.close()
+                continue
+            }
             if (pending != null && image.timestamp == longWanted) {
                 longFrame = image
                 takeLong()
@@ -319,7 +395,59 @@ class ZslCamera(
      * [long] is given, one frame at that exposure taken now. [done] runs on the handler
      * thread with DNGs written in memory, or null if the frames were not there.
      */
+    /** On demand: when the still's exposure starts, and what failed when it does not come. */
+    @Volatile var stillStarted: (() -> Unit)? = null
+    @Volatile var stillError: String? = null
+    private var stillImage: Image? = null
+    private var stillResult = -1L
+
+    // Handler thread: the still's frame and its result both in: the shot.
+    private fun takeStill() {
+        if (!onDemand || pending == null) return
+        val image = stillImage ?: return
+        if (results[image.timestamp] == null) return
+        stillImage = null
+        pendingFrames = listOf(image)
+        finish(null)
+    }
+
+    private fun stillFailed(why: String) {
+        val done = pending ?: return
+        pending = null
+        stillError = why
+        stillImage?.close(); stillImage = null
+        done(null)
+    }
+
+    /** On demand: one STILL_CAPTURE request for a RAW frame, at the exposure the meter holds. */
+    private fun shootStill(orientationDegrees: Int, taken: () -> Unit, done: (Shot?) -> Unit) {
+        handler.post {
+            val camera = device
+            val s = session
+            if (camera == null || s == null) { stillError = "相机还没准备好（停在：$state）"; return@post done(null) }
+            pendingTaken = taken
+            pendingOrientation = orientationDegrees
+            pending = done
+            stillError = null
+            stillImage?.close(); stillImage = null
+            try {
+                val b = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                b.addTarget(preview!!)
+                b.addTarget(rawReader!!.surface)
+                settings(b)
+                b.setTag(STILL_TAG)
+                s.capture(b.build(), resultCallback, handler)
+                val ms = (exposure.live?.timeNs ?: 50_000_000L) / 1_000_000
+                handler.postDelayed({ if (pending === done) stillFailed("相机 ${5000 + 3 * ms} ms 内没有交回 RAW") }, 5000 + 3 * ms)
+            } catch (e: Exception) {
+                Log.w(TAG, "still RAW", e)
+                stillFailed("拍摄请求被拒绝：${e.message}")
+            }
+        }
+    }
+
     fun shoot(frames: Int, long: Exposure?, orientationDegrees: Int, taken: () -> Unit, done: (Shot?) -> Unit) {
+        if (onDemand) return shootStill(orientationDegrees, taken, done)
         handler.post {
             pendingTaken = taken
             val taken = ring.toList().takeLast(frames).reversed()
@@ -439,7 +567,10 @@ class ZslCamera(
         /** Frames kept for a burst. */
         const val RING = 6
         const val MAX_RAW_PIXELS = 26_000_000L
+        /** Waits before asking again for a camera still held by its last user. */
+        private val RETRIES = longArrayOf(300, 700, 1500)
         private const val LONG_TAG = "long"
+        private const val STILL_TAG = "still"
 
         fun exifOrientation(degrees: Int) = when ((degrees % 360 + 360) % 360) {
             90 -> ExifInterface.ORIENTATION_ROTATE_90

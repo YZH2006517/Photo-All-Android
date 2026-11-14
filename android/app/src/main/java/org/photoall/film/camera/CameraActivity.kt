@@ -33,6 +33,7 @@ import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.core.CameraState
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import android.util.Size
@@ -119,7 +120,6 @@ class CameraActivity : ComponentActivity() {
     private var blocksManual: Boolean? = null
     private lateinit var lookRoller: Roller
     private lateinit var lensWell: LensWell
-    private lateinit var hdrSwitch: SlideSwitch
     private lateinit var amPill: TextView
     private lateinit var exposureReadout: TextView
     private lateinit var lookReadout: TextView
@@ -184,7 +184,6 @@ class CameraActivity : ComponentActivity() {
     private lateinit var zoomLabel: TextView
     private lateinit var lensRow: LinearLayout
     private lateinit var facingButton: ImageView
-    private lateinit var hdrButton: Button
     private lateinit var peakButton: Button
     private lateinit var distanceLabel: TextView
     private lateinit var focusSeek: SeekBar
@@ -227,6 +226,57 @@ class CameraActivity : ComponentActivity() {
     private var settingsOpen = false
     private var bindSnapshot = emptyList<Float>()
     private var developing = 0
+    private var skinShown = 0f // the camera style the views were built in
+    private val shotFx by lazy { org.photoall.film.ui.Skin.ShotFx(this) }
+    private var skinTicker: android.animation.ValueAnimator? = null
+    /** Gravity, smoothed, as the tilt the style's layers and lights follow. */
+    private val tiltListener = object : android.hardware.SensorEventListener {
+        override fun onSensorChanged(e: android.hardware.SensorEvent) {
+            val (gx, gy) = when (display?.rotation) {
+                android.view.Surface.ROTATION_90 -> -e.values[1] to e.values[0]
+                android.view.Surface.ROTATION_270 -> e.values[1] to -e.values[0]
+                else -> e.values[0] to e.values[1]
+            }
+            val skin = org.photoall.film.ui.Skin
+            // held upright the phone leans back about 45 degrees: that is the rest position
+            skin.tiltX += ((-gx / 5f).coerceIn(-1f, 1f) - skin.tiltX) * 0.12f
+            skin.tiltY += (((gy - 6.5f) / 5f).coerceIn(-1f, 1f) - skin.tiltY) * 0.12f
+        }
+        override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
+    }
+
+    /** The style's motion: time and tilt, redrawn each frame while the screen is in front. */
+    private fun runSkin(on: Boolean) {
+        val sensors = getSystemService(android.hardware.SensorManager::class.java)
+        sensors.unregisterListener(tiltListener)
+        skinTicker?.cancel()
+        skinTicker = null
+        if (!on || !org.photoall.film.ui.Skin.active) return
+        sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY)?.let {
+            sensors.registerListener(tiltListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME)
+        }
+        val start = android.os.SystemClock.uptimeMillis()
+        skinTicker = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 1000
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            addUpdateListener {
+                if (!org.photoall.film.ui.Skin.calm) org.photoall.film.ui.Skin.time = (android.os.SystemClock.uptimeMillis() - start) / 1000f
+                if (::stage.isInitialized) stage.body?.background?.invalidateSelf()
+                shutter.background?.invalidateSelf()
+                if (filmBodyActive()) {
+                    updateLightMeter()
+                    for (v in listOf(lensBarrel, rewindCrank, cartridge, speedDial, frameCounter, windLever)) v.invalidate()
+                    val sx = -org.photoall.film.ui.Skin.tiltX * dp(3)
+                    val sy = org.photoall.film.ui.Skin.tiltY * dp(2)
+                    for (col in listOf(lensBarrel.parent as? View, speedDial.parent as? View)) col?.let {
+                        it.background?.invalidateSelf()
+                    }
+                }
+            }
+            start()
+        }
+    }
+
     private var themeShown = 0f // the theme the views were built in
     private lateinit var haptics: Haptics
     private val rebake = Runnable { engineThread.later { bakeLut() } }
@@ -248,8 +298,25 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // adb: "am start ... --ei skin 2" picks a camera style (to look at each on a phone)
+        // used once: the task keeps its first intent, and a rebuild (after a theme change) must not apply it again
+        if (savedInstanceState == null) intent.getIntExtra("skin", -1).takeIf { it >= 1 }?.let {
+            SettingsStore(this)[Settings.THEME] = (org.photoall.film.ui.Style.palettes.size + it - 1).toFloat()
+        }
+        intent.removeExtra("skin")
         org.photoall.film.ui.Style.apply(this)
         super.onCreate(savedInstanceState)
+        seenConfig = android.content.res.Configuration(resources.configuration)
+        getSharedPreferences("camera_quirks", MODE_PRIVATE).let { q ->
+            val stalled = q.getBoolean("raw_camera2", false) || q.all.keys.any { it.startsWith("raw_no_analysis_") }
+            if (stalled && !q.getBoolean("stall_reset_v39", false)) q.edit().apply {
+                for (key in q.all.keys) if (key.startsWith("raw_no_analysis_") || key.startsWith("raw_unusable_")) remove(key)
+                remove("raw_camera2")
+                remove("zsl_blocked")
+                putBoolean("stall_reset_v39", true)
+            }.apply()
+        }
+        getSystemService(android.hardware.camera2.CameraManager::class.java).registerAvailabilityCallback(availability, main)
         store = SettingsStore(this)
         themeShown = store[Settings.THEME]
         haptics = Haptics(window.decorView) { store[Settings.HAPTICS].toInt() }
@@ -283,10 +350,6 @@ class CameraActivity : ComponentActivity() {
             Style.pressable(this)
             setOnClickListener { front = !front; lensId = null; pendingZoom = null; haptics.play(Haptics.Event.SEGMENT); bindCamera() }
         }
-        hdrButton = button("HDR") {
-            store[Settings.HDR] = if (store.flag(Settings.HDR)) 0f else 1f
-            haptics.play(Haptics.Event.SEGMENT)
-        }.apply { textSize = 12f; typeface = android.graphics.Typeface.MONOSPACE; Style.compact(this, 10f); Style.pressable(this) }
         flashIcon = iconButton("闪光") { showFlashModes(flashIcon) }
         histogramIcon = iconButton("直方图") {
             store[Settings.HISTOGRAM] = if (store.flag(Settings.HISTOGRAM)) 0f else 1f
@@ -330,6 +393,12 @@ class CameraActivity : ComponentActivity() {
             background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(Style.SURFACE); setStroke(1, Style.HAIRLINE) }
             clipToOutline = true
             setOnClickListener { coach?.event("album"); startActivity(Intent(this@CameraActivity, GalleryActivity::class.java)) }
+            // long press: straight to the photo just taken (the newest, first in the viewer)
+            setOnLongClickListener {
+                haptics.play(Haptics.Event.SEGMENT)
+                showLatestLarge()
+                true
+            }
         }
         shutter = View(this).apply {
             background = Style.shutter(this@CameraActivity)
@@ -429,7 +498,7 @@ class CameraActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(12), 0, dp(12), 0)
             }
-            pickerTabScroll = android.widget.HorizontalScrollView(this@CameraActivity).apply {
+            pickerTabScroll = android.widget.HorizontalScrollView(this@CameraActivity).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
                 isHorizontalScrollBarEnabled = false
                 overScrollMode = View.OVER_SCROLL_NEVER
                 isHorizontalFadingEdgeEnabled = true
@@ -484,9 +553,6 @@ class CameraActivity : ComponentActivity() {
         lensWell = LensWell(this).apply {
             contentDescription = "焦距：拖动旋钮选择镜头"
             onSelect = { i -> options.getOrNull(i)?.let { selectLens(it) } }
-        }
-        hdrSwitch = SlideSwitch(this).apply {
-            onToggle = { on -> store[Settings.HDR] = if (on) 1f else 0f; haptics.play(Haptics.Event.SEGMENT) }
         }
         amPill = TextView(this).apply {
             gravity = Gravity.CENTER
@@ -592,6 +658,7 @@ class CameraActivity : ComponentActivity() {
         viewfinderFrame = ViewfinderFrame(this).apply {
             addView(viewfinder, FrameLayout.LayoutParams(-1, -1))
             addView(curtain, FrameLayout.LayoutParams(-1, -1)) // under the corner mask
+            addView(shotFx, FrameLayout.LayoutParams(-1, -1)) // the style's flash of a shot, over the curtain
             addView(this@CameraActivity.overlay, FrameLayout.LayoutParams(-1, -1)) // not View.overlay
             addView(lensRow, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(10) })
             addView(facingButton, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.BOTTOM or Gravity.END).apply {
@@ -617,8 +684,20 @@ class CameraActivity : ComponentActivity() {
         store.onChange { key -> onSettingChanged(key) }
         updateLabels()
         // the last launch ended badly: offer its report to send (nothing is sent by itself)
-        main.postDelayed({ if (!isFinishing) org.photoall.film.CrashReport.pending(this)?.let { showCrashReport(it) } }, 700)
+        // The last run ended badly: its report first, before the GPU engine and the camera
+        // start (a phone that crashes in either would never show it otherwise), and with safe
+        // settings already applied when the crashes repeat. The heavy start waits for the report.
+        val report = org.photoall.film.CrashReport.pending(this)
         org.photoall.film.CrashReport.onRecovered = { thread, _ -> onThreadRecovered(thread) }
+        if (report != null) showCrashReport(report) { startEngineAndCamera() } else startEngineAndCamera()
+    }
+
+    private var heavyStarted = false
+
+    /** The GPU engine and the camera: what may crash on a phone we have not met. */
+    private fun startEngineAndCamera() {
+        if (heavyStarted || isFinishing || isDestroyed) return
+        heavyStarted = true
         status.text = "正在启动胶片引擎…"
         engineThread.later {
             try {
@@ -672,14 +751,22 @@ class CameraActivity : ComponentActivity() {
         frameNote.setTextColor(if (landscape) 0xffb4ada3.toInt() else Style.TEXT_2)
         status.setTextColor(if (landscape) 0xffd8d4cc.toInt() else Style.TEXT_2)
         modeLabel.setTextColor(if (landscape) 0xffb4ada3.toInt() else Style.TEXT_2)
+        val skinned = org.photoall.film.ui.Skin.active
+        overlay.frameAround = if (landscape) org.photoall.film.ui.Toy.SOCKET else Style.BG
+        if (skinned) frameCount.typeface = org.photoall.film.ui.Skin.figures()
         stage.show(slot, LinearLayout(this).apply {
             orientation = if (landscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             setBackgroundColor(Style.BG)
+            if (skinned && !landscape) background = org.photoall.film.ui.Skin.Backdrop(resources.displayMetrics.density, false)
             if (landscape) {
                 // the phone as a toy camera: the viewfinder sunk in the middle, controls either side
-                background = org.photoall.film.ui.ToyBackground(resources.displayMetrics.density)
+                background = if (skinned) org.photoall.film.ui.Skin.Backdrop(resources.displayMetrics.density, true)
+                    else org.photoall.film.ui.ToyBackground(resources.displayMetrics.density)
                 clipChildren = false
-                addView(FitColumn(this@CameraActivity, toySide(left = true)), LinearLayout.LayoutParams(dp(158), -1))
+                val body = filmBodyActive()
+                if (body) syncFilmBody()
+                val side = if (body) bodyColumnWidth() else dp(158)
+                addView(FitColumn(this@CameraActivity, if (body) filmSide(left = true) else toySide(left = true)), LinearLayout.LayoutParams(side, -1))
                 // the well wraps the picture exactly (no bands either side); the space left over
                 // is body, not black
                 finderHost.removeView(slot)
@@ -690,7 +777,7 @@ class CameraActivity : ComponentActivity() {
                     addView(slot, FrameLayout.LayoutParams(-2, -2))
                 }, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
                 addView(finderHost, LinearLayout.LayoutParams(0, -1, 1f).apply { topMargin = dp(8); bottomMargin = dp(8) })
-                addView(FitColumn(this@CameraActivity, toySide(left = false)), LinearLayout.LayoutParams(dp(158), -1))
+                addView(FitColumn(this@CameraActivity, if (body) filmSide(left = false) else toySide(left = false)), LinearLayout.LayoutParams(side, -1))
             } else {
                 addView(topBar, LinearLayout.LayoutParams(-1, dp(52)))
                 // viewfinder and controls together under the top bar; spare height goes
@@ -719,6 +806,12 @@ class CameraActivity : ComponentActivity() {
                 insets
             }
         })
+        // 拍摄录屏 follows the screen's new shape
+        windowManager.currentWindowMetrics.bounds.let {
+            org.photoall.film.reel.Reel.screenChanged(it.width(), it.height(), resources.displayMetrics.densityDpi)
+        }
+        // the film body starts at the wall until a roll is loaded
+        if (filmBodyActive()) { if (!bodyPrefs.getBoolean("loaded", false)) showFilmWall() } else hideFilmWall()
         updateFocusControls() // portrait shows the focus row, landscape the rail
         hideStatusBar()
     }
@@ -769,16 +862,17 @@ class CameraActivity : ComponentActivity() {
             setPadding(dp(14), dp(8), dp(14), dp(8))
         }
         if (left) {
-            detach(exposureReadout, exposureRoller, hdrSwitch, isoWheel, shutterWheel)
+            detach(exposureReadout, exposureRoller, isoWheel, shutterWheel)
             val settings = socket(settingsIcon, keySize).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
             val flash = socket(flashIcon, keySize).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
             val am = socket(amPill, keySize).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
-            hdrSwitch.layoutParams = LinearLayout.LayoutParams(sock, dp(34))
             val album = socket(thumbnail, keySize, 16f).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
             val sheet = socket(quickButton, keySize).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
             col.addView(row(settings, flash))
-            col.addView(row(am, hdrSwitch), LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
-            col.addView(caption("A / M          HDR"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
+            (recButton.parent as? android.view.ViewGroup)?.removeView(recButton)
+            col.addView(recButton, LinearLayout.LayoutParams(-1, dp(30)).apply { topMargin = dp(8) })
+            col.addView(row(am), LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
+            col.addView(caption("A / M"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
             // auto: the exposure roller; manual: ISO and shutter wheels side by side, in the same place
             val auto = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -888,6 +982,18 @@ class CameraActivity : ComponentActivity() {
                 outline.setRoundRect(0, 0, view.width, view.height, dp(17).toFloat())
         } else android.view.ViewOutlineProvider.BACKGROUND
         viewfinderFrame.clipToOutline = body
+        if (org.photoall.film.ui.Skin.active) {
+            // the style's own shutter and keys, in both layouts
+            val face = org.photoall.film.ui.Skin.Shutter(density)
+            shutter.background = face
+            shotFx.onFire = { face.shotAt = org.photoall.film.ui.Skin.time }
+            for (v in listOf(settingsIcon, flashIcon, quickButton, amPill)) v.background = org.photoall.film.ui.Skin.Key(density)
+            facingButton.background = org.photoall.film.ui.Skin.Key(density)
+            val ink = Style.TEXT
+            facingButton.setImageDrawable(Icon(Icon.Kind.FLIP, ink, 1.8f))
+            quickButton.setImageDrawable(Icon(Icon.Kind.GRID, ink))
+            settingsIcon.setImageDrawable(Icon(Icon.Kind.TUNE, ink))
+        }
     }
 
     private fun toggleManual() {
@@ -935,7 +1041,6 @@ class CameraActivity : ComponentActivity() {
         amPill.text = if (manual) "M" else "A"
         amPill.setTextColor(if (manual) Toy.AMBER else Toy.INK)
         amPill.contentDescription = if (manual) "手动曝光（点按回到自动）" else "自动曝光（点按切到手动）"
-        if (hdrSwitch.on != hdrOn) hdrSwitch.set(hdrOn, animate = hdrSwitch.isAttachedToWindow)
         syncExposureBlocks()
         exposureReadout.swapText(if (manual) {
             if (manualKey == Settings.ISO) "ISO ${Settings.iso(store[Settings.ISO])}" else Settings.shutterLabel(store[Settings.SHUTTER])
@@ -1449,13 +1554,14 @@ class CameraActivity : ComponentActivity() {
      * stays free for a centred camera hole (the histogram switch is in the settings sheet).
      */
     private fun fillTopBar(landscape: Boolean) {
-        for (v in listOf(flashIcon, hdrButton, frameCount, frameNote, histogramIcon, settingsIcon))
+        for (v in listOf(flashIcon, frameCount, frameNote, histogramIcon, settingsIcon))
             (v.parent as? android.view.ViewGroup)?.removeView(v)
         (frameCount.parent as? android.view.ViewGroup)?.let { (it.parent as? android.view.ViewGroup)?.removeView(it) }
         topBar.removeAllViews()
         val icon = dp(if (landscape) 40 else 48)
         topBar.addView(flashIcon, LinearLayout.LayoutParams(icon, icon))
-        topBar.addView(hdrButton, LinearLayout.LayoutParams(-2, dp(28)).apply { marginStart = dp(2) })
+        (recButton.parent as? android.view.ViewGroup)?.removeView(recButton)
+        if (!landscape) topBar.addView(recButton, LinearLayout.LayoutParams(-2, dp(28)).apply { marginStart = dp(6) })
         topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
         topBar.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -1567,6 +1673,12 @@ class CameraActivity : ComponentActivity() {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        val before = seenConfig
+        seenConfig = android.content.res.Configuration(newConfig)
+        if (before != null && lookChanged(before, newConfig)) {
+            if (capturing) recreatePending = true else recreate()
+            return
+        }
         val generation = viewfinder.surfaceGeneration
         attachLayout()
         coach?.event("turn")
@@ -1811,34 +1923,15 @@ class CameraActivity : ComponentActivity() {
      * What went wrong last time, to copy and send to the developer. After repeated crashes
      * the camera has already been put on safe settings, and says which.
      */
-    private fun showCrashReport(report: org.photoall.film.CrashReport.Report) {
+    private fun showCrashReport(report: org.photoall.film.CrashReport.Report, then: () -> Unit = {}) {
         if (report.safeMode) {
             // the heavy paths off: zero-lag HDR (RAW kept in memory), flash, a large develop
             store[Settings.HDR] = 0f
             store[Settings.FLASH] = 0f
             store[Settings.LONG_EDGE] = 1f
         }
-        val text = TextView(this).apply {
-            this.text = report.text
-            textSize = 11f
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextIsSelectable(true)
-            setPadding(dp(20), dp(8), dp(20), dp(8))
-        }
-        val lead = (if (report.fatal) "抱歉。" else "应用已自动恢复，但这些错误值得修好。") +
-            "把下面这份报告复制给开发者（GitHub Issues，或小红书 / 抖音私信），能帮我们在这台手机上修好它。报告只含机型、系统与出错位置，不含照片。" +
-            if (report.safeMode) "\n\n连续意外退出了两次，已切换到安全设置：关闭 HDR 与闪光，冲洗尺寸改为 3072。可在参数里改回。" else ""
-        android.app.AlertDialog.Builder(this)
-            .setTitle(report.title)
-            .setMessage(lead)
-            .setView(android.widget.ScrollView(this).apply { addView(text) })
-            .setPositiveButton("复制报告") { _, _ ->
-                val clip = getSystemService(android.content.ClipboardManager::class.java)
-                clip.setPrimaryClip(android.content.ClipData.newPlainText("Photo All 问题报告", report.text))
-                status.text = "报告已复制"
-            }
-            .setNegativeButton("忽略", null)
-            .show()
+        org.photoall.film.ui.CrashReportSheet.show(this, report,
+            onCopied = { status.text = "报告已复制" }, onClosed = then)
     }
 
     /** A thread died and the app went on: start again what it was running. */
@@ -1996,7 +2089,6 @@ class CameraActivity : ComponentActivity() {
     }
 
     private var shownFlash = -1
-    private var shownHdr: Boolean? = null
 
     /** A control whose state just changed gives a small spring (the flash bolt also tilts). */
     private fun pop(v: View, tilt: Boolean = false) {
@@ -2283,10 +2375,18 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onResume() {
+        org.photoall.film.ui.CartridgeSprites.attach(this) // the 3D cartridges are drawn in this screen's window
         super.onResume()
         // back from a portrait-only screen: return to the layout the user had
         if (requestedOrientation != chosenOrientation) requestedOrientation = chosenOrientation
         viewfinder.onResume()
+        applyFinderTone()
+        // 拍摄录屏 stopping by itself (the system, an encoder that can't do 2K): say why
+        org.photoall.film.reel.Reel.listener = { st ->
+            syncRecButton()
+            if (!st.running && st.detail.isNotEmpty()) status.text = st.detail
+        }
+        syncRecButton()
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
         loadLatestThumbnail()
         // the first time, the tour (once the camera may run and the layout has settled)
@@ -2299,15 +2399,51 @@ class CameraActivity : ComponentActivity() {
         val reopen = zslPaused
         zslPaused = false
         if (reopen && !settingsOpen) bindCamera()
+        // the system's "remove animations": no ambient motion, no transitions
+        org.photoall.film.ui.Skin.calm = android.provider.Settings.Global.getFloat(contentResolver,
+            android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
+        runSkin(true)
+        // after a change of theme: the old screen leaves in the new theme's manner
+        org.photoall.film.ui.Skin.lastFrame?.let { old ->
+            org.photoall.film.ui.Skin.lastFrame = null
+            // the new viewfinder starts as the same frosted glass the old one left as
+            overlay.frost = org.photoall.film.ui.Skin.lastFinder
+            overlay.frostAlpha = 1f
+            org.photoall.film.ui.Skin.lastFinder = null
+            var revealed = false
+            var framed = false
+            fun clear() {
+                if (!revealed || !framed) return
+                android.animation.ValueAnimator.ofFloat(1f, 0f).apply {
+                    duration = 520
+                    startDelay = 60
+                    interpolator = android.view.animation.DecelerateInterpolator(1.4f)
+                    addUpdateListener { overlay.frostAlpha = it.animatedValue as Float }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationEnd(animation: android.animation.Animator) { overlay.frost = null; overlay.frostAlpha = 0f }
+                    })
+                }.start()
+            }
+            viewfinder.onFrame = { main.postDelayed({ framed = true; clear() }, 120) }
+            main.postDelayed({ if (!framed) { framed = true; clear() } }, 3000) // no camera: don't stay frosted
+            val reveal = org.photoall.film.ui.ThemeReveal(this, old)
+            addContentView(reveal, android.view.ViewGroup.LayoutParams(-1, -1))
+            reveal.play {
+                (reveal.parent as? android.view.ViewGroup)?.removeView(reveal)
+                revealed = true
+                clear()
+            }
+        }
         if (settingsOpen && store[Settings.THEME] != themeShown) {
             // Every view was built in the old colours: build the screen again.
             settingsOpen = false
-            recreate()
+            captureForTheme { recreate() }
             return
         }
         if (settingsOpen) {
             // The settings screen wrote straight to storage; catch up with everything.
             settingsOpen = false
+            applyFinderTone()
             if (reopen || bindKeys() != bindSnapshot) bindCamera() else applyCameraOptions()
             main.post(rebake)
             updateLabels()
@@ -2321,6 +2457,7 @@ class CameraActivity : ComponentActivity() {
             zsl = null
             zslPaused = true
         }
+        runSkin(false)
         orientationListener.disable()
         main.removeCallbacks(hideRotate)
         rotateButton.dismiss()
@@ -2329,6 +2466,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        org.photoall.film.ui.CartridgeSprites.detach(this)
+        runCatching { getSystemService(android.hardware.camera2.CameraManager::class.java).unregisterAvailabilityCallback(availability) }
         if (org.photoall.film.CrashReport.onRecovered != null) org.photoall.film.CrashReport.onRecovered = null
         analysisThread.shutdown()
         engineThread.execute { engine?.close() } // before shutdown: always accepted
@@ -2337,7 +2476,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     /** Settings that need the camera rebound rather than just new request options. */
-    private fun bindKeys() = listOf(store[Settings.RAW], store[Settings.SOFT_3A], if (zslWanted()) 1f else 0f)
+    private fun bindKeys() = listOf(store[Settings.RAW], store[Settings.SOFT_3A], if (zslWanted()) 1f else 0f,
+        if (zslWanted()) store[Settings.HDR] else 0f) // the Camera2 session streams RAW for HDR, asks for it otherwise
 
     private fun openSettings() {
         coach?.event("settings")
@@ -2349,6 +2489,7 @@ class CameraActivity : ComponentActivity() {
     // ----- settings ---------------------------------------------------------
 
     private fun onSettingChanged(key: String) {
+        applyFinderTone()
         updateLabels()
         sheetRefresh?.invoke(key)
         when {
@@ -2404,8 +2545,8 @@ class CameraActivity : ComponentActivity() {
             runOnUiThread { status.text = "预览失败：${e.message}" }
             return
         }
-        viewfinder.setLut(lut, 33)
-        lastLut = lut
+        lastLut = lut // the histogram reads the film's look; the viewfinder shows it when chosen
+        runOnUiThread { applyFinderTone() }
         meter?.setLut(lut, 33)
         Log.i(TAG, "preview lut: %.1f ms".format((System.nanoTime() - start) / 1e6))
     }
@@ -2504,8 +2645,15 @@ class CameraActivity : ComponentActivity() {
 
     private fun zslWanted(): Boolean {
         val flash = store[Settings.FLASH].toInt()
-        return store.flag(Settings.HDR) && store.flag(Settings.RAW) && (flash == 0 || flash == Settings.FLASH_STEADY)
+        if (!store.flag(Settings.RAW) || !(flash == 0 || flash == Settings.FLASH_STEADY)) return false
+        return store.flag(Settings.HDR) || rawByCamera2()
     }
+
+    /**
+     * RAW straight from Camera2 (the zero-lag session, one frame) instead of CameraX's
+     * still capture: on a phone where CameraX's RAW request never reached the camera.
+     */
+    private fun rawByCamera2() = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_camera2", false)
 
     /**
      * HDR: the lens through a zero-lag Camera2 session (RAW frames kept in memory), the
@@ -2522,7 +2670,8 @@ class CameraActivity : ComponentActivity() {
             applyHistogram(m)
         }
         lateinit var session: ZslCamera
-        session = ZslCamera(this, id, full, controller, previewMeter) { message, refused ->
+        // HDR merges the ring of streamed frames; a single RAW asks for one still on demand
+        session = ZslCamera(this, id, full, controller, previewMeter, onError = { message, refused ->
             main.post {
                 if (zsl !== session) return@post
                 org.photoall.film.CrashReport.note(this@CameraActivity, "零延迟 RAW 会话失败（镜头 $id）", IllegalStateException(message))
@@ -2533,7 +2682,7 @@ class CameraActivity : ComponentActivity() {
                 status.text = "$message · HDR 改用普通连拍"
                 bindCamera()
             }
-        }
+        }, onDemand = !store.flag(Settings.HDR))
         zsl = session
         org.photoall.film.CrashReport.stage(this, "打开零延迟 RAW 相机 $id · ${session.rawSize} × ${session.keep} 帧")
         val sensor = full.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
@@ -2541,8 +2690,12 @@ class CameraActivity : ComponentActivity() {
         viewfinder.sensorRotation = sensor
         viewfinder.frontFacing = full.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
         controller.sensorRotation = rotation
-        setUnder(store[Settings.HDR_UNDER].toDouble().coerceAtMost(1.0))
+        setUnder(if (store.flag(Settings.HDR)) store[Settings.HDR_UNDER].toDouble().coerceAtMost(1.0) else 0.0)
         viewfinder.provideDirect(session.previewSize, rotation) { surface -> session.open(surface) }
+        main.postDelayed({
+            if (zsl === session && session.state == "等取景画面") org.photoall.film.CrashReport.note(this,
+                "零延迟 RAW 会话失败（镜头 $id）", IllegalStateException("取景画面 6 秒没交给 Camera2"))
+        }, 6000)
         pendingZoom?.let { session.zoomTo(it) }
         pendingZoom = null
         overlay.hideFocus()
@@ -2575,7 +2728,7 @@ class CameraActivity : ComponentActivity() {
     private fun adaptUnder() {
         val m = meter ?: return
         val c = exposure ?: return
-        if (zsl == null) return
+        if (zsl == null || !store.flag(Settings.HDR)) return
         val now = SystemClock.uptimeMillis()
         // Every change restarts the camera's repeating request (a hitch in the viewfinder):
         // only for a third of a stop or more, at most every 1.5 s.
@@ -2608,15 +2761,174 @@ class CameraActivity : ComponentActivity() {
         val all = lenses(provider)
         // The remembered lens, else the main camera (not a macro or depth helper).
         all.firstOrNull { Camera2CameraInfo.from(it).cameraId == lensId }?.let { return it }
+        // the lens in use just left the system's list (its driver restarting): wait for it a
+        // few seconds rather than take another lens
+        val gone = lastBoundId
+        if (gone != null && all.none { Camera2CameraInfo.from(it).cameraId == gone } && lensWaits < 8) {
+            lensWaits++
+            trail("镜头 $gone 不在系统列表里，等它回来（$lensWaits）")
+            status.text = "相机驱动正在重启，稍等…"
+            main.postDelayed({ if (!isFinishing) bindCamera() }, 1000)
+            return null
+        }
+        lensWaits = 0
         return mainCamera(all)
     }
+    private var lastBoundId: String? = null
+    private var lensWaits = 0
 
+    /**
+     * The camera as it really is, not as bound. On an OPPO (MediaTek, Android 17) the main
+     * camera left the system's list at start and came back a moment later; CameraX made a
+     * new camera for it while our use cases stayed on the old one, which never opened, and
+     * a shot then waited forever ("useCaseCamera is null"). So: the state is written down,
+     * a camera not open a few seconds after binding is bound again, and so is one that
+     * comes back into the system's list while ours is not open.
+     */
+    private val CAMERA_REMOVED = 8
+    private var boundAt = 0L
+    private var reopenTries = 0
+    private var lastStateText = ""
+
+    private fun describe(state: CameraState?): String {
+        if (state == null) return "未知"
+        val type = when (state.type) {
+            CameraState.Type.PENDING_OPEN -> "等待可用"
+            CameraState.Type.OPENING -> "正在打开"
+            CameraState.Type.OPEN -> "已打开"
+            CameraState.Type.CLOSING -> "正在关闭"
+            CameraState.Type.CLOSED -> "已关闭"
+        }
+        val error = state.error?.let { e ->
+            when (e.code) {
+                CameraState.ERROR_CAMERA_IN_USE -> "被其他应用占用"
+                CameraState.ERROR_MAX_CAMERAS_IN_USE -> "同时打开的相机太多"
+                CameraState.ERROR_OTHER_RECOVERABLE_ERROR -> "可恢复的错误"
+                CameraState.ERROR_STREAM_CONFIG -> "输出流配置失败"
+                CameraState.ERROR_CAMERA_DISABLED -> "相机被系统禁用"
+                CameraState.ERROR_CAMERA_FATAL_ERROR -> "相机致命错误"
+                CameraState.ERROR_DO_NOT_DISTURB_MODE_ENABLED -> "勿扰模式"
+                CAMERA_REMOVED -> "相机从系统里消失：驱动重启"
+                else -> "错误 ${e.code}"
+            }
+        }
+        return type + (error?.let { "（$it）" } ?: "")
+    }
+
+    private var shutterAt = 0L
+    private var shutterRaw = false
+    private var crashSeen = false
+
+    /**
+     * The camera vanished from the system right after a RAW request (CameraState error 8,
+     * the list of cameras empty, the lens back seconds later): the driver restarted on it.
+     * Once: the plainest request (no shading map, no tone curve) next time. Twice: this lens
+     * cannot take RAW on this phone, and shoots JPEG. Either way the shot ends now.
+     */
+    private fun rawCrashed(id: String) {
+        if (crashSeen) return
+        crashSeen = true
+        val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+        val plain = quirks.getBoolean("raw_plain_$id", false)
+        trail(if (plain) "最简参数的 RAW 也让驱动重启了：这颗镜头改 JPEG" else "RAW 让相机驱动重启：下次用最简参数")
+        if (!plain) quirks.edit().putBoolean("raw_plain_$id", true).apply()
+        else quirks.edit().putBoolean("raw_unusable_$id", true).apply()
+        org.photoall.film.CrashReport.note(this, "拍 RAW 时相机驱动重启（镜头 $id）", IllegalStateException(trailText()))
+        status.text = if (!plain) "相机驱动在拍 RAW 时重启了，已改用最简拍摄参数，等相机回来后再按一次快门"
+            else "这台手机的相机驱动拍 RAW 会重启，这颗镜头已改用 JPEG"
+        activeWatch?.fireNow()
+    }
+
+    private fun cameraOpen() = camera?.cameraInfo?.cameraState?.value?.type == CameraState.Type.OPEN
+
+    private fun watchCameraState(bound: androidx.camera.core.Camera, id: String) {
+        boundAt = SystemClock.uptimeMillis()
+        bound.cameraInfo.cameraState.observe(this) { state ->
+            if (camera !== bound) return@observe
+            val text = "相机 $id ${describe(state)}"
+            if (text != lastStateText) {
+                lastStateText = text
+                trail(text)
+                Log.i(TAG, "camera state: $text")
+                org.photoall.film.CrashReport.stage(this, text)
+            }
+            if (state.error?.code == CAMERA_REMOVED && shutterRaw && SystemClock.uptimeMillis() - shutterAt < 3000) rawCrashed(id)
+            if (state.type == CameraState.Type.OPEN) reopenTries = 0
+            else if (state.error?.code == CameraState.ERROR_CAMERA_IN_USE || state.error?.code == CameraState.ERROR_MAX_CAMERAS_IN_USE)
+                status.text = "相机被其他应用或系统占用，空出来后会自动接上"
+        }
+        // not open a while after binding: bound again (the camera it waits for may be a stale
+        // one). A camera still OPENING is on its way (some phones take seconds the first time,
+        // a nubia Red Magic among them): it is given up to 12 s before anything is done.
+        checkOpened(bound, id, 0)
+    }
+
+    private fun checkOpened(bound: androidx.camera.core.Camera, id: String, waited: Int) {
+        main.postDelayed({
+            // a screen in the background has its camera closed on purpose: nothing to check
+            if (camera !== bound || isFinishing || cameraOpen() ||
+                !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return@postDelayed
+            val now = bound.cameraInfo.cameraState.value
+            val state = describe(now)
+            if (now?.type == CameraState.Type.OPENING && now.error == null && waited < 2) {
+                trail("相机 $id 还在打开，再等 4 秒")
+                return@postDelayed checkOpened(bound, id, waited + 1)
+            }
+            if (reopenTries++ < 3) {
+                org.photoall.film.CrashReport.note(this, "相机绑定后 ${4 * (waited + 1)} 秒没打开（$state），重新连接",
+                    IllegalStateException(trailText()))
+                bindCamera()
+            } else status.text = "相机打不开（$state），请关掉其他用相机的应用后重开本应用"
+        }, 4000)
+    }
+
+    /** The system's list of cameras: a camera back in it while ours is not open is bound again. */
+    private val availability = object : android.hardware.camera2.CameraManager.AvailabilityCallback() {
+        override fun onCameraAvailable(id: String) {
+            main.post {
+                val ours = boundInfo?.let { Camera2CameraInfo.from(it).cameraId } ?: return@post
+                if (id != ours || zsl != null || isFinishing ||
+                    !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return@post
+                if (cameraOpen() || SystemClock.uptimeMillis() - boundAt < 1500) return@post
+                Log.i(TAG, "camera $id available again while ours is ${describe(camera?.cameraInfo?.cameraState?.value)}: rebind")
+                org.photoall.film.CrashReport.stage(this@CameraActivity, "相机 $id 重新可用，重新连接")
+                bindCamera()
+            }
+        }
+    }
+
+    /** The camera's recent story (binds and why, state changes, shots), for the reports. */
+    private val camTrail = ArrayDeque<String>()
+    private fun trail(what: String) {
+        camTrail.addLast(SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date()) + " " + what)
+        while (camTrail.size > 16) camTrail.removeFirst()
+    }
+    private fun trailText() = "相机时间线：\n" + camTrail.joinToString("\n")
+    private var rebindPending: String? = null
+
+    /**
+     * Binds the camera again, unless a shot is in flight: a rebind closes the camera under
+     * it (ImageCaptureException: Camera is closed, OPPO). Then it waits for the shot to
+     * end. Each one is written down with where it came from.
+     */
     private fun bindCamera() {
+        val from = Throwable().stackTrace.getOrNull(1)?.let { "${it.methodName.substringBefore('$')}:${it.lineNumber}" } ?: "?"
+        if (capturing) {
+            rebindPending = from
+            trail("重连推迟到拍完（来自 $from）")
+            return
+        }
+        trail("重连（来自 $from）")
+        bindCameraNow()
+    }
+
+    private fun bindCameraNow() {
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({ try {
             val provider = future.get().also { provider = it }
-            val info = pickCamera(provider) ?: run { status.text = "没有可用的相机"; return@addListener }
+            val info = pickCamera(provider) ?: run { if (lensWaits == 0) status.text = "没有可用的相机"; return@addListener }
+            lensWaits = 0
             val fourThree = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build()
             // Stills: the largest 4:3 size up to ~26 MP. Many phones (Xiaomi, vivo, OPPO
@@ -2642,7 +2954,9 @@ class CameraActivity : ComponentActivity() {
                 camera?.let { Camera2CameraControl.from(it.cameraControl).setCaptureRequestOptions(options) }
             }.also { c -> c.onLive = { e -> main.post { showLive(e) } } }
             exposure = controller
+            controller.plain = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_plain_${chars.cameraId}", false)
             boundInfo = info
+            lastBoundId = chars.cameraId
             // a phone whose metered flash came back unfired: the LED way from then on (this lens)
             val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
             if (quirks.getBoolean("flash_torch_${chars.cameraId}", false)) controller.flashByTorch = true
@@ -2711,14 +3025,14 @@ class CameraActivity : ComponentActivity() {
             var finalCapture = imageCapture
             val bound = try {
                 org.photoall.film.CrashReport.stage(this, "绑定相机 ${chars.cameraId}${if (rawCapture) " RAW" else ""}")
-                provider.bindToLifecycle(this, info.cameraSelector, preview, imageCapture, analysis)
+                provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, imageCapture, analysis)
             } catch (e: Exception) {
                 Log.w(TAG, "bind: preview + capture + analysis", e)
                 org.photoall.film.CrashReport.note(this, "相机绑定降级：去掉测光分析流（${if (rawCapture) "RAW" else "JPEG"}）", e)
                 provider.unbindAll()
                 analysisCase = null
                 try {
-                    provider.bindToLifecycle(this, info.cameraSelector, preview, imageCapture)
+                    provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, imageCapture)
                 } catch (e2: Exception) {
                     Log.w(TAG, "bind: preview + capture", e2)
                     org.photoall.film.CrashReport.note(this, "相机绑定降级：RAW 改为 JPEG", e2)
@@ -2727,7 +3041,7 @@ class CameraActivity : ComponentActivity() {
                     finalCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                         .setResolutionSelector(stillSize).build()
                     try {
-                        provider.bindToLifecycle(this, info.cameraSelector, preview, finalCapture).also {
+                        provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, finalCapture).also {
                             status.text = "这颗镜头不支持 RAW 与预览同时输出，改用 JPEG"
                         }
                     } catch (e3: Exception) {
@@ -2740,6 +3054,7 @@ class CameraActivity : ComponentActivity() {
             }
             camera = bound
             capture = finalCapture
+            watchCameraState(bound, chars.cameraId)
             viewfinder.sensorRotation = bound.cameraInfo.sensorRotationDegrees
             viewfinder.frontFacing = bound.cameraInfo.lensFacing == CameraSelector.LENS_FACING_FRONT
             // Metering regions map from the viewfinder as currently rotated (landscape too).
@@ -3090,17 +3405,10 @@ class CameraActivity : ComponentActivity() {
         if (manual) showManual()
         val flashMode = flashMode()
         val hdr = store.flag(Settings.HDR) && rawCapture && (flashMode == 0 || flashMode == Settings.FLASH_STEADY)
-        // Top bar: the HDR chip (outlined in the accent when on), the flash icon, histogram.
-        val bracket = store[Settings.HDR_LONG] >= 0.1f
-        val shorts = store[Settings.HDR_FRAMES].toInt().coerceIn(2, if (bracket) 5 else 6)
-        hdrButton.text = if (hdr) (if (bracket) "HDR $shorts+1" else "HDR $shorts") else "HDR"
-        hdrButton.setTextColor(if (hdr) Style.ACCENT else Style.TEXT_2)
-        hdrButton.background = Style.surface(this, fill = Color.TRANSPARENT, radiusDp = 14f, stroke = if (hdr) Style.ACCENT else Style.HAIRLINE)
+        // Top bar: the flash icon, histogram (HDR+ is set in the settings only).
         val onBody = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         if (shownFlash != -1 && shownFlash != flashMode) pop(flashIcon, tilt = true)
-        if (shownHdr != null && shownHdr != hdr) pop(hdrButton)
         shownFlash = flashMode
-        shownHdr = hdr
         flashIcon.setImageDrawable(Icon(if (flashMode == 0) Icon.Kind.FLASH_OFF else Icon.Kind.FLASH,
             if (flashMode != 0) (if (onBody) Toy.AMBER else Style.ACCENT) else if (onBody) Toy.INK else Style.TEXT))
         flashIcon.contentDescription = "闪光：${Settings.flashModes[flashMode]}"
@@ -3135,11 +3443,97 @@ class CameraActivity : ComponentActivity() {
 
     /** A capture (single frame or burst) is running; the shutter waits for it. */
     private var capturing = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (value) cameraLife.hold() else cameraLife.release()
+            // a change of look that came during the shot (dark mode, display size, font):
+            // the screen is made anew now that the shot is safe
+            if (!value && recreatePending) main.post { if (!isFinishing && !isDestroyed) recreate() }
+            if (!value) rebindPending?.let { from ->
+                rebindPending = null
+                main.post { if (!isFinishing && !isDestroyed && !capturing) { trail("拍完，执行推迟的重连（来自 $from）"); bindCameraNow() } }
+            }
+        }
+
+    /**
+     * Changes the system would relaunch the screen for (dark mode, display size, font size,
+     * language, a fold): handled here instead, so a relaunch never closes the camera on a
+     * shot still being taken (ImageCaptureException: Camera is closed, OPPO). The screen is
+     * recreated by hand, at once, or once the shot in flight is saved.
+     */
+    private var seenConfig: android.content.res.Configuration? = null
+    private var recreatePending = false
+
+    private fun lookChanged(old: android.content.res.Configuration, new: android.content.res.Configuration): Boolean {
+        val c = old.diff(new)
+        val look = android.content.pm.ActivityInfo.CONFIG_UI_MODE or android.content.pm.ActivityInfo.CONFIG_DENSITY or
+            android.content.pm.ActivityInfo.CONFIG_FONT_SCALE or android.content.pm.ActivityInfo.CONFIG_LOCALE or
+            android.content.pm.ActivityInfo.CONFIG_LAYOUT_DIRECTION or android.content.pm.ActivityInfo.CONFIG_COLOR_MODE
+        return c and look != 0
+    }
+
+    /**
+     * CameraX's lifecycle: the activity's, except that it stays started while a shot is still
+     * being taken. Leaving the app (or the screen) mid-shot then lets the shot finish and be
+     * saved, instead of the camera closing on it (ImageCaptureException: Camera is closed).
+     */
+    private inner class CameraLife : androidx.lifecycle.LifecycleOwner {
+        private val registry = androidx.lifecycle.LifecycleRegistry(this)
+        override val lifecycle: androidx.lifecycle.Lifecycle get() = registry
+        private var holds = 0
+        private var wanted = androidx.lifecycle.Lifecycle.State.INITIALIZED
+
+        init {
+            this@CameraActivity.lifecycle.addObserver(androidx.lifecycle.LifecycleEventObserver { _, event ->
+                wanted = event.targetState
+                apply()
+            })
+        }
+
+        fun hold() { holds++ }
+
+        fun release() {
+            holds = maxOf(0, holds - 1)
+            apply()
+        }
+
+        private fun apply() {
+            if (registry.currentState == androidx.lifecycle.Lifecycle.State.DESTROYED) return
+            val target = if (holds > 0 && wanted != androidx.lifecycle.Lifecycle.State.DESTROYED &&
+                !wanted.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) androidx.lifecycle.Lifecycle.State.STARTED else wanted
+            if (target != androidx.lifecycle.Lifecycle.State.INITIALIZED) registry.currentState = target
+        }
+    }
+
+    private val cameraLife by lazy { CameraLife() }
 
     private fun takePicture() {
+        trail("按快门（相机${describe(camera?.cameraInfo?.cameraState?.value)}${if (rawCapture) " · RAW" else ""}${if (exposure?.plain == true) " · 最简参数" else ""}）")
+        shutterAt = SystemClock.uptimeMillis()
+        shutterRaw = rawCapture && zsl == null
+        if (zsl == null && camera != null && !cameraOpen()) {
+            val state = describe(camera?.cameraInfo?.cameraState?.value)
+            status.text = "相机还没连上（$state），正在重新连接，请稍后再按"
+            haptics.play(Haptics.Event.LIMIT)
+            org.photoall.film.CrashReport.note(this, "按快门时相机没打开（$state）", IllegalStateException(lastStateText))
+            bindCamera()
+            return
+        }
+        if (filmBodyActive()) {
+            if (!bodyPrefs.getBoolean("loaded", false)) { showFilmWall(); return }
+            if (bodyPrefs.getInt("frame", 1) > 36) { haptics.play(Haptics.Event.LIMIT); status.text = "这卷拍完了：摇三圈倒片摇把"; return }
+            if (!bodyPrefs.getBoolean("cocked", true)) {
+                haptics.play(Haptics.Event.LIMIT)
+                status.text = "快门未上弦：把过片扳手拖到底"
+                return
+            }
+            bodyPrefs.edit().putBoolean("cocked", false).apply()
+            syncFilmBody()
+        }
         if (pickerOpen) closePicker()
         coach?.event("shot")
-        zsl?.let { if (store.flag(Settings.HDR)) return takeZsl(it) }
+        zsl?.let { return takeZsl(it) }
         val capture = capture ?: return
         if (capturing) {
             status.text = "上一张还在拍摄…"
@@ -3296,8 +3690,9 @@ class CameraActivity : ComponentActivity() {
             }
             val developOptions = options.copy(
                 exposureEv = rawEv + if (key > 0f || singleFlash) 0f else pushBack,
-                // a flash frame is brighter than the viewfinder showed: keep the HAL's exposure
-                matchKey = if (singleFlash) 0f else key,
+                // a flash frame keeps the HAL's exposure where the flash lit it
+                // (it only lifts what the flash left under the viewfinder: "stage match lift")
+                matchKey = key,
                 localTone = if (hdr) store[Settings.HDR_TONE] else 0f,
                 chromaDenoise = store[Settings.CHROMA_NR],
                 rawDenoise = store[Settings.RAW_DENOISE],
@@ -3329,13 +3724,19 @@ class CameraActivity : ComponentActivity() {
             log.put(dev, "分区白平衡 [环境R G B 闪光R G B]", developOptions.flashWhite)
             log.put(dev, "工作尺寸长边", developOptions.maxLongEdge)
             log.put(dev, "颗粒种子", developOptions.seed)
+            lateinit var landed: (ImageCaptureException?) -> Unit
+            val watch = ShotWatch { last -> landed(timedOut(last)); rawStalled(last) }
             val shoot = {
-                captureBurst(capture, files, exposures, 0, torchFrame, flashFrame, armFlash) { error ->
+                captureBurst(capture, files, exposures, 0, torchFrame, flashFrame, armFlash, watch) { error ->
+                    if (watch.end()) landed(error)
+                }
+            }
+            landed = done@{ error ->
                     release()
                     if (error != null) {
                         files.forEach { it.delete() }
                         failed(error)
-                        return@captureBurst
+                        return@done
                     }
                     engineThread.later {
                         // What each frame really got, against what was asked (the diagnosis
@@ -3361,7 +3762,8 @@ class CameraActivity : ComponentActivity() {
                         }
                         finish(stamp, recipe, quality, kind, shot, log) {
                             try {
-                                engine().developDng(files.map { it.path }, params, developOptions).also {
+                                engine().developDng(files.map { it.path },
+                                    if (singleFlash) params + ("stage match lift" to 1f) else params, developOptions).also {
                                     if (keepRaw) Photos.saveDng(this@CameraActivity, files[developed], "FILM_$stamp.dng", store.flag(Settings.PRIVATE_PHOTOS))
                                 }
                             } finally {
@@ -3369,17 +3771,28 @@ class CameraActivity : ComponentActivity() {
                             }
                         }
                     }
-                }
             }
             main.postDelayed(shoot, settle)
         } else {
             // manual flash: the LED lights first and gets a couple of frames to reach full strength
             val torchWait = if (manualFlash) controller?.manual?.let { 200 + 2 * it.timeNs / 1_000_000 } ?: 600L else 0L
             if (manualFlash) controller?.lightTorch(true)
+            val watch = ShotWatch { last -> release(); failed(timedOut(last)); bindCamera() }
+            val wait = 8000L + 3 * frameMs(controller?.manual)
             main.postDelayed({
+                watch.step("拍摄：请求 JPEG", wait)
                 capture.takePicture(engineThread, object : ImageCapture.OnImageCapturedCallback() {
-                    override fun onCaptureStarted() = exposureStarted(frameMs(controller?.manual), last = true)
+                    override fun onCaptureStarted() {
+                        main.post { watch.step("拍摄：JPEG 开始曝光", wait) }
+                        exposureStarted(frameMs(controller?.manual), last = true)
+                    }
                     override fun onCaptureSuccess(image: ImageProxy) {
+                        // posted to the main thread, where the guard lives
+                        val mine = java.util.concurrent.CountDownLatch(1)
+                        var ours = false
+                        main.post { ours = watch.end(); mine.countDown() }
+                        mine.await()
+                        if (!ours) { image.close(); return }
                         release()
                         val shot = jpegShot(image)?.let { it.copy(focal35 = it.focal35 ?: focal35) }
                         finish(stamp, recipe, quality, if (singleFlash) "JPEG · 闪光" else if (steadyLight) "JPEG · 补光" else "JPEG", shot, log) {
@@ -3387,8 +3800,11 @@ class CameraActivity : ComponentActivity() {
                         }
                     }
                     override fun onError(exception: ImageCaptureException) {
-                        release()
-                        failed(exception)
+                        main.post {
+                            if (!watch.end()) return@post
+                            release()
+                            failed(exception)
+                        }
                     }
                 })
             }, settle + torchWait)
@@ -3424,14 +3840,15 @@ class CameraActivity : ComponentActivity() {
         status.text = "${work()}中（$developing 张）…"
         val controller = exposure
         val ring = controller?.live // the frames' exposure (under the meter)
+        val hdr = store.flag(Settings.HDR)
         val longStops = store[Settings.HDR_LONG].toDouble()
-        val long = if (longStops >= 0.1 && ring != null && controller != null) controller.longExposure(ring, longStops) else null
+        val long = if (hdr && longStops >= 0.1 && ring != null && controller != null) controller.longExposure(ring, longStops) else null
         val key = meter?.key ?: 0f // as the viewfinder showed it
         val focal35 = boundInfo?.let { (equivalentMm(it) * session.zoom).roundToInt().takeIf { mm -> mm > 0 } }
         val log = ShotLog()
         log.put("拍摄", "时间", stamp)
         log.put("拍摄", "格式", "RAW（DNG）冲洗")
-        log.put("拍摄", "模式", "HDR（零延迟连拍）")
+        log.put("拍摄", "模式", if (hdr) "HDR（零延迟连拍）" else "单张（Camera2 直接取 RAW）")
         log.put("拍摄", "拍摄前压暗", "%.2f 档（取景器提亮同样多）".format(Locale.US, controller?.under ?: 0.0))
         meter?.let { m -> log.put("拍摄", "取景器高光 (99.5%) / 过曝比例", "%.3f / %.2f%%".format(Locale.US, m.highlight, 100 * m.clipped)) }
         log.put("拍摄", "连拍帧曝光", ring?.label())
@@ -3445,15 +3862,18 @@ class CameraActivity : ComponentActivity() {
         // The burst length set in the settings; at most six frames reach the merge (five
         // from the ring when a long one follows).
         // (fewer on a phone whose RAW frames are large: the ring keeps fewer)
-        val frames = store[Settings.HDR_FRAMES].toInt().coerceIn(2, maxOf(2, if (long != null) session.keep - 1 else session.keep))
+        val frames = if (!hdr) 1 else store[Settings.HDR_FRAMES].toInt().coerceIn(2, maxOf(2, if (long != null) session.keep - 1 else session.keep))
         haptics.quiet = long != null // the ring frames are already taken; the long one is not
         // Zero lag: the frames were exposed as the button went down. The curtain shuts now
         // and opens after the reference frame's exposure, or after the long frame's.
-        exposureStarted(frameMs(ring), last = long == null)
+        if (session.onDemand) session.stillStarted = { main.post { exposureStarted(frameMs(ring), last = true) } }
+        else exposureStarted(frameMs(ring), last = long == null)
         session.shoot(frames, long, orientation, taken = { main.post { capturing = false; if (!shotClacked) clack() } }) { shot ->
             main.post { capturing = false; if (!shotClacked) clack() }
             if (shot == null) {
-                runOnUiThread { developing--; status.text = "拍摄失败：连拍帧还没准备好，请再按一次"; haptics.play(Haptics.Event.ERROR) }
+                val why = session.stillError
+                if (why != null) org.photoall.film.CrashReport.note(this, "Camera2 RAW 拍摄失败", IllegalStateException(why))
+                runOnUiThread { developing--; status.text = if (why != null) "拍摄失败：$why" else "拍摄失败：连拍帧还没准备好，请再按一次"; haptics.play(Haptics.Event.ERROR) }
                 return@shoot
             }
             log.put("拍摄", "取帧用时", "%d ms（%d 帧%s）".format(Locale.US, SystemClock.uptimeMillis() - started,
@@ -3464,7 +3884,7 @@ class CameraActivity : ComponentActivity() {
             val developOptions = options.copy(
                 exposureEv = rawEv,
                 matchKey = key,
-                localTone = store[Settings.HDR_TONE],
+                localTone = if (hdr) store[Settings.HDR_TONE] else 0f,
                 chromaDenoise = store[Settings.CHROMA_NR],
                 rawDenoise = store[Settings.RAW_DENOISE],
                 frameExposure = shot.exposures,
@@ -3492,10 +3912,24 @@ class CameraActivity : ComponentActivity() {
                     Photos.saveDng(this@CameraActivity, file, "FILM_$stamp.dng", store.flag(Settings.PRIVATE_PHOTOS))
                     file.delete()
                 }
-                val kind = "HDR 零延迟 ${shot.dngs.size} 帧" + if (shot.long) "（含长曝光）" else ""
+                val kind = if (!hdr) "RAW · Camera2" else "HDR 零延迟 ${shot.dngs.size} 帧" + if (shot.long) "（含长曝光）" else ""
                 finish(stamp, recipe, quality, kind, info, log) {
                     try {
-                        engine().developDng(shot.dngs.map { it.handle }, params, developOptions)
+                        try {
+                            engine().developDng(shot.dngs.map { it.handle }, params, developOptions)
+                        } catch (e: RuntimeException) {
+                            if (shot.dngs.size < 2) throw e
+                            // the merge failed on the GPU (an Adreno 619 lost its device on a 6-frame
+                            // burst): the photo is still kept, from the reference frame alone, on a
+                            // fresh engine if the old one's device is gone
+                            org.photoall.film.CrashReport.stage("多帧合成失败，改用单帧：${e.message}")
+                            log.put("冲洗结果", "多帧合成失败", "${e.message}；改用第 1 帧单独冲洗")
+                            if (e.message.orEmpty().let { "VkResult -4" in it || "DEVICE_LOST" in it }) {
+                                runCatching { engine?.close() }
+                                engine = FilmEngine.create(assets)
+                            }
+                            engine().developDng(listOf(shot.dngs[0].handle), params, developOptions)
+                        }
                     } finally {
                         shot.release()
                     }
@@ -3509,20 +3943,113 @@ class CameraActivity : ComponentActivity() {
      * non-null [exposures] entry is held on the sensor first, and the frame is taken once
      * the viewfinder reports it (or after a timeout).
      */
+    /**
+     * One shot's guard. Each step of the shot (frame asked for, exposure started, frame
+     * saved) is written down as the report's last step and re-arms a timer; a camera that
+     * never answers (seen on an OPPO with a MediaTek chip: the shutter moved, no picture
+     * came and every later press was refused) ends the shot after the timer instead of
+     * holding the shutter forever. Whatever comes back from the camera after that is ignored.
+     */
+    private var activeWatch: ShotWatch? = null
+
+    private inner class ShotWatch(private val onTimeout: (String) -> Unit) {
+        private var over = false
+
+        /** The camera is known gone: no point waiting out the timer. */
+        fun fireNow() { main.removeCallbacks(timeout); timeout.run() }
+        private var last = ""
+        private val timeout = Runnable {
+            if (over) return@Runnable
+            over = true
+            org.photoall.film.CrashReport.stage("拍摄超时：$last")
+            onTimeout(last)
+        }
+
+        fun step(what: String, waitMs: Long) {
+            if (over) return
+            activeWatch = this
+            crashSeen = false
+            last = what
+            org.photoall.film.CrashReport.stage(what)
+            main.removeCallbacks(timeout)
+            main.postDelayed(timeout, waitMs)
+        }
+
+        val live get() = !over
+
+        /** True the first time: the shot is this caller's to finish. */
+        fun end(): Boolean {
+            main.removeCallbacks(timeout)
+            if (over) return false
+            over = true
+            return true
+        }
+    }
+
+    /**
+     * A RAW shot the camera never answered (an OPPO with a MediaTek chip, Android 17: the
+     * request sat there, the exposure never started). Stepped down on this lens, kept for
+     * next time: first without the metering stream beside the RAW one (three streams at
+     * once is what some phones drop a RAW request over), then JPEG. Rebinds either way,
+     * which also clears the stuck request.
+     */
+    private fun rawStalled(last: String) {
+        if (crashSeen) { zsl?.close(); zsl = null; bindCamera(); return } // said and handled in rawCrashed
+        val trail = trailText()
+        val state = describe(camera?.cameraInfo?.cameraState?.value)
+        val open = cameraOpen()
+        // what the camera stack said meanwhile: the cause, not just the symptom
+        Thread {
+            val tail = cameraLogTail()
+            org.photoall.film.CrashReport.note(this, "拍摄无回应 · 相机$state · 相机日志（$last）",
+                IllegalStateException(trail + "\n" + if (tail.isEmpty()) "（读不到相机日志）" else tail))
+        }.start()
+        if (open) {
+            // the camera was open and still did not answer a RAW request: RAW through Camera2
+            getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_camera2", true).apply()
+            status.text = "相机开着却没有交回 RAW，已改用 Camera2 直接取 RAW，请再按一次快门"
+        } else status.text = "相机没有真正打开（$state），已重新连接，请再按一次快门"
+        zsl?.close(); zsl = null
+        bindCamera()
+    }
+
+    /** This process's last camera lines from the system log (CameraX, camera-pipe, the HAL's replies). */
+    private fun cameraLogTail(): String = runCatching {
+        val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "4000", "--pid=${android.os.Process.myPid()}"))
+        val tags = listOf("Camera", "camera", "CXCP", "Capture", "Request", "Stream", "Session", "Hal", "HAL", "Oplus", "Mtk", "MTK")
+        val ours = listOf("FilmCamera", "CrashReport", "AndroidRuntime", "\tat ", ": at ", "  at ")
+        proc.inputStream.bufferedReader().readLines()
+            .filter { line -> tags.any { line.contains(it) } && ours.none { line.contains(it) } }
+            .takeLast(28)
+            .joinToString("\n") { line -> line.drop(6).take(170) } // the date off; time, tag and message kept
+    }.getOrDefault("")
+
+    /** A camera that did not answer: the stuck request goes with a fresh binding. */
+    private fun timedOut(last: String) = ImageCaptureException(ImageCapture.ERROR_CAPTURE_FAILED,
+        "相机超时没有交回照片（最后一步：$last），已重新连接相机", null)
+
     private fun captureBurst(capture: ImageCapture, files: List<File>, exposures: List<Exposure?>, index: Int,
                              torchFrame: Int, flashFrame: Int = -1, armFlash: () -> Unit = {},
+                             watch: ShotWatch? = null,
                              done: (ImageCaptureException?) -> Unit) {
         if (index == flashFrame) armFlash()
         if (index >= files.size) return done(null)
         if (files.size > 1) status.text = (if (torchFrame >= 0) "闪光 " else "HDR 连拍 ") + "${index + 1}/${files.size}…"
+        val frame = "第 ${index + 1}/${files.size} 帧 RAW"
+        val wait = 8000L + 3 * frameMs(exposures.getOrNull(index))
         val shoot = {
+            watch?.step("拍摄：请求$frame", wait)
             capture.takePicture(ImageCapture.OutputFileOptions.Builder(files[index]).build(), mainExecutor,
                 object : ImageCapture.OnImageSavedCallback {
-                    override fun onCaptureStarted() =
+                    override fun onCaptureStarted() {
+                        watch?.step("拍摄：$frame 开始曝光", wait)
                         exposureStarted(frameMs(exposures.getOrNull(index)), last = index == files.size - 1)
+                    }
                     override fun onImageSaved(result: ImageCapture.OutputFileResults) {
+                        if (watch?.live == false) return // given up on: no more frames
+                        watch?.step("拍摄：$frame 已保存", wait)
                         if (index == torchFrame) exposure?.lightTorch(false)
-                        captureBurst(capture, files, exposures, index + 1, torchFrame, flashFrame, armFlash, done)
+                        captureBurst(capture, files, exposures, index + 1, torchFrame, flashFrame, armFlash, watch, done)
                     }
                     override fun onError(exception: ImageCaptureException) = done(exception)
                 })
@@ -3932,24 +4459,17 @@ class CameraActivity : ComponentActivity() {
                 onPick = { i -> store[Settings.FLASH] = i.toFloat(); haptics.play(Haptics.Event.SEGMENT) }
             }, LinearLayout.LayoutParams(-1, -2))
             if (!hasFlash) body.addView(sheetNote("这个镜头没有闪光灯"))
-            val hdrOn = store.flag(Settings.HDR)
-            val long = store[Settings.HDR_LONG] >= 0.1f
-            val frames = store[Settings.HDR_FRAMES].toInt().coerceIn(2, if (long) 5 else 6)
             val guides = store[Settings.GUIDES].toInt().coerceIn(0, Settings.guideNames.lastIndex)
             val focus = focusMode()
             body.addView(tileRow(
-                tile("HDR 合成", if (hdrOn) "ON" else "OFF",
-                    if (!rawCapture) "需要在参数里开 RAW" else if (long) "$frames 张 + 1 长曝 · 零延迟" else "$frames 张 · 零延迟", hdrOn) {
-                    store[Settings.HDR] = if (hdrOn) 0f else 1f
-                },
                 tile("对焦", Settings.focusModes[focus], when (focus) { 0 -> "连续自动 · 双击锁定"; 1 -> "点按锁定"; else -> "手动 · 拖动滑杆" }, focus != 0) {
                     cycleFocusMode()
                 },
-            ))
-            body.addView(tileRow(
                 tile("参考线", if (guides == 0) "关" else "开", Settings.guideNames[guides], guides != 0) {
                     stepSetting(Settings.GUIDES, 1)
                 },
+            ))
+            body.addView(tileRow(
                 tile("手动曝光", if (store.flag(Settings.MANUAL)) "ON" else "OFF",
                     if (store.flag(Settings.MANUAL)) "ISO ${Settings.iso(store[Settings.ISO])} · ${Settings.shutterLabel(store[Settings.SHUTTER])}" else "自动测光",
                     store.flag(Settings.MANUAL)) {
@@ -3957,15 +4477,13 @@ class CameraActivity : ComponentActivity() {
                 },
             ))
             body.addView(sheetTitle("取景辅助"))
-            body.addView(android.widget.HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                addView(LinearLayout(this@CameraActivity).apply {
-                    for ((name, key) in listOf("直方图" to Settings.HISTOGRAM, "峰值对焦" to Settings.PEAKING,
-                        "高光保护" to Settings.HIGHLIGHT, "胶片测光" to Settings.SOFT_3A, "按胶片 ISO" to Settings.FILM_ISO))
-                        addView(chip(name, store.flag(key)) { store[key] = if (store.flag(key)) 0f else 1f },
-                            LinearLayout.LayoutParams(-2, dp(36)).apply { marginEnd = dp(8) })
-                })
-            })
+            // the aids wrap onto a second line on a narrow phone rather than run off the edge
+            body.addView(org.photoall.film.ui.FlowRow(this, dp(8), dp(8)).apply {
+                for ((name, key) in listOf("直方图" to Settings.HISTOGRAM, "峰值对焦" to Settings.PEAKING,
+                    "高光保护" to Settings.HIGHLIGHT, "胶片测光" to Settings.SOFT_3A, "按胶片 ISO" to Settings.FILM_ISO))
+                    addView(chip(name, store.flag(key)) { store[key] = if (store.flag(key)) 0f else 1f },
+                        android.view.ViewGroup.LayoutParams(-2, dp(36)))
+            }, LinearLayout.LayoutParams(-1, -2))
             body.addView(switchRow("拍摄时加边框", "另存一张带边框的；样式在相册里点照片的“边框”设计",
                 store.flag(Settings.FRAME_AUTO)) {
                 store[Settings.FRAME_AUTO] = if (store.flag(Settings.FRAME_AUTO)) 0f else 1f
@@ -3973,6 +4491,17 @@ class CameraActivity : ComponentActivity() {
             body.addView(switchRow("同时保存 RAW", "DNG 原片，可重新冲洗", store.flag(Settings.KEEP_RAW)) {
                 store[Settings.KEEP_RAW] = if (store.flag(Settings.KEEP_RAW)) 0f else 1f
             })
+            if (store.flag(Settings.REEL_ON)) body.addView(switchRow("拍摄录屏（2K）",
+                "按快门前 ${store[Settings.REEL_BEFORE].toInt()} 秒到后 ${store[Settings.REEL_AFTER].toInt()} 秒，存成视频，用来展示拍摄过程",
+                org.photoall.film.reel.Reel.state.running) { toggleReel() })
+            body.addView(label(12f).apply { text = "主题"; setTextColor(Style.TEXT_3); setPadding(0, dp(14), 0, dp(6)) })
+            body.addView(org.photoall.film.ui.ThemePicker(this, store[Settings.THEME].toInt()) { index ->
+                if (index.toFloat() != store[Settings.THEME]) {
+                    store[Settings.THEME] = index.toFloat()
+                    sheet.dismissNow()
+                    captureForTheme { recreate() }
+                }
+            }, LinearLayout.LayoutParams(-1, dp(156)))
             body.addView(Button(this).apply {
                 text = "全部参数"
                 Style.textButton(this, 14f)
@@ -4030,7 +4559,7 @@ class CameraActivity : ComponentActivity() {
                 }
             })
             val current = store["film"].toInt()
-            val scroller = android.widget.HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+            val scroller = android.widget.HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt()); isHorizontalScrollBarEnabled = false }
             val strip = LinearLayout(this)
             var chosenView: View? = null
             stocks.forEachIndexed { i, name ->
@@ -4081,7 +4610,7 @@ class CameraActivity : ComponentActivity() {
             // paper: a straight scan, or one of the papers
             body.addView(sheetTitle("相纸"))
             val paper = store["paper"].toInt()
-            body.addView(android.widget.HorizontalScrollView(this).apply {
+            body.addView(android.widget.HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
                 isHorizontalScrollBarEnabled = false
                 addView(LinearLayout(this@CameraActivity).apply {
                     addView(chip("直接扫描", filmOn && !printOn) { store[Settings.PRINT_ON] = 0f },
@@ -4220,7 +4749,7 @@ class CameraActivity : ComponentActivity() {
                 override fun afterTextChanged(e: android.text.Editable?) { query = e?.toString()?.trim() ?: ""; fill() }
             })
         }, LinearLayout.LayoutParams(-1, -2))
-        if (groups.size > 1) head.addView(android.widget.HorizontalScrollView(this).apply {
+        if (groups.size > 1) head.addView(android.widget.HorizontalScrollView(this).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
             isHorizontalScrollBarEnabled = false
             setPadding(0, dp(10), 0, dp(6))
             addView(chips)
@@ -4301,10 +4830,14 @@ class CameraActivity : ComponentActivity() {
             setOnClickListener { haptics.play(Haptics.Event.SEGMENT); onClick() }
         }
 
-    private fun tileRow(a: View, b: View) = LinearLayout(this).apply {
+    private fun tileRow(vararg tiles: View) = LinearLayout(this).apply {
         // wrap the content (large system fonts), at least the design's 76 dp
-        addView(a, LinearLayout.LayoutParams(0, -1, 1f).apply { marginEnd = dp(4) })
-        addView(b, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = dp(4) })
+        tiles.forEachIndexed { i, t ->
+            addView(t, LinearLayout.LayoutParams(0, -1, 1f).apply {
+                if (i > 0) marginStart = dp(4)
+                if (i < tiles.lastIndex) marginEnd = dp(4)
+            })
+        }
         minimumHeight = dp(76)
         layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
     }
@@ -4321,6 +4854,421 @@ class CameraActivity : ComponentActivity() {
         setTextColor(if (on) Style.BG else Style.TEXT_2)
         Style.pressable(this)
         setOnClickListener { haptics.play(Haptics.Event.SEGMENT); onClick() }
+    }
+
+    // ----- 拍摄录屏 and the viewfinder's tone ----------------------------------------------------
+
+    private val reelConsent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val data = result.data
+        if (result.resultCode == RESULT_OK && data != null) {
+            val b = windowManager.currentWindowMetrics.bounds
+            org.photoall.film.reel.Reel.start(this, result.resultCode, data, b.width(), b.height(), resources.displayMetrics.densityDpi)
+        } else status.text = "没有开始录屏"
+    }
+    private val notePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** The film loaded in the 3D camera back (or that scene skipped): the roll is in either way. */
+    private val loadScene = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val index = result.data?.getIntExtra(org.photoall.film.ui.CameraBackActivity.EXTRA_INDEX, -1) ?: -1
+        if (index >= 0) filmWall?.onLoaded?.invoke(index)
+    }
+
+    private fun toggleReel() {
+        val reel = org.photoall.film.reel.Reel
+        if (reel.state.running) {
+            reel.stop(this)
+            return
+        }
+        applyFinderTone()
+        // the notification says when a clip is saved (nothing is drawn on the screen being recorded)
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            notePermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        reelConsent.launch(reel.consentIntent(this))
+    }
+
+    /** The viewfinder's softness and saturation, and the recording's seconds, from the settings. */
+    private fun applyFinderTone() {
+        viewfinder.soften = store[Settings.FINDER_SOFT]
+        viewfinder.saturation = store[Settings.FINDER_SAT]
+        viewfinder.grain = store[Settings.FINDER_GRAIN]
+        viewfinder.exposure = store[Settings.FINDER_EV]
+        viewfinder.setLut(if (store.flag(Settings.FINDER_LUT)) lastLut else null, 33)
+        syncRecButton()
+        org.photoall.film.reel.Reel.before = store[Settings.REEL_BEFORE]
+        org.photoall.film.reel.Reel.after = store[Settings.REEL_AFTER]
+    }
+
+    /** 录屏: a pill with a dot, red while recording. */
+    private val recButton by lazy {
+        TextView(this).apply {
+            text = "● 录屏"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setPadding(dp(10), 0, dp(10), 0)
+            contentDescription = "拍摄录屏：开启后每次按快门保存前后的视频"
+            setOnClickListener { toggleReel() }
+            syncRecButton(this)
+        }
+    }
+
+    private fun syncRecButton(b: TextView = recButton) {
+        val allowed = store.flag(Settings.REEL_ON)
+        b.visibility = if (allowed) View.VISIBLE else View.GONE
+        // turned off while recording: stop it
+        if (!allowed && org.photoall.film.reel.Reel.state.running) org.photoall.film.reel.Reel.stop(this)
+        val on = org.photoall.film.reel.Reel.state.running
+        b.text = if (on) "● 录屏中" else "● 录屏"
+        b.setTextColor(if (on) 0xffffffff.toInt() else Style.TEXT)
+        b.background = Style.surface(this, fill = if (on) 0xffd23a2a.toInt() else Color.TRANSPARENT, radiusDp = 14f,
+            stroke = if (on) 0 else Style.HAIRLINE)
+    }
+
+    private fun filmBodyActive() = org.photoall.film.ui.Skin.kind == org.photoall.film.ui.Skin.CAMERA &&
+        resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+
+    // ----- the landscape film body (相机拟物) -----------------------------------------------------
+
+    private val bodyPrefs by lazy { getSharedPreferences("filmbody", MODE_PRIVATE) }
+    private val asaSteps = listOf(0, 3, 6, 9, 12, 15, 18) // ISO 100 .. 6400 in the store's thirds
+    private val lensBarrel by lazy {
+        org.photoall.film.ui.LensBarrel(this).apply {
+            aperture = bodyPrefs.getInt("aperture", 4)
+            onTick = { strong -> haptics.play(if (strong) Haptics.Event.STOP else Haptics.Event.TICK) }
+            onAperture = { i -> bodyPrefs.edit().putInt("aperture", i).apply(); applyBodyExposure() }
+            onFocus = { pos -> applyBodyFocus(pos) }
+        }
+    }
+    private val rewindCrank by lazy {
+        org.photoall.film.ui.RewindCrank(this).apply {
+            onTurn = {
+                haptics.play(Haptics.Event.TICK)
+                turns += 1
+                if (turns >= 3) {
+                    // the roll is back in its cartridge: a fresh one is loaded, wound to frame 1
+                    turns = 0
+                    // the roll is back in its cartridge: to the wall for the next one
+                    bodyPrefs.edit().putBoolean("loaded", false).apply()
+                    haptics.play(Haptics.Event.STOP)
+                    showFilmWall()
+                }
+            }
+        }
+    }
+    private val cartridge by lazy { org.photoall.film.ui.Cartridge(this).apply { onTap = { showFilmWall() } } }
+    private val lightMeter by lazy { org.photoall.film.ui.LightMeter(this) }
+    private val speedDial by lazy {
+        org.photoall.film.ui.SpeedDial(this).apply {
+            onTick = { strong -> haptics.play(if (strong) Haptics.Event.LIMIT else Haptics.Event.TICK) }
+            onSpeed = { i ->
+                if (!store.flag(Settings.MANUAL)) applyBodyExposure() // the first turn takes exposure off automatic
+                store[Settings.SHUTTER] = (9 + 3 * i).toFloat()
+            }
+            onAsa = {
+                val next = (bodyPrefs.getInt("asa", 2) + 1) % asaSteps.size
+                bodyPrefs.edit().putInt("asa", next).apply()
+                haptics.play(Haptics.Event.TICK)
+                applyBodyExposure()
+            }
+        }
+    }
+    private val frameCounter by lazy { org.photoall.film.ui.FrameCounter(this) }
+    private val windLever by lazy {
+        org.photoall.film.ui.WindLever(this).apply {
+            onTick = { strong -> haptics.play(if (strong) Haptics.Event.STOP else Haptics.Event.TICK) }
+            onWound = {
+                val frame = bodyPrefs.getInt("frame", 1)
+                if (frame >= 36) status.text = "这卷 36 张拍完了：摇三圈倒片摇把"
+                else {
+                    bodyPrefs.edit().putInt("frame", frame + 1).putBoolean("cocked", true).apply()
+                    cartridge.wind()
+                    syncFilmBody()
+                }
+            }
+        }
+    }
+    private var meterShownAt = 0L
+
+    /**
+     * Before the screen is rebuilt in a new theme: the viewfinder frosts over, and the screen as
+     * it is (frost and all) is kept for the new theme's entrance to take away.
+     */
+    private fun captureForTheme(then: () -> Unit) {
+        val vw = viewfinder.width
+        val vh = viewfinder.height
+        var went = false
+        fun go(still: android.graphics.Bitmap?) {
+            if (went) return
+            went = true
+            val frost = still?.let { frosted(it) }
+            // frosting the glass on the old screen first, so the entrance starts from it
+            overlay.frost = frost
+            overlay.frostAlpha = 1f
+            overlay.invalidate()
+            main.post {
+                org.photoall.film.ui.Skin.capture(window.decorView)
+                // the surface draws nothing in a capture: paint the frost where the glass is
+                val shot = org.photoall.film.ui.Skin.lastFrame
+                if (shot != null && frost != null) {
+                    val at = IntArray(2)
+                    viewfinderFrame.getLocationInWindow(at)
+                    android.graphics.Canvas(shot).drawBitmap(frost, null,
+                        android.graphics.RectF(at[0] / 2f, at[1] / 2f, (at[0] + viewfinderFrame.width) / 2f, (at[1] + viewfinderFrame.height) / 2f),
+                        android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+                }
+                org.photoall.film.ui.Skin.lastFinder = frost
+                then()
+            }
+        }
+        if (vw > 0 && vh > 0 && !org.photoall.film.ui.Skin.calm) {
+            val still = android.graphics.Bitmap.createBitmap(maxOf(1, vw / 4), maxOf(1, vh / 4), android.graphics.Bitmap.Config.ARGB_8888)
+            main.postDelayed({ go(null) }, 200)
+            runCatching { android.view.PixelCopy.request(viewfinder, still, { r -> go(if (r == android.view.PixelCopy.SUCCESS) still else null) }, main) }
+                .onFailure { go(null) }
+        } else go(null)
+    }
+
+    /** The near-full-screen look at the newest photo: grows out of the thumbnail, a tap puts it back. */
+    private fun showLatestLarge() {
+        val root = window.decorView as? android.view.ViewGroup ?: return
+        val start = IntArray(2)
+        thumbnail.getLocationInWindow(start)
+        val from = android.graphics.RectF(start[0].toFloat(), start[1].toFloat(), start[0] + thumbnail.width.toFloat(), start[1] + thumbnail.height.toFloat())
+        val shade = View(this).apply { setBackgroundColor(Color.BLACK); alpha = 0f }
+        val pic = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            (thumbnail.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap?.let { setImageBitmap(it) }
+            contentDescription = "最新一张照片"
+        }
+        val holder = FrameLayout(this).apply {
+            isClickable = true
+            addView(shade, FrameLayout.LayoutParams(-1, -1))
+            addView(pic, FrameLayout.LayoutParams(-1, -1).apply { setMargins(dp(14), dp(24), dp(14), dp(24)) })
+        }
+        root.addView(holder, android.view.ViewGroup.LayoutParams(-1, -1))
+        var closing = false
+        fun shownRect(): android.graphics.RectF {
+            val dr = pic.drawable ?: return android.graphics.RectF(0f, 0f, pic.width.toFloat(), pic.height.toFloat())
+            val r = android.graphics.RectF(0f, 0f, dr.intrinsicWidth.toFloat(), dr.intrinsicHeight.toFloat())
+            pic.imageMatrix.mapRect(r)
+            r.offset(pic.left.toFloat(), pic.top.toFloat())
+            return r
+        }
+        fun placeAt(t: Float) {
+            // t 0: over the thumbnail; 1: in place. The picture's own rect scales into the thumbnail's.
+            val to = shownRect()
+            if (to.width() <= 0f) return
+            val s = (from.width() / to.width()).coerceAtLeast(from.height() / to.height())
+            val sc = s + (1 - s) * t
+            pic.pivotX = to.centerX() - pic.left
+            pic.pivotY = to.centerY() - pic.top
+            pic.scaleX = sc
+            pic.scaleY = sc
+            pic.translationX = (from.centerX() - to.centerX()) * (1 - t)
+            pic.translationY = (from.centerY() - to.centerY()) * (1 - t)
+            shade.alpha = 0.88f * t
+        }
+        val open = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 380
+            interpolator = android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f)
+            addUpdateListener { placeAt(it.animatedValue as Float) }
+        }
+        holder.viewTreeObserver.addOnPreDrawListener(object : android.view.ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                holder.viewTreeObserver.removeOnPreDrawListener(this)
+                placeAt(0f)
+                open.start()
+                return true
+            }
+        })
+        holder.setOnClickListener {
+            if (closing) return@setOnClickListener
+            closing = true
+            open.cancel()
+            android.animation.ValueAnimator.ofFloat(1f, 0f).apply {
+                duration = 280
+                interpolator = android.view.animation.PathInterpolator(0.4f, 0f, 0.2f, 1f)
+                addUpdateListener { placeAt(it.animatedValue as Float) }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) { root.removeView(holder) }
+                })
+            }.start()
+        }
+        // the photo itself, sharp, in place of the thumbnail once it is read
+        java.util.concurrent.Executors.newSingleThreadExecutor().execute {
+            val photo = runCatching { org.photoall.film.gallery.Photos.list(this).firstOrNull() }.getOrNull() ?: return@execute
+            val longSide = maxOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
+            val big = runCatching {
+                android.graphics.ImageDecoder.decodeBitmap(android.graphics.ImageDecoder.createSource(contentResolver, photo.uri)) { dec, info, _ ->
+                    val s = longSide.toFloat() / maxOf(info.size.width, info.size.height)
+                    if (s < 1f) dec.setTargetSize((info.size.width * s).toInt().coerceAtLeast(1), (info.size.height * s).toInt().coerceAtLeast(1))
+                }
+            }.getOrNull() ?: return@execute
+            runOnUiThread { if (!closing && holder.parent != null) pic.setImageBitmap(big) }
+        }
+    }
+    private var filmWall: org.photoall.film.ui.FilmWall? = null
+
+    /** The wall of film: a roll is chosen, loaded (the animation), and the camera is ready at frame 1. */
+    private fun showFilmWall() {
+        if (filmWall != null) return
+        val wall = org.photoall.film.ui.FilmWall(this, FilmEngine.filmStocks, if (store.flag(Settings.FILM_ON)) store["film"].toInt() else -1).apply {
+            onTick = { strong -> haptics.play(if (strong) Haptics.Event.STOP else Haptics.Event.TICK) }
+            onInspect = { film ->
+                startActivity(android.content.Intent(this@CameraActivity, org.photoall.film.ui.Cartridge3DActivity::class.java)
+                    .putExtra(org.photoall.film.ui.Cartridge3DActivity.EXTRA_FILM, film))
+            }
+            onLoadScene = { index ->
+                loadScene.launch(android.content.Intent(this@CameraActivity, org.photoall.film.ui.CameraBackActivity::class.java)
+                    .putExtra(org.photoall.film.ui.CameraBackActivity.EXTRA_FILM, FilmEngine.filmStocks[index])
+                    .putExtra(org.photoall.film.ui.CameraBackActivity.EXTRA_INDEX, index))
+            }
+            onLoaded = { index ->
+                applyPick(0, index + 1)
+                bodyPrefs.edit().putInt("frame", 1).putBoolean("cocked", true).putBoolean("loaded", true).apply()
+                syncFilmBody()
+                hideFilmWall()
+                status.text = "已装片 · 第 1 张"
+            }
+            onSkip = {
+                bodyPrefs.edit().putBoolean("loaded", true).apply()
+                hideFilmWall()
+            }
+        }
+        filmWall = wall
+        wall.setOnApplyWindowInsetsListener { v, insets ->
+            val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
+        addContentView(wall, android.view.ViewGroup.LayoutParams(-1, -1))
+        wall.requestApplyInsets()
+    }
+
+    private fun hideFilmWall() {
+        filmWall?.let { (it.parent as? android.view.ViewGroup)?.removeView(it) }
+        filmWall = null
+    }
+
+    /** The real lens's f-number, for turning the aperture ring into exposure. */
+    private fun realAperture(): Float = boundInfo?.let {
+        Camera2CameraInfo.from(it).getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull()
+    } ?: 1.8f
+
+    /**
+     * The phone's aperture is fixed: the ring works through the sensor's gain instead, as
+     * much brighter or darker as that f-stop would let in. The ASA window sets the film speed.
+     */
+    private fun applyBodyExposure() {
+        if (!store.flag(Settings.MANUAL)) enterManual()
+        val n = lensBarrel.stops[lensBarrel.aperture].toFloat()
+        val offset = (6.0 * Math.log(realAperture().toDouble() / n) / Math.log(2.0)).roundToInt()
+        val asa = asaSteps[bodyPrefs.getInt("asa", 2).coerceIn(0, asaSteps.lastIndex)]
+        store[Settings.ISO] = (asa + offset).coerceIn(0, 18).toFloat()
+        speedDial.asa = Settings.iso(asa.toFloat()).toString()
+    }
+
+    /** The focus ring: AF at its far end, then metres from infinity to 0.5 m. */
+    private fun applyBodyFocus(pos: Float) {
+        if (pos < 0.5f) {
+            if (focusMode() != 0) store[Settings.FOCUS] = 0f
+            return
+        }
+        val metres = floatArrayOf(Float.POSITIVE_INFINITY, 10f, 5f, 3f, 2f, 1.5f, 1f, 0.7f, 0.5f)
+        val at = (pos - 1f).coerceIn(0f, 8f)
+        val i = at.toInt().coerceAtMost(7)
+        val f = at - i
+        fun diopters(m: Float) = if (m.isInfinite()) 0f else 1f / m
+        val dpt = diopters(metres[i]) + (diopters(metres[i + 1]) - diopters(metres[i])) * f
+        val min = minFocusDiopters()
+        if (focusMode() != 2) store[Settings.FOCUS] = 2f
+        store[Settings.FOCUS_DISTANCE] = if (min > 0f) (dpt / min).coerceIn(0f, 1f) else at / 8f
+    }
+
+    /** Counter, lever and dial from what is set. */
+    private fun syncFilmBody() {
+        val frame = bodyPrefs.getInt("frame", 1)
+        val cocked = bodyPrefs.getBoolean("cocked", true)
+        frameCounter.frame = frame
+        frameCounter.locked = !cocked
+        windLever.cocked = cocked
+        cartridge.frame = frame
+        cartridge.film = filmName()
+        speedDial.index = ((store[Settings.SHUTTER].toInt() - 9) / 3).coerceIn(0, 10)
+        speedDial.asa = Settings.iso(asaSteps[bodyPrefs.getInt("asa", 2).coerceIn(0, asaSteps.lastIndex)].toFloat()).toString()
+    }
+
+    /** The meter needle: how far what the viewfinder shows is from a mid-grey exposure. */
+    private fun updateLightMeter() {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - meterShownAt < 220) return
+        meterShownAt = now
+        val key = meter?.key ?: return
+        if (key <= 0f) return
+        lightMeter.stops = (Math.log(key / 0.18) / Math.log(2.0)).toFloat()
+    }
+
+    /**
+     * The film body's side panels: what the 4:3 viewfinder leaves of the width, after the
+     * system bars and the camera cutout, shared by the two, within 150..210 dp. On a narrow
+     * phone the viewfinder gives up a little height rather than the panels their parts.
+     */
+    private fun bodyColumnWidth(): Int {
+        val insets = window.decorView.rootWindowInsets?.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+        val dm = resources.displayMetrics
+        val long = maxOf(dm.widthPixels, dm.heightPixels) - (insets?.let { it.left + it.right } ?: 0)
+        val short = minOf(dm.widthPixels, dm.heightPixels) - (insets?.let { it.top + it.bottom } ?: 0) - dp(16)
+        val spare = (long - short * 4 / 3) / 2
+        return spare.coerceIn(dp(150), dp(210))
+    }
+
+    /** The two sides of the film body, left (lens, crank, cartridge, keys) and right (meter, dial, shutter, counter, lever). */
+    private fun filmSide(left: Boolean): View {
+        fun detach(vararg v: View) = v.forEach { (it.parent as? android.view.ViewGroup)?.removeView(it) }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(12), dp(12), dp(12), dp(14))
+            clipChildren = false
+            background = org.photoall.film.ui.BodyPlate(resources.displayMetrics.density)
+        }
+        if (left) {
+            detach(lensBarrel, rewindCrank, cartridge, thumbnail, quickButton, settingsIcon, recButton)
+            col.addView(lensBarrel, LinearLayout.LayoutParams(-1, dp(176)))
+            col.addView(LinearLayout(this).apply {
+                addView(rewindCrank, LinearLayout.LayoutParams(dp(62), -1))
+                addView(cartridge, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = dp(6) })
+            }, LinearLayout.LayoutParams(-1, dp(92)).apply { topMargin = dp(10) })
+            col.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+            col.addView(recButton, LinearLayout.LayoutParams(-1, dp(32)).apply { topMargin = dp(8); bottomMargin = dp(8) })
+            col.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                // three keys spread over the panel's width, whatever it is
+                addView(thumbnail, LinearLayout.LayoutParams(dp(40), dp(40)))
+                addView(View(this@CameraActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(quickButton, LinearLayout.LayoutParams(dp(40), dp(40)))
+                addView(View(this@CameraActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(settingsIcon, LinearLayout.LayoutParams(dp(40), dp(40)))
+            }, LinearLayout.LayoutParams(-1, dp(44)))
+        } else {
+            detach(lightMeter, speedDial, shutter, frameCounter, facingButton, windLever, flashIcon)
+            col.addView(lightMeter, LinearLayout.LayoutParams(-1, dp(26)))
+            col.addView(speedDial, LinearLayout.LayoutParams(dp(124), dp(124)).apply { topMargin = dp(6); gravity = Gravity.CENTER_HORIZONTAL })
+            col.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(shutter, LinearLayout.LayoutParams(dp(68), dp(68)))
+                addView(View(this@CameraActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(frameCounter, LinearLayout.LayoutParams(dp(56), dp(70)))
+            }, LinearLayout.LayoutParams(-1, dp(70)).apply { topMargin = dp(4) })
+            col.addView(windLever, LinearLayout.LayoutParams(-1, dp(118)).apply { topMargin = dp(2) })
+            col.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(flashIcon, LinearLayout.LayoutParams(dp(40), dp(40)))
+                addView(View(this@CameraActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(facingButton, LinearLayout.LayoutParams(dp(40), dp(40)))
+            }, LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(2) })
+        }
+        return col
     }
 
     private fun switchRow(title: String, detail: String, on: Boolean, onToggle: () -> Unit) = LinearLayout(this).apply {
@@ -4361,7 +5309,10 @@ class CameraActivity : ComponentActivity() {
 
     private fun failed(exception: ImageCaptureException) {
         Log.e(TAG, "capture failed", exception)
-        org.photoall.film.CrashReport.note(this, "拍摄失败（相机返回错误 ${exception.imageCaptureError}）", exception)
+        // the screen was closed under the shot (left with back, or killed): not a fault to report
+        val leaving = (isFinishing || isDestroyed) && exception.imageCaptureError == ImageCapture.ERROR_CAMERA_CLOSED
+        if (!leaving) org.photoall.film.CrashReport.note(this, "拍摄失败（相机返回错误 ${exception.imageCaptureError}）",
+            IllegalStateException(trailText(), exception))
         runOnUiThread {
             developing--
             status.text = "拍摄失败：${exception.message}"
@@ -4382,7 +5333,9 @@ class CameraActivity : ComponentActivity() {
 
     private fun exposureStarted(exposureMs: Long, last: Boolean) {
         val run = {
+            org.photoall.film.reel.Reel.mark() // 拍摄录屏: this shot's seconds before and after
             curtain.close()
+            shotFx.fire()
             main.removeCallbacks(openCurtain)
             // a burst keeps it black from the first frame to the end of the last; even at a
             // fast speed the view stays black a beat (an SLR's mirror is up longer than its

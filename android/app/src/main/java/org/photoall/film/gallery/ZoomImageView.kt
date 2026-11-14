@@ -21,6 +21,8 @@ class ZoomImageView(context: Context) : ImageView(context) {
     var onDragEnd: (dx: Float, vx: Float) -> Unit = { _, _ -> }
     /** What is shown changed: another picture, or the zoom and pan (a frosted copy follows). */
     var onDisplayChanged: () -> Unit = {}
+    /** A single tap (not the first of a double tap, not a drag). */
+    var onTap: () -> Unit = {}
     private var downX = 0f
     private var downY = 0f
     private var paging = false     // this gesture moves the page sideways
@@ -57,6 +59,11 @@ class ZoomImageView(context: Context) : ImageView(context) {
             return true
         }
 
+        override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+            onTap()
+            return true
+        }
+
         override fun onDoubleTap(e: MotionEvent): Boolean {
             if (scale > 1f) reset() else {
                 scale = 2.5f
@@ -86,7 +93,83 @@ class ZoomImageView(context: Context) : ImageView(context) {
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
+        // a relayout in the middle of a glide: start again from where the picture is now
+        if (glide?.isRunning == true) { glide?.cancel(); glideFrom = RectF(lastOnScreen); glideUntil = android.os.SystemClock.uptimeMillis() + 600 }
         reset()
+        if (glideFrom != null && android.os.SystemClock.uptimeMillis() < glideUntil) glidePending = true
+    }
+
+    private var glidePending = false
+
+    // The glide starts here, in this layout pass (every parent is already in its new place, so
+    // the window position is right) and before the frame is drawn: posted, it came a frame late
+    // and the picture showed once at its new size first, then jumped back to glide (a flicker).
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        if (glidePending) { glidePending = false; startGlide() }
+    }
+
+    private var glideFrom: RectF? = null
+    private var glideUntil = 0L
+    private var glide: android.animation.ValueAnimator? = null
+    private val lastOnScreen = RectF()
+
+    /** The picture where it is on screen now, in window coordinates. */
+    private fun onScreen(): RectF? {
+        val dr = drawable ?: return null
+        val r = RectF(0f, 0f, dr.intrinsicWidth.toFloat(), dr.intrinsicHeight.toFloat())
+        imageMatrix.mapRect(r)
+        val at = IntArray(2)
+        getLocationInWindow(at)
+        r.offset(at[0].toFloat(), at[1].toFloat())
+        return r
+    }
+
+    /**
+     * The layout is about to change (bars going or coming): keep the picture where it is on
+     * screen, and once the new layout is in, ease it to its new fit.
+     */
+    fun holdPlace() {
+        glideFrom = onScreen() ?: return
+        lastOnScreen.set(glideFrom!!)
+        glideUntil = android.os.SystemClock.uptimeMillis() + 600
+    }
+
+    private fun startGlide() {
+        val from = glideFrom ?: return
+        val dr = drawable ?: return
+        glideFrom = null
+        val at = IntArray(2)
+        getLocationInWindow(at)
+        val dw = dr.intrinsicWidth.toFloat()
+        val target = Matrix(m)
+        val fromScale = from.width() / dw
+        val fromX = from.left - at[0]
+        val fromY = from.top - at[1]
+        val v = FloatArray(9)
+        target.getValues(v)
+        val toScale = v[Matrix.MSCALE_X]
+        val toX = v[Matrix.MTRANS_X]
+        val toY = v[Matrix.MTRANS_Y]
+        glide = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 340
+            interpolator = android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f)
+            addUpdateListener {
+                val t = it.animatedValue as Float
+                val sc = fromScale + (toScale - fromScale) * t
+                m.reset()
+                m.postScale(sc, sc)
+                m.postTranslate(fromX + (toX - fromX) * t, fromY + (toY - fromY) * t)
+                imageMatrix = m
+                onScreen()?.let { r -> lastOnScreen.set(r) }
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (glideFrom == null) { m.set(target); imageMatrix = m }
+                }
+            })
+            start()
+        }
     }
 
     fun reset() {
