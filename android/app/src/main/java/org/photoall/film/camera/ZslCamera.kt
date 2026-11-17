@@ -207,6 +207,9 @@ class ZslCamera(
     var metering = true
         private set
 
+    /** Called (camera thread) when the session came up without the meter's stream. */
+    @Volatile var onLean: (() -> Unit)? = null
+
     private fun configure(camera: CameraDevice) {
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
@@ -214,6 +217,7 @@ class ZslCamera(
                 step("会话已配置${if (metering) "" else "（无测光流）"}，开始预览")
                 session = s
                 repeat()
+                if (!metering) onLean?.invoke()
             }
             override fun onConfigureFailed(s: CameraCaptureSession) {
                 step("会话配置失败")

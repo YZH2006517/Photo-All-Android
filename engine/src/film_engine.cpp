@@ -734,13 +734,13 @@ struct FilmEngine::Impl
     for(int k = 0; k < kKernelCount; k++)
     {
       const KernelSpec &spec = kKernels[k];
-      const ShaderBlob *blob = find_shader(spec.name);
+      if(!info.burst && std::strncmp(spec.name, "hp_", 3) == 0) continue; // left out, see create
+      const ShaderBlob *blob = find_shader(info.safe_shaders ? (std::string(spec.name) + "_safe").c_str() : spec.name);
       if(!blob)
       {
         error = std::string("missing SPIR-V for ") + spec.name;
         return false;
       }
-      if(!info.burst && std::strncmp(spec.name, "hp_", 3) == 0) continue; // left out, see create
       Pipeline &p = pipelines[k];
       report_stage(spec.name);
       VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -2350,10 +2350,11 @@ FilmEngine::~FilmEngine() = default;
 void set_stage_hook(void (*hook)(const char *stage)) { g_stage_hook = hook; }
 
 std::unique_ptr<FilmEngine> FilmEngine::create(const Lut &filmsim, const Lut &spectra, std::string &error,
-                                               bool burst_kernels)
+                                               bool burst_kernels, bool safe_shaders)
 {
   auto impl = std::make_unique<Impl>();
-  impl->info.burst = burst_kernels;
+  impl->info.safe_shaders = safe_shaders;
+  impl->info.burst = burst_kernels && !safe_shaders;
   report_stage("vulkan");
   const bool ok = impl->init(filmsim, spectra, error);
   report_stage(ok ? "ready" : "failed");

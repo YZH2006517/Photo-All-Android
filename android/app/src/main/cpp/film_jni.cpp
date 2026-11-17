@@ -170,7 +170,7 @@ JNIEXPORT void JNICALL Java_org_photoall_film_engine_FilmNative_bufferRelease(JN
 }
 
 JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *env, jclass type, jobject asset_manager,
-                                                                       jboolean burst)
+                                                                       jboolean burst, jboolean safe)
 {
   JNI_TRY
   StageScope stages(env, type);
@@ -184,7 +184,7 @@ JNIEXPORT jlong JNICALL Java_org_photoall_film_engine_FilmNative_create(JNIEnv *
     return 0;
   }
   auto handle = std::make_unique<Handle>();
-  handle->engine = film::FilmEngine::create(filmsim, spectra, error, burst == JNI_TRUE);
+  handle->engine = film::FilmEngine::create(filmsim, spectra, error, burst == JNI_TRUE, safe == JNI_TRUE);
   if(!handle->engine)
   {
     throw_java(env, error);

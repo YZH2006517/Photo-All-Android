@@ -59,6 +59,16 @@ object CrashReport {
             val died = p.getString("engine_stage", null)
             if (died != null && died.startsWith("hp_"))
                 p.edit().putString("burst_off", burstKey(app)).putString("burst_off_kernel", died).commit()
+            // a core kernel, and the run really ended in a native crash (not closed while it
+            // compiled): the unoptimised kernels next time, after them none
+            else if (died != null && died !in setOf("vulkan", "ready", "failed") && lastExitNative(app)) {
+                val key = burstKey(app)
+                // already on the unoptimised kernels (the probe's verdict or a crash before): none
+                val wasSafe = p.getString("engine_safe", null) == key ||
+                    org.photoall.film.engine.GpuProbe.verdict(app)?.startsWith("safe") == true
+                if (wasSafe) p.edit().putString("engine_off", key).commit()
+                else p.edit().putString("engine_safe", key).putString("engine_safe_kernel", died).commit()
+            }
             p.edit().putString("prev_stage", p.getString("stage", null)).putLong("prev_stage_at", p.getLong("stage_at", 0L))
                 .putString("prev_engine_stage", p.getString("engine_stage", null))
                 .putString("stage", "启动").putLong("stage_at", System.currentTimeMillis())
@@ -170,6 +180,24 @@ object CrashReport {
         val app = app ?: return true
         return app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("burst_off", null) != burstKey(app)
     }
+
+    /** "safe" or "off" after this process crashed compiling a core kernel (this version and build), else null. */
+    fun engineCrashMode(): String? {
+        val app = app ?: return null
+        val p = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val key = burstKey(app)
+        return when (key) {
+            p.getString("engine_off", null) -> "off"
+            p.getString("engine_safe", null) -> "safe"
+            else -> null
+        }
+    }
+
+    private fun lastExitNative(context: Context): Boolean = Build.VERSION.SDK_INT >= 30 && runCatching {
+        context.getSystemService(ActivityManager::class.java).getHistoricalProcessExitReasons(context.packageName, 0, 3)
+            .firstOrNull { !it.processName.endsWith(org.photoall.film.engine.GpuProbe.PROCESS_SUFFIX) }
+            ?.reason == ApplicationExitInfo.REASON_CRASH_NATIVE
+    }.getOrDefault(false)
 
     private val events = ArrayDeque<String>()
 
@@ -348,6 +376,14 @@ object CrashReport {
                     .append(" 时崩溃，RAW 改用单帧）\n")
             else org.photoall.film.engine.GpuProbe.verdict(context)?.takeIf { it.startsWith("sealed") }?.let {
                 append("多帧合成：已封存（").append(it.removePrefix("sealed: ")).append("，RAW 改用单帧）\n")
+            }
+            org.photoall.film.engine.GpuProbe.verdict(context)?.let {
+                if (it.startsWith("safe")) append("GPU 引擎：改用未优化的着色器（").append(it.removePrefix("safe: ")).append("）\n")
+                if (it.startsWith("off")) append("GPU 引擎：停用（").append(it.removePrefix("off: ")).append("）\n")
+            }
+            when (engineCrashMode()) {
+                "safe" -> append("GPU 引擎：应用内编译 ").append(prefs.getString("engine_safe_kernel", "?")).append(" 时崩溃，改用未优化的着色器\n")
+                "off" -> append("GPU 引擎：未优化的着色器也崩溃，已停用\n")
             }
         }
     }

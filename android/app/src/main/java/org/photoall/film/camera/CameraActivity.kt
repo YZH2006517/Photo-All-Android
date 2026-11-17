@@ -230,7 +230,7 @@ class CameraActivity : ComponentActivity() {
     private var developing = 0
     private var skinShown = 0f // the camera style the views were built in
     private val shotFx by lazy { org.photoall.film.ui.Skin.ShotFx(this) }
-    private var skinTicker: android.animation.ValueAnimator? = null
+    private var skinTicker: Runnable? = null
     /** Gravity, smoothed, as the tilt the style's layers and lights follow. */
     private val tiltListener = object : android.hardware.SensorEventListener {
         override fun onSensorChanged(e: android.hardware.SensorEvent) {
@@ -247,21 +247,35 @@ class CameraActivity : ComponentActivity() {
         override fun onAccuracyChanged(sensor: android.hardware.Sensor?, accuracy: Int) {}
     }
 
-    /** The style's motion: time and tilt, redrawn each frame while the screen is in front. */
+    /**
+     * The style's motion: time and tilt, redrawn while the screen is in front. 25 times a
+     * second, not at the display's rate: every vsync on a 120 Hz screen (Xiaomi 18 Pro) kept
+     * the whole body redrawn 120 times a second and the phone hot. With the system's
+     * animations off there is no motion and no tilt.
+     */
     private fun runSkin(on: Boolean) {
         val sensors = getSystemService(android.hardware.SensorManager::class.java)
         sensors.unregisterListener(tiltListener)
-        skinTicker?.cancel()
+        skinTicker?.let { main.removeCallbacks(it) }
         skinTicker = null
         if (!on || !org.photoall.film.ui.Skin.active) return
-        sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY)?.let {
-            sensors.registerListener(tiltListener, it, android.hardware.SensorManager.SENSOR_DELAY_GAME)
+        // animations off: no motion, only the film body's meter kept current, four times a second
+        val calm = org.photoall.film.ui.Skin.calm
+        if (!calm) sensors.getDefaultSensor(android.hardware.Sensor.TYPE_GRAVITY)?.let {
+            sensors.registerListener(tiltListener, it, android.hardware.SensorManager.SENSOR_DELAY_UI)
         }
         val start = android.os.SystemClock.uptimeMillis()
-        skinTicker = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 1000
-            repeatCount = android.animation.ValueAnimator.INFINITE
-            addUpdateListener {
+        skinTicker = object : Runnable {
+            override fun run() {
+                if (skinTicker !== this) return
+                main.postDelayed(this, if (calm) 250 else 40)
+                skinFrame(start)
+            }
+        }.also { main.post(it) }
+    }
+
+    private fun skinFrame(start: Long) {
+            run {
                 if (!org.photoall.film.ui.Skin.calm) org.photoall.film.ui.Skin.time = (android.os.SystemClock.uptimeMillis() - start) / 1000f
                 if (::stage.isInitialized) stage.body?.background?.invalidateSelf()
                 shutter.background?.invalidateSelf()
@@ -275,8 +289,6 @@ class CameraActivity : ComponentActivity() {
                     }
                 }
             }
-            start()
-        }
     }
 
     private var themeShown = 0f // the theme the views were built in
@@ -308,13 +320,20 @@ class CameraActivity : ComponentActivity() {
         intent.removeExtra("skin")
         org.photoall.film.ui.Style.apply(this)
         super.onCreate(savedInstanceState)
+        // 60 Hz is plenty for a viewfinder that runs at the camera's 30: a 120 Hz panel kept
+        // at full rate the whole time the camera is open costs heat (Xiaomi 18 Pro)
+        window.attributes = window.attributes.also { it.preferredRefreshRate = 60f }
         seenConfig = android.content.res.Configuration(resources.configuration)
         getSharedPreferences("camera_quirks", MODE_PRIVATE).let { q ->
-            val stalled = q.getBoolean("raw_camera2", false) || q.all.keys.any { it.startsWith("raw_no_analysis_") }
-            if (stalled && !q.getBoolean("stall_reset_v39", false)) q.edit().apply {
-                for (key in q.all.keys) if (key.startsWith("raw_no_analysis_") || key.startsWith("raw_unusable_")) remove(key)
-                remove("raw_camera2")
-                remove("zsl_blocked")
+            // once per install: what builds before 39 learnt from a stall (raw_no_analysis_*, no
+            // longer written) is cleared. Marked done on every install's first start, so a
+            // quirk learnt later (raw_camera2, raw_unusable_*) is never wiped by it.
+            if (!q.contains("stall_reset_v39")) q.edit().apply {
+                if (q.all.keys.any { it.startsWith("raw_no_analysis_") }) {
+                    for (key in q.all.keys) if (key.startsWith("raw_no_analysis_") || key.startsWith("raw_unusable_")) remove(key)
+                    remove("raw_camera2")
+                    remove("zsl_blocked")
+                }
                 putBoolean("stall_reset_v39", true)
             }.apply()
         }
@@ -350,7 +369,7 @@ class CameraActivity : ComponentActivity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0x80151515.toInt()) }
             Style.pressable(this)
-            setOnClickListener { front = !front; lensId = null; lastBoundId = null; lensWaits = 0; pinnedLens = null; pendingZoom = null; zslBusyTries = 0; reopenTries = 0; haptics.play(Haptics.Event.SEGMENT); bindCamera() }
+            setOnClickListener { flipFacing() }
         }
         flashIcon = iconButton("闪光") { showFlashModes(flashIcon) }
         histogramIcon = iconButton("直方图") {
@@ -701,13 +720,23 @@ class CameraActivity : ComponentActivity() {
         if (heavyStarted || isFinishing || isDestroyed) return
         heavyStarted = true
         status.text = "正在启动胶片引擎…"
+        // the system was updated: what was learnt about this phone was cleared (PhotoAllApp)
+        getSharedPreferences("camera_quirks", MODE_PRIVATE).let { q ->
+            if (q.getBoolean("quirks_reset_notice", false)) {
+                q.edit().remove("quirks_reset_notice").apply()
+                val text = "系统已更新，之前为这台手机做的兼容降级已全部重置，会重新检测；再遇到问题仍会自动处理并提示"
+                android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_LONG).show()
+                org.photoall.film.CrashReport.event(text)
+            }
+        }
         engineThread.later {
             try {
                 engine = FilmEngine.create(assets)
-                runOnUiThread { status.text = "GPU：${engine?.deviceName}" }
+                val notice = FilmEngine.notice(this)
+                runOnUiThread { status.text = "GPU：${engine?.deviceName}"; notice?.let { degraded(it) } }
                 bakeLut()
             } catch (e: Throwable) {
-                runOnUiThread { status.text = "引擎无法启动：${e.message}" }
+                runOnUiThread { degraded("胶片引擎无法启动：${e.message}") }
             }
         }
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) bindCamera()
@@ -2659,6 +2688,100 @@ class CameraActivity : ComponentActivity() {
 
     private var zslBusyTries = 0
 
+    private var flipping = false
+
+    /**
+     * Front / back: the picture turns over like a card. The still of this camera turns away,
+     * its back (frosted, the other camera not yet seen) turns in, and stays until the first
+     * frame of the new camera has arrived: the switch underneath (a frame or two with the
+     * old picture and the new camera's turn, a black one) is never seen. Animations off:
+     * the frosted still only, then it clears.
+     */
+    private fun flipFacing() {
+        if (flipping) return
+        flipping = true
+        haptics.play(Haptics.Event.SEGMENT)
+        var revealed = false
+        fun reveal() {
+            if (revealed) return
+            revealed = true
+            viewfinder.onSessionFrame = null
+            android.animation.ValueAnimator.ofFloat(overlay.frostAlpha, 0f).apply {
+                duration = 280
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener { overlay.frostAlpha = it.animatedValue as Float }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        overlay.flipDegrees = 0f
+                        overlay.frost = null
+                        flipping = false
+                    }
+                })
+                start()
+            }
+        }
+        fun switchNow() {
+            front = !front; lensId = null; lastBoundId = null; lensWaits = 0; pinnedLens = null; pendingZoom = null
+            zslBusyTries = 0; reopenTries = 0
+            viewfinder.onSessionFrame = { main.postDelayed({ reveal() }, 90) }
+            main.postDelayed({ reveal() }, 3000) // a camera slow to come: uncovered all the same
+            bindCamera()
+        }
+        var went = false
+        fun go(still: android.graphics.Bitmap?) {
+            if (went) return
+            went = true
+            val frost = runCatching { still?.let { frosted(it.copy(android.graphics.Bitmap.Config.ARGB_8888, false)) } }.getOrNull()
+            overlay.frostAlpha = 1f
+            if (still == null || org.photoall.film.ui.Skin.calm) {
+                overlay.frost = frost
+                switchNow()
+                return
+            }
+            overlay.frost = still
+            android.animation.ValueAnimator.ofFloat(0f, 90f).apply {
+                duration = 170
+                interpolator = android.view.animation.AccelerateInterpolator(1.4f)
+                addUpdateListener { overlay.flipDegrees = it.animatedValue as Float }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        overlay.frost = frost ?: still
+                        switchNow()
+                        android.animation.ValueAnimator.ofFloat(-90f, 0f).apply {
+                            duration = 240
+                            interpolator = android.view.animation.DecelerateInterpolator(1.4f)
+                            // a whisker past zero keeps the well drawn round it until revealed
+                            addUpdateListener { overlay.flipDegrees = (it.animatedValue as Float).let { d -> if (d == 0f) 0.001f else d } }
+                            start()
+                        }
+                    }
+                })
+                start()
+            }
+        }
+        val vw = viewfinder.width
+        val vh = viewfinder.height
+        if (vw > 0 && vh > 0) {
+            val still = android.graphics.Bitmap.createBitmap(maxOf(1, vw / 2), maxOf(1, vh / 2), android.graphics.Bitmap.Config.ARGB_8888)
+            main.postDelayed({ go(null) }, 150)
+            runCatching { android.view.PixelCopy.request(viewfinder, still, { r -> go(if (r == android.view.PixelCopy.SUCCESS) still else null) }, main) }
+                .onFailure { go(null) }
+        } else go(null)
+    }
+
+    /**
+     * A step down this phone needed: always told, not left to the status line (written over
+     * a moment later). A long toast, the status line, and the diagnostics' recent events;
+     * each wording once per screen, so a lens without RAW is not announced on every bind.
+     */
+    private fun degraded(text: String) {
+        status.text = text
+        if (!toldDegraded.add(text)) return
+        android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_LONG).show()
+        org.photoall.film.CrashReport.event("自动降级：$text")
+    }
+    private val toldDegraded = mutableSetOf<String>()
+
     private fun blockZsl(id: String) {
         zslBlocked += id
         getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putStringSet("zsl_blocked", zslBlocked.toSet()).apply()
@@ -2712,15 +2835,16 @@ class CameraActivity : ComponentActivity() {
                 if (pinned != null) {
                     blockZsl("$id/$pinned")
                     pinnedLens = null
-                    status.text = "这颗镜头不能单独输出 RAW，改用变焦"
+                    degraded("这颗镜头不能单独输出 RAW，已自动改用主摄 RAW 变焦")
                 } else {
                     blockZsl(id)
-                    status.text = "$message · HDR 改用普通连拍"
+                    degraded("这颗镜头不能连续输出 RAW，HDR+ 已自动改用普通连拍")
                 }
                 bindCamera()
             }
         }, onDemand = !store.flag(Settings.HDR), physicalId = pinned, physicalCharacteristics = physical)
         zsl = session
+        session.onLean = { main.post { if (zsl === session) degraded("这颗镜头不能同时输出预览、RAW 和测光画面，已去掉测光（直方图、高光保护暂不可用）") } }
         org.photoall.film.CrashReport.stage(this, "打开零延迟 RAW 相机 $id${pinned?.let { "（RAW 取自镜头 $it）" } ?: ""} · ${session.rawSize} × ${session.keep} 帧")
         val sensor = full.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val rotation = zslRotation(full)
@@ -2873,8 +2997,8 @@ class CameraActivity : ComponentActivity() {
         if (!plain) quirks.edit().putBoolean("raw_plain_$id", true).apply()
         else quirks.edit().putBoolean("raw_unusable_$id", true).apply()
         org.photoall.film.CrashReport.note(this, "拍 RAW 时相机驱动重启（镜头 $id）", IllegalStateException(trailText()))
-        status.text = if (!plain) "相机驱动在拍 RAW 时重启了，已改用最简拍摄参数，等相机回来后再按一次快门"
-            else "这台手机的相机驱动拍 RAW 会重启，这颗镜头已改用 JPEG"
+        degraded(if (!plain) "相机驱动在拍 RAW 时重启了，已自动改用最简拍摄参数，等相机回来后再按一次快门"
+            else "这台手机的相机驱动拍 RAW 会重启，这颗镜头已自动改用 JPEG")
         activeWatch?.fireNow()
     }
 
@@ -2888,18 +3012,30 @@ class CameraActivity : ComponentActivity() {
      * it fails on: once, this lens gets plain streams (smaller stills, no metering stream),
      * remembered; the rebinding that follows uses them.
      */
+    private val fatalAtOpen = mutableMapOf<String, Int>()
+
     private fun fatalAfterOpen(id: String) {
         val now = SystemClock.uptimeMillis()
         // died while still opening (never open since this binding: a Huawei Kirin, Android 16,
         // three fatal errors 3 s into OPENING, one after another), or within 4 s of opening
         val opening = openedAt < boundAt && now - boundAt < 8000
         if ((!opening && now - openedAt > 4000) || now - shutterAt < 4000) return
+        // once can be chance (the driver busy with something else): a step down, kept for
+        // good, only when it happens again on this lens
+        val count = (fatalAtOpen[id] ?: 0) + 1
+        fatalAtOpen[id] = count
+        if (count < 2) { trail("相机 $id 打开时出错一次，先照常重连"); return }
+        fatalAtOpen.remove(id)
         val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
         // a step down each time, kept for this lens: plain streams first, then no RAW
         val step = when {
             !quirks.getBoolean("plain_streams_$id", false) -> {
                 quirks.edit().putBoolean("plain_streams_$id", true).apply()
                 "简化输出流"
+            }
+            !quirks.getBoolean("strict_requests_$id", false) -> {
+                quirks.edit().putBoolean("strict_requests_$id", true).apply()
+                "最简拍摄参数"
             }
             rawCapture && !quirks.getBoolean("raw_unusable_$id", false) -> {
                 quirks.edit().putBoolean("raw_unusable_$id", true).apply()
@@ -2909,7 +3045,7 @@ class CameraActivity : ComponentActivity() {
         }
         trail("${if (opening) "打开时" else "打开后"}驱动出错：这颗镜头改用$step")
         org.photoall.film.CrashReport.note(this, "相机${if (opening) "打开时" else "打开后"}驱动出错，改用$step（镜头 $id）", IllegalStateException(trailText()))
-        status.text = "相机驱动出错，已改用更稳的设置（$step）重新连接"
+        degraded("相机驱动出错，已自动改用更稳的设置（$step）重新连接")
         reopenTries = 0 // a new setting: its own tries
         main.postDelayed({ if (!isFinishing) bindCamera() }, 800)
     }
@@ -3034,7 +3170,11 @@ class CameraActivity : ComponentActivity() {
                 camera?.let { Camera2CameraControl.from(it.cameraControl).setCaptureRequestOptions(options) }
             }.also { c -> c.onLive = { e -> main.post { showLive(e) } } }
             exposure = controller
-            controller.plain = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_plain_${chars.cameraId}", false)
+            getSharedPreferences("camera_quirks", MODE_PRIVATE).let { q ->
+                // a lens whose driver died at opening: only the settings it lists, and the plain ones
+                controller.strict = q.getBoolean("strict_requests_${chars.cameraId}", false)
+                controller.plain = controller.strict || q.getBoolean("raw_plain_${chars.cameraId}", false)
+            }
             boundInfo = info
             lastBoundId = chars.cameraId
             // a phone whose metered flash came back unfired: the LED way from then on (this lens)
@@ -3047,7 +3187,7 @@ class CameraActivity : ComponentActivity() {
                         quirks.edit().putBoolean("flash_torch_${chars.cameraId}", true).apply()
                         org.photoall.film.CrashReport.note(this, "闪光未触发，已改用常亮方式",
                             IllegalStateException("lens ${chars.cameraId}: FLASH_STATE $state after AE_MODE_ON_ALWAYS_FLASH"))
-                        status.text = "这台手机的闪光没有亮，已改用常亮方式，下一张起生效"
+                        degraded("这台手机的闪光没有亮，已自动改用常亮方式，下一张起生效")
                     }
                 }
             }
@@ -3095,7 +3235,10 @@ class CameraActivity : ComponentActivity() {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build().also { it.setAnalyzer(analysisThread, previewMeter); analysisCase = it }
-            val wantRaw = store.flag(Settings.RAW) && !rawUnusable
+            // flash shots through CameraX that never answered with RAW here (rawStalled)
+            val flashJpeg = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_flash_jpeg_${chars.cameraId}", false) &&
+                store[Settings.FLASH].toInt().let { it != 0 && it != Settings.FLASH_STEADY }
+            val wantRaw = store.flag(Settings.RAW) && !rawUnusable && !flashJpeg
             val rawSupported = ImageCapture.getImageCaptureCapabilities(info).supportedOutputFormats
                 .contains(ImageCapture.OUTPUT_FORMAT_RAW)
             rawCapture = wantRaw && rawSupported
@@ -3120,6 +3263,7 @@ class CameraActivity : ComponentActivity() {
                 org.photoall.film.CrashReport.note(this, "相机绑定降级：去掉测光分析流（${if (rawCapture) "RAW" else "JPEG"}）", e)
                 provider.unbindAll()
                 analysisCase = null
+                degraded("这颗镜头不能同时输出预览、照片和测光画面，已去掉测光（直方图、高光保护暂不可用）")
                 try {
                     provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, imageCapture)
                 } catch (e2: Exception) {
@@ -3131,7 +3275,7 @@ class CameraActivity : ComponentActivity() {
                         .setResolutionSelector(stillSize).build()
                     try {
                         provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, finalCapture).also {
-                            status.text = "这颗镜头不支持 RAW 与预览同时输出，改用 JPEG"
+                            degraded("这颗镜头不支持 RAW 与预览同时输出，已自动改用 JPEG")
                         }
                     } catch (e3: Exception) {
                         Log.e(TAG, "bind failed", e3)
@@ -3156,7 +3300,9 @@ class CameraActivity : ComponentActivity() {
             buildZoomButtons()
             applyCameraOptions()
             updateLabels()
-            if (wantRaw && !rawSupported) status.text = "这颗镜头不支持 RAW，改用 JPEG"
+            if (wantRaw && !rawSupported) degraded("这颗镜头不支持 RAW，已自动改用 JPEG")
+            if (!rawCapture && store.flag(Settings.RAW) && store[Settings.FLASH].toInt() == Settings.FLASH_OVERPOWER && !flashJpeg)
+                degraded("这颗镜头现在拍不了 RAW，压光暂不可用（需要 RAW），闪光已关闭")
         } catch (e: Exception) {
             // a camera stack that throws where others do not: say so, keep the app alive
             Log.e(TAG, "bindCamera", e)
@@ -4110,16 +4256,21 @@ class CameraActivity : ComponentActivity() {
         }.start()
         val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
         val lens = boundInfo?.let { runCatching { Camera2CameraInfo.from(it).cameraId }.getOrNull() }
-        if (open && quirks.getBoolean("raw_camera2", false) && lens != null) {
+        if (open && rawByCamera2() && lens != null && store.flag(Settings.RAW) && !zslWanted()) {
+            // RAW goes through Camera2 on this phone, but a flash shot has to go through CameraX,
+            // which already did not answer: flash shots on this lens are JPEG; RAW without the
+            // flash keeps working
+            quirks.edit().putBoolean("raw_flash_jpeg_$lens", true).apply()
+            degraded("这台手机带闪光拍 RAW 没有回应，闪光时已自动改用 JPEG（压光需要 RAW，暂不可用），请再按一次快门")
+        } else if (open && quirks.getBoolean("raw_camera2", false) && lens != null) {
             // Camera2 did not answer either (Xiaomi 14 Pro, HyperOS: RAW listed, never delivered
             // to an app): two paths, no RAW. This lens shoots JPEG from now on, said plainly.
             quirks.edit().putBoolean("raw_unusable_$lens", true).apply()
-            status.text = "这台手机没有把 RAW 交给应用，这颗镜头已改用 JPEG，请再按一次快门"
-            android.widget.Toast.makeText(this, "这台手机不提供 RAW，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
+            degraded("这台手机没有把 RAW 交给应用，这颗镜头已自动改用 JPEG，请再按一次快门")
         } else if (open) {
             // the camera was open and still did not answer a RAW request: RAW through Camera2
             quirks.edit().putBoolean("raw_camera2", true).apply()
-            status.text = "相机开着却没有交回 RAW，已改用 Camera2 直接取 RAW，请再按一次快门"
+            degraded("相机没有交回 RAW，已自动改用另一种方式取 RAW，请再按一次快门")
         } else status.text = "相机没有真正打开（$state），已重新连接，请再按一次快门"
         zsl?.close(wait = true); zsl = null
         bindCamera()
@@ -4137,11 +4288,10 @@ class CameraActivity : ComponentActivity() {
         if (pinned != null) {
             blockZsl("${session.cameraId}/$pinned")
             pinnedLens = null
-            status.text = "这颗镜头单独取 RAW 没有回应，已改用主摄 RAW 变焦，请再按一次快门"
+            degraded("这颗镜头单独取 RAW 没有回应，已自动改用主摄 RAW 变焦，请再按一次快门")
         } else {
             getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_unusable_${session.cameraId}", true).apply()
-            status.text = "这台手机没有把 RAW 交给应用，这颗镜头已改用 JPEG，请再按一次快门"
-            android.widget.Toast.makeText(this, "这台手机不提供 RAW，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
+            degraded("这台手机没有把 RAW 交给应用，这颗镜头已自动改用 JPEG，请再按一次快门")
         }
         trail("RAW 无回应 →${if (pinned != null) "取消镜头 $pinned 单独取 RAW" else "镜头 ${session.cameraId} 改 JPEG"}")
         zsl?.close(wait = true); zsl = null
@@ -4536,9 +4686,14 @@ class CameraActivity : ComponentActivity() {
             org.photoall.film.CrashReport.note(this, "冲洗失败（$source）", e)
             // a RAW this app cannot read: say so plainly, and shoot JPEG on this lens from now on
             if (e.message?.let { it.contains("DNG") || it.contains("lossless JPEG") } == true) runOnUiThread {
-                val id = boundInfo?.let { Camera2CameraInfo.from(it).cameraId }
+                // a pinned lens's own RAW: only that lens (the zoom on the main camera's RAW
+                // takes over); else the camera's
+                val pinned = pinnedLens
+                val id = pinned ?: boundInfo?.let { Camera2CameraInfo.from(it).cameraId }
                 if (id != null) getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_unusable_$id", true).apply()
-                android.widget.Toast.makeText(this, "这台手机的 RAW 格式暂时无法冲洗，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
+                pinnedLens = null
+                degraded(if (pinned != null) "这颗镜头的 RAW 格式暂时无法冲洗，已自动改用主摄 RAW 变焦"
+                    else "这台手机的 RAW 格式暂时无法冲洗，已自动改用 JPEG 拍摄")
                 zsl?.close(wait = true); zsl = null
                 bindCamera()
             } else runOnUiThread {
@@ -5135,23 +5290,32 @@ class CameraActivity : ComponentActivity() {
         fun go(still: android.graphics.Bitmap?) {
             if (went) return
             went = true
-            val frost = still?.let { frosted(it) }
+            val frost = runCatching { still?.let { frosted(it) } }.getOrNull()
             // frosting the glass on the old screen first, so the entrance starts from it
             overlay.frost = frost
             overlay.frostAlpha = 1f
             overlay.invalidate()
             main.post {
-                org.photoall.film.ui.Skin.capture(window.decorView)
-                // the surface draws nothing in a capture: paint the frost where the glass is
-                val shot = org.photoall.film.ui.Skin.lastFrame
-                if (shot != null && frost != null && shot.isMutable) {
-                    val at = IntArray(2)
-                    viewfinderFrame.getLocationInWindow(at)
-                    android.graphics.Canvas(shot).drawBitmap(frost, null,
-                        android.graphics.RectF(at[0] / 2f, at[1] / 2f, (at[0] + viewfinderFrame.width) / 2f, (at[1] + viewfinderFrame.height) / 2f),
-                        android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+                // the snapshot is only for the transition: whatever a phone's drawing does
+                // with it (Xiaomi 15 Ultra, 0.2.2 build 77: an immutable bitmap), the theme
+                // still changes, without its reveal at worst
+                runCatching {
+                    org.photoall.film.ui.Skin.capture(window.decorView)
+                    // the surface draws nothing in a capture: paint the frost where the glass is
+                    val shot = org.photoall.film.ui.Skin.lastFrame
+                    if (shot != null && frost != null && shot.isMutable) {
+                        val at = IntArray(2)
+                        viewfinderFrame.getLocationInWindow(at)
+                        android.graphics.Canvas(shot).drawBitmap(frost, null,
+                            android.graphics.RectF(at[0] / 2f, at[1] / 2f, (at[0] + viewfinderFrame.width) / 2f, (at[1] + viewfinderFrame.height) / 2f),
+                            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+                    }
+                    org.photoall.film.ui.Skin.lastFinder = frost
+                }.onFailure {
+                    org.photoall.film.CrashReport.note(this, "换主题截图失败，跳过过渡动画", it)
+                    org.photoall.film.ui.Skin.lastFrame = null
+                    org.photoall.film.ui.Skin.lastFinder = null
                 }
-                org.photoall.film.ui.Skin.lastFinder = frost
                 then()
             }
         }

@@ -422,7 +422,56 @@ class FilmExposure(
      */
     var plain = false
 
-    private fun fill(o: RequestSink) {
+    /**
+     * [strict]: only what this camera says it takes. A LIMITED camera handed a mode it does
+     * not list (a preset tone curve, the shading map, manual sensor values) may fail the
+     * whole request in its driver: a fatal error while opening, a black viewfinder. Only on
+     * a lens that did so (CameraActivity's step-down): others, a Galaxy among them, take the
+     * preset sRGB curve without listing it, and the viewfinder and the develop are tuned to it.
+     */
+    var strict = false
+
+    private val accepts: (CaptureRequest.Key<*>, Any) -> Boolean by lazy {
+        val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+        val manualSensor = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in caps
+        val manualPost = CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING in caps
+        fun listed(list: IntArray?, value: Any) = list == null || (value as? Int)?.let { it in list } ?: true
+        val tonemaps = chars.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)
+        val shading = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES)
+        val aeModes = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)
+        val antibanding = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES)
+        val awbModes = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
+        val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+        val focusable = (chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f) > 0f
+        val priority = if (Build.VERSION.SDK_INT >= 36) chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_PRIORITY_MODES) else null
+        val check: (CaptureRequest.Key<*>, Any) -> Boolean = { key, value ->
+            when (key) {
+                CaptureRequest.TONEMAP_MODE -> tonemaps != null && listed(tonemaps, value)
+                CaptureRequest.TONEMAP_PRESET_CURVE -> tonemaps?.contains(CaptureRequest.TONEMAP_MODE_PRESET_CURVE) == true
+                CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE -> value == CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_OFF ||
+                    (manualSensor || shading != null) && listed(shading, value)
+                CaptureRequest.CONTROL_AE_MODE -> listed(aeModes, value) && (value != CaptureRequest.CONTROL_AE_MODE_OFF || manualSensor)
+                CaptureRequest.SENSOR_EXPOSURE_TIME, CaptureRequest.SENSOR_FRAME_DURATION -> manualSensor
+                CaptureRequest.SENSOR_SENSITIVITY -> manualSensor || priority != null
+                CaptureRequest.CONTROL_AE_ANTIBANDING_MODE -> listed(antibanding, value)
+                CaptureRequest.CONTROL_AWB_MODE -> listed(awbModes, value)
+                CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_GAINS,
+                CaptureRequest.COLOR_CORRECTION_TRANSFORM -> manualPost
+                CaptureRequest.CONTROL_AF_MODE -> listed(afModes, value)
+                CaptureRequest.LENS_FOCUS_DISTANCE -> focusable
+                else -> if (Build.VERSION.SDK_INT >= 36 && key == CaptureRequest.CONTROL_AE_PRIORITY_MODE) listed(priority, value) else true
+            }
+        }
+        check
+    }
+
+    private fun fill(sink: RequestSink) {
+        val o = object : RequestSink {
+            override fun <T : Any> put(key: CaptureRequest.Key<T>, value: T): RequestSink {
+                if (!strict || accepts(key, value)) sink.put(key, value)
+                return this
+            }
+        }
         if (!plain) o.put(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
                 CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
             .put(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_PRESET_CURVE)
