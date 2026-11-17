@@ -79,6 +79,13 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
     /** Called once, on the main thread, when the next camera frame arrives. */
     @Volatile var onFrame: (() -> Unit)? = null
 
+    /**
+     * Called once, on the main thread, with the first frame of the next camera session (a
+     * surface handed out after it was set): the front / back switch uncovers the picture then.
+     */
+    @Volatile var onSessionFrame: (() -> Unit)? = null
+    @Volatile private var sessionArmed = false
+
     @Volatile var saturation = 0.7f
         set(value) { field = value; requestRender() }
 
@@ -170,6 +177,7 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         directSurface?.release()
         val surface = Surface(texture)
         directSurface = surface
+        sessionArmed = true
         ready(surface)
         requestRender()
     }
@@ -196,6 +204,7 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             requestRender()
         }
         val surface = Surface(texture)
+        sessionArmed = true
         request.provideSurface(surface, Executor { it.run() }) { surface.release() }
     }
 
@@ -219,6 +228,10 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             setOnFrameAvailableListener {
                 requestRender()
                 onFrame?.let { f -> onFrame = null; post(f) }
+                if (sessionArmed) {
+                    sessionArmed = false
+                    onSessionFrame?.let { f -> onSessionFrame = null; post(f) }
+                }
             }
         }
         pendingRequest?.let { pendingRequest = null; provide(it) }

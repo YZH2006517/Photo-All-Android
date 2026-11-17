@@ -50,6 +50,19 @@ foreach(source IN LISTS KERNEL_SOURCES)
     COMMENT "glslc ${kernel}.comp"
     VERBATIM)
   list(APPEND SPV_FILES "${spv}")
+  # the same kernel unoptimised ("<kernel>_safe"): for a GPU driver whose compiler crashes on
+  # the optimised SPIR-V (a Huawei Kirin driver on setup). The HDR+ merge is never used then.
+  if(NOT kernel MATCHES "^hp_")
+    set(safe "${SPV_DIR}/${kernel}_safe.spv")
+    add_custom_command(
+      OUTPUT "${safe}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${SPV_DIR}"
+      COMMAND "${GLSLC}" --target-env=vulkan1.1 -O0 -I "${VKDT_SHADERS}" -I "${source_dir}" "${source}" -o "${safe}"
+      DEPENDS "${source}" ${VKDT_SHADER_DEPS}
+      COMMENT "glslc ${kernel}.comp (unoptimised)"
+      VERBATIM)
+    list(APPEND SPV_FILES "${safe}")
+  endif()
 endforeach()
 set(SHADER_CPP "${CMAKE_CURRENT_BINARY_DIR}/film_shaders.cpp")
 add_custom_command(

@@ -211,12 +211,38 @@ class FilmEngine private constructor(private var handle: Long) : AutoCloseable {
         fun create(assets: AssetManager): FilmEngine {
             org.photoall.film.CrashReport.stage("启动 GPU 引擎")
             // the merge kernels only where a probe in its own process compiled them (GpuProbe)
-            val burst = org.photoall.film.CrashReport.burstKernelsAllowed() && GpuProbe.burstAllowed()
-            val handle = synchronized(shaderCompileLock) { FilmNative.create(assets, burst) }
+            val plan = GpuProbe.plan()
+            val crashed = org.photoall.film.CrashReport.engineCrashMode() // the app's own process
+            plan.off?.let { throw IllegalStateException(it) }
+            if (crashed == "off") throw IllegalStateException("这台手机的 GPU 驱动编译不了胶片引擎（未优化的着色器也崩溃了）")
+            val safe = plan.safe || crashed == "safe"
+            val burst = !safe && org.photoall.film.CrashReport.burstKernelsAllowed() && plan.burst
+            val handle = synchronized(shaderCompileLock) { FilmNative.create(assets, burst, safe) }
             return FilmEngine(handle).also {
                 runCatching { it.deviceName }.getOrNull()?.let { name -> org.photoall.film.CrashReport.gpuName(name) }
                 org.photoall.film.CrashReport.stage("GPU 引擎就绪")
             }
+        }
+
+        /**
+         * What the engine had to give up on this phone, said once per app version and system
+         * build: the merge kernels, or the optimised shaders. Null when nothing (or told).
+         */
+        fun notice(context: android.content.Context): String? {
+            val verdict = GpuProbe.verdict(context) ?: ""
+            val (mode, text) = when {
+                verdict.startsWith("safe") || org.photoall.film.CrashReport.engineCrashMode() == "safe" ->
+                    "safe" to "这台手机的 GPU 驱动编译胶片引擎时出错，已自动改用兼容模式（效果不变，可能稍慢），HDR+ 多帧合成不可用"
+                verdict.startsWith("sealed") || !org.photoall.film.CrashReport.burstKernelsAllowed() ->
+                    "burst" to "这台手机的 GPU 驱动编译多帧合成时出错，HDR+ 已自动关闭，RAW 改用单帧冲洗"
+                else -> return null
+            }
+            val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode }.getOrDefault(0L)
+            val key = "$mode|$version|${android.os.Build.FINGERPRINT}"
+            val prefs = context.getSharedPreferences("gpu_notice", android.content.Context.MODE_PRIVATE)
+            if (prefs.getString("told", null) == key) return null
+            prefs.edit().putString("told", key).apply()
+            return text
         }
 
         val filmStocks: List<String> by lazy { FilmNative.names(false).toList() }
@@ -230,7 +256,8 @@ internal object FilmNative {
     }
 
     /** [burst] false leaves the HDR+ merge kernels out (see CrashReport.burstKernelsAllowed). */
-    @JvmStatic external fun create(assets: AssetManager, burst: Boolean): Long
+    /** [safe] builds from the unoptimised SPIR-V (a driver whose compiler crashed on the optimised). */
+    @JvmStatic external fun create(assets: AssetManager, burst: Boolean, safe: Boolean = false): Long
 
     /** Called from native code with each step of [create] (kernel names while compiling). */
     @JvmStatic fun stage(what: String) = stageSink(what)

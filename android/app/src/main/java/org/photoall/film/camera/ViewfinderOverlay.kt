@@ -241,6 +241,14 @@ class ViewfinderOverlay(context: Context) : View(context) {
         set(value) { field = value; invalidate() }
     var frostAlpha = 0f
         set(value) { field = value; invalidate() }
+    /**
+     * The still turned about the vertical axis, in degrees (the front / back switch): the
+     * well shows round it, opaque, so the camera changing underneath is never seen.
+     */
+    var flipDegrees = 0f
+        set(value) { field = value; invalidate() }
+    private val flipCamera = android.graphics.Camera()
+    private val flipMatrix = android.graphics.Matrix()
     private val frostPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val frostSrc = android.graphics.Rect()
     private val frostDst = android.graphics.RectF()
@@ -267,9 +275,33 @@ class ViewfinderOverlay(context: Context) : View(context) {
             frostSrc.set(0, ((bh - ch) / 2).toInt(), f.width, ((bh + ch) / 2).toInt())
         }
         frostDst.set(0f, 0f, width.toFloat(), height.toFloat())
+        if (flipDegrees != 0f) {
+            frostPaint.color = 0xff0b0b0d.toInt()
+            frostPaint.alpha = a
+            canvas.drawRect(frostDst, frostPaint)
+            val cx = width / 2f
+            val cy = height / 2f
+            flipCamera.save()
+            flipCamera.setLocation(0f, 0f, -14f)
+            flipCamera.rotateY(flipDegrees)
+            flipCamera.getMatrix(flipMatrix)
+            flipCamera.restore()
+            flipMatrix.preTranslate(-cx, -cy)
+            flipMatrix.postTranslate(cx, cy)
+            canvas.save()
+            canvas.concat(flipMatrix)
+        }
         frostPaint.color = Color.WHITE
         frostPaint.alpha = a
         canvas.drawBitmap(f, frostSrc, frostDst, frostPaint)
+        if (flipDegrees != 0f) {
+            // the side turning away goes darker, as a card does in the light
+            val shade = kotlin.math.abs(kotlin.math.sin(Math.toRadians(flipDegrees.toDouble()))).toFloat()
+            frostPaint.color = Color.BLACK
+            frostPaint.alpha = (shade * 0.45f * a).toInt()
+            canvas.drawRect(frostDst, frostPaint)
+            canvas.restore()
+        }
     }
 
     override fun dispatchDraw(canvas: Canvas) {

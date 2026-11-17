@@ -128,6 +128,7 @@ bool load_lut(const std::string &path, film::Lut &lut, std::string &error)
 
 int main(int argc, char **argv)
 {
+  bool safe = false;
   std::string filmsim_path, spectra_path, in_path, out_path, error;
   std::vector<std::string> burst_paths;
   std::string creative_path;
@@ -157,6 +158,7 @@ int main(int argc, char **argv)
     else if(arg == "--ev") options.exposure_ev = std::stof(next());
     else if(arg == "--seed") options.seed = static_cast<uint32_t>(std::stoul(next()));
     else if(arg == "--p3") options.output = film::ColourSpace::DisplayP3;
+    else if(arg == "--safe") safe = true; // the unoptimised SPIR-V (see DeviceInfo::safe_shaders)
     else if(arg == "--set")
     {
       const std::string kv = next();
@@ -218,7 +220,7 @@ int main(int argc, char **argv)
   }
 
   const auto t0 = std::chrono::steady_clock::now();
-  auto engine = film::FilmEngine::create(filmsim, spectra, error);
+  auto engine = film::FilmEngine::create(filmsim, spectra, error, true, safe);
   if(!engine)
   {
     std::cerr << "engine: " << error << "\n";

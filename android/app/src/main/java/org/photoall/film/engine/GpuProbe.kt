@@ -37,24 +37,54 @@ object GpuProbe {
     fun verdict(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(key(context), null)
 
-    /** True when the merge kernels may be compiled here; probes first if not yet known. Blocks. */
-    fun burstAllowed(): Boolean {
-        val context = app ?: return true // not the app's own process: decide nothing
+    /**
+     * How the engine may be built here: [burst] with the merge kernels; [safe] from the
+     * unoptimised SPIR-V; [off] (why) not at all.
+     */
+    class Plan(val burst: Boolean, val safe: Boolean = false, val off: String? = null)
+
+    /**
+     * The plan for this phone; probes first if not yet known. Blocks. Verdicts: "ok";
+     * "sealed: why" (no merge kernels); "safe: why" (a core kernel crashed the compiler, the
+     * unoptimised ones did not: a Huawei Kirin driver on setup); "off: why" (neither did).
+     */
+    fun plan(): Plan {
+        val context = app ?: return Plan(true) // not the app's own process: decide nothing
         synchronized(lock) {
-            verdict(context)?.let { return it == "ok" }
-            val result = probe(context)
-            android.util.Log.i("GpuProbe", "verdict: $result")
-            // the probe never ran (a system that holds services back): no answer, ask next time,
-            // and keep the merge, as nothing says the driver can't take it
-            if (result.startsWith("unknown")) return true
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .clear().putString(key(context), result).commit()
-            return result == "ok"
+            val known = verdict(context) ?: run {
+                var result = probe(context, burst = true, safe = false)
+                val kernel = runCatching { stageFile(context).readText().trim() }.getOrDefault("")
+                val core = kernel.isNotEmpty() && !kernel.startsWith("hp_") && kernel !in setOf("vulkan", "ready", "failed")
+                if (result.startsWith("sealed") && core) {
+                    // the process has to be gone before the service is bound again
+                    Thread.sleep(800)
+                    val again = probe(context, burst = false, safe = true)
+                    val why = result.removePrefix("sealed: ")
+                    result = when {
+                        again == "ok" -> "safe: $why"
+                        again.startsWith("unknown") -> result
+                        else -> "off: $why；未优化的着色器也不行（${again.substringAfter(": ")}）"
+                    }
+                }
+                android.util.Log.i("GpuProbe", "verdict: $result")
+                // the probe never ran (a system that holds services back): no answer, ask next
+                // time, and keep the merge, as nothing says the driver can't take it
+                if (result.startsWith("unknown")) return Plan(true)
+                context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                    .clear().putString(key(context), result).commit()
+                result
+            }
+            return when {
+                known == "ok" -> Plan(true)
+                known.startsWith("safe") -> Plan(false, safe = true)
+                known.startsWith("off") -> Plan(false, off = "这台手机的 GPU 驱动编译不了胶片引擎（${known.removePrefix("off: ")}）")
+                else -> Plan(false)
+            }
         }
     }
 
-    /** "ok", or "sealed: why". */
-    private fun probe(context: Context): String {
+    /** "ok", or "sealed: why", or "unknown: why". */
+    private fun probe(context: Context, burst: Boolean, safe: Boolean): String {
         val stageFile = stageFile(context)
         stageFile.delete()
         val connected = CountDownLatch(1)
@@ -82,6 +112,8 @@ object GpuProbe {
             val caller = Thread({
                 val data = Parcel.obtain()
                 val reply = Parcel.obtain()
+                data.writeInt(if (burst) 1 else 0)
+                data.writeInt(if (safe) 1 else 0)
                 answer = try {
                     binder!!.transact(CODE_PROBE, data, reply, 0)
                     reply.readString() ?: "sealed: 没有结果"
@@ -136,8 +168,10 @@ object GpuProbe {
                 if (code != CODE_PROBE) return super.onTransact(code, data, reply, flags)
                 val file = stageFile(this@Probe)
                 FilmNative.stageSink = { stage -> runCatching { file.writeText(stage) } }
+                val burst = data.dataAvail() < 8 || data.readInt() == 1
+                val safe = data.dataAvail() >= 4 && data.readInt() == 1
                 val result = try {
-                    val handle = FilmNative.create(assets, true)
+                    val handle = FilmNative.create(assets, burst, safe)
                     FilmNative.destroy(handle)
                     "ok"
                 } catch (e: Throwable) {

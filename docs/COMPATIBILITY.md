@@ -36,7 +36,7 @@
 | 部分天玑机型 | 闪光不触发 | 同 OPPO | 同上 |
 | Xiaomi 14 Pro、vivo X200 Pro（天玑 9400）、魅族 21 Pro | 切换主题时报错（已自动恢复） | 主题过渡要截一张屏，软件画布画不了屏上的硬件位图（相册缩略图） | `Skin.capture` 失败时改用 `Picture` 交给渲染器画；仍不行就跳过过渡动画 |
 | Xiaomi 14 Pro（骁龙 8 Gen 3，HyperOS） | 开 RAW 按快门没反应，相机反复重连 | 相机声称支持 RAW（LEVEL_3），但 CameraX 和 Camera2 两条路的 RAW 请求都不回 | 第一次卡住改走 Camera2；Camera2 也卡住，这颗镜头记为 `raw_unusable_<id>`，改 JPEG 并提示 |
-| 华为麒麟（CMS-AL20 / Maleoon 935、PLA-AL10 / Maleoon 920） | 相机打开 0.3 秒后驱动致命错误、相机消失，反复重连 | LIMITED HAL，不给 RAW；打开时请求的输出流组合让驱动崩溃 | 打开后 4 秒内、或还在打开中（MLN-LX9 / Maleoon 935F，Android 16：打开 3 秒后致命错误，连续三次）就出致命错误，且没按快门：这颗镜头记 `plain_streams_<id>`，之后不带测光分析流、静态照片上限约 1200 万像素；再出错且在取 RAW 时记 `raw_unusable_<id>` 改 JPEG |
+| 华为麒麟（CMS-AL20 / Maleoon 935、PLA-AL10 / Maleoon 920） | 相机打开 0.3 秒后驱动致命错误、相机消失，反复重连 | LIMITED HAL，不给 RAW；打开时请求的输出流组合让驱动崩溃 | 打开后 4 秒内、或还在打开中（MLN-LX9 / Maleoon 935F，Android 16：打开 3 秒后致命错误，连续三次）就出致命错误，且没按快门：这颗镜头记 `plain_streams_<id>`，之后不带测光分析流、静态照片上限约 1200 万像素；同一颗镜头第二次出错才降级；再出错记 `strict_requests_<id>`（只发声明支持的设置），仍出错且在取 RAW 时记 `raw_unusable_<id>` 改 JPEG；每一级都提示用户 |
 
 ---
 
@@ -48,13 +48,19 @@
   - 做法：`GpuProbe` 在 `:gpuprobe` 进程里完整创建一次引擎，结果分三种：`ok`、`sealed: <阶段>`、`unknown`。只有前两种会缓存。
   - 每一步编译都记录阶段（`set_stage_hook` → `FilmNative.stage`，写盘用 `commit()`），驱动崩了也能留下是哪个 kernel。
   - 封存后 `FilmEngine.create(…, burst_kernels = false)` 跳过 `hp_*` kernel，多帧合成改单帧。
+  - **崩在基础 kernel 上（华为麒麟 hvgr 驱动编译 `setup`）：** 探测进程再用未优化的 SPIR-V（`<kernel>_safe`，glslc `-O0`，电脑上冲洗结果与优化版一致）试一次。成功记 `safe:`，以后都用它、不带多帧合成；也失败记 `off:`，引擎停用并说明原因，相机照常打开。
+  - 应用自己的进程在编译基础 kernel 时原生崩溃（`engine_stage` 是 kernel 名且上次退出是原生崩溃）：下次 `engine_safe`，已是未优化的再崩就 `engine_off`。
+  - 以上每种降级每个版本、每个系统版本提示用户一次（`FilmEngine.notice`）。
 - **取景器 GLES 和引擎 Vulkan 抢同一个编译器。** Mali 上两边同时编译容易出事，用 `shaderCompileLock` 串行。
 - **提交失败后命令缓冲区就作废了。** 分批 `submit_and_wait` / `begin` 任一步失败，后面不能再往 `cmd` 里录任何命令，否则 Adreno 驱动直接空指针崩溃（不是返回错误）。失败路径一律跳过剩余录制。
 - **AGSL 需要 API 33。** minSdk 是 29，所以界面特效没用 AGSL，改用 Canvas 加烘焙好的渐变。
 
 ### 2. 相机（CameraX / Camera2）
 
-- **绑定失败要逐级降级，不能让异常冒到主线程。** 顺序：预览加拍照加测光分析 → 去掉测光分析 → JPEG → 报"相机启动失败"。每一级都记进报告。
+- **每一次自动降级都要告诉用户。** `CameraActivity.degraded()`：较长的提示、状态栏、诊断里的"最近的提示"；同一句话在一个界面只提示一次。不能只写状态栏（一会儿就被覆盖），也不能只记日志。
+- **降级不能改变正常机型的行为。** 新的"更稳"做法只用在出过错的那颗镜头上（按镜头记在 `camera_quirks`），偶发一次不算，要同一颗镜头再出错才永久降级。反例：三星不声明支持固定 sRGB 色调曲线却一直在用，若对所有机型按声明过滤，三星的取景和成片都会变。
+- **绑定失败要逐级降级，不能让异常冒到主线程。** 顺序：预览加拍照加测光分析 → 去掉测光分析 → JPEG → 报"相机启动失败"。每一级都记进报告并提示。
+- **打开时或打开后 4 秒内驱动致命错误（华为麒麟）。** 同一颗镜头第二次出现才降级，每次降一级并重连：简化输出流（`plain_streams_<id>`：不要测光流，照片最大约 1200 万像素）→ 最简拍摄参数（`strict_requests_<id>`：只发相机声明支持的设置，并去掉暗角图和色调曲线）→ JPEG（`raw_unusable_<id>`）。
 - **不能只看"绑定成功"，要看相机的真实状态。**
   - 现象：0 号主摄从系统列表消失又回来时，CameraX 新建了相机对象，而我们的用例还挂在旧的上，拍照请求挂起，日志是 `useCaseCamera is null`。
   - 做法：监听 `cameraInfo.cameraState`；绑定后 4 秒还没打开就重连（最多 3 次）；`CameraManager.AvailabilityCallback` 报自己的镜头重新可用时，如果相机没开就重连；快门前确认相机已打开，没开就不发请求。
@@ -68,10 +74,14 @@
 - **Camera2 RAW 有两种取法。**
   - HDR：连续请求里就带 RAW 流，零延迟取环里的帧。部分芯片不支持连续输出全尺寸 RAW，会报设备错误。
   - 单张：连续请求只喂预览和测光，按快门时发一次 `TEMPLATE_STILL_CAPTURE` 取 RAW（`ZslCamera.onDemand`）。
-  - 建会话前用 `isSessionConfigurationSupported`（API 31+）问一下输出组合；不支持就去掉测光流。会话 6 秒没建好要报出停在哪一步。
+  - 建会话前用 `isSessionConfigurationSupported`（API 31+）问一下输出组合；不支持就去掉测光流（并提示直方图、高光保护不可用）。会话 12 秒没建好要报出停在哪一步。
+  - 单张 RAW 5 秒没交回：钉住的物理镜头改用主摄 RAW 变焦（`zsl_blocked` 里记 `逻辑/物理`），否则这颗镜头改 JPEG。
+  - 钉住物理镜头取 RAW 时，帧的时间戳是那颗传感器自己的，结果按逻辑和物理两个时间戳都存；单张时直接认这次请求的结果。
+  - 只能同时开一个相机的手机（小米 14 Ultra）：切换镜头前等 Camera2 会话真正关掉（最多 1.5 秒）；被占用时重试 5 次（约 9 秒），会话被断开或仍被占用就整体重连，最多 2 次。
+- **闪光拍摄绕不开 CameraX。** `raw_camera2` 的手机上，不带闪光的 RAW 走 Camera2，闪光照片仍走 CameraX。闪光 RAW 也超时，只记 `raw_flash_jpeg_<id>`：闪光时这颗镜头拍 JPEG，压光不可用（需要 RAW）；不带闪光的 RAW 不受影响。
 - **配置变化不要让系统重建相机界面。** 深色模式自动切换、显示大小、字体、语言、折叠屏开合，都会让系统重建 Activity 并关掉相机。
   - 做法：在 `configChanges` 里声明这些变化，自己处理；需要重建时，如果正在拍照就等拍完再 `recreate()`。
-- **非 RAW 拍摄请求固定的 sRGB 色调曲线（`TONEMAP_PRESET_CURVE_SRGB`）。** 这样 JPEG 和取景器预览用的是同一条曲线，取景器上套的胶片 LUT 才和成片对得上。所以 JPEG 拍摄不做导入时那种"场景还原"。
+- **非 RAW 拍摄请求固定的 sRGB 色调曲线（`TONEMAP_PRESET_CURVE_SRGB`），即使相机没声明（三星就没有）。** 只有记了 `strict_requests_<id>` 的镜头不发。 这样 JPEG 和取景器预览用的是同一条曲线，取景器上套的胶片 LUT 才和成片对得上。所以 JPEG 拍摄不做导入时那种"场景还原"。
 - **闪光照片的亮度对齐。** HAL 定的闪光曝光往往比取景器暗，闪光灯照不到的背景发灰。改为"只提亮"：向取景器亮度靠，但不压暗，最亮的 0.5% 不超过 0.9，最多提 3 档（`stage match lift`）。
 
 ### 3. 导入照片（8 位、已渲染的 JPEG）
@@ -129,13 +139,19 @@
 | 键 | 含义 | 何时写入 |
 |---|---|---|
 | `flash_torch_<镜头>` | 测光闪光不触发，改为常亮 LED | 拍完发现 FLASH_STATE 未触发 |
-| `raw_unusable_<镜头>` | 这颗镜头改用 JPEG | DNG 读不了，或最简参数下 RAW 仍让驱动重启 |
-| `raw_plain_<镜头>` | RAW 请求不带镜头暗角图和色调曲线 | 第一次 RAW 让驱动重启 |
-| `raw_camera2` | 单张 RAW 走 Camera2 按需取 | 相机开着，但 CameraX 的 RAW 请求超时 |
-| `zsl_blocked` | 这些镜头不走零延迟 RAW，HDR 改普通连拍 | 镜头拒绝连续输出 RAW 和预览 |
-| `stall_reset_v39` | 一次性清理旧版本的误判降级 | beta39 启动时 |
+| `raw_unusable_<镜头>` | 这颗镜头改用 JPEG（物理镜头 id 时：不再单独取它的 RAW） | DNG 读不了；最简参数下 RAW 仍让驱动重启；Camera2 也没交回 RAW；打开出错降到最后一级 |
+| `raw_plain_<镜头>` | 请求不带镜头暗角图和色调曲线 | 第一次 RAW 让驱动重启 |
+| `raw_camera2` | 不带闪光的 RAW 走 Camera2 按需取（全机） | 相机开着，但 CameraX 的 RAW 请求超时 |
+| `raw_flash_jpeg_<镜头>` | 闪光时这颗镜头拍 JPEG | `raw_camera2` 之后，闪光 RAW（走 CameraX）仍超时 |
+| `plain_streams_<镜头>` | 不要测光流，照片最大约 1200 万像素 | 打开时 / 打开后 4 秒内第二次致命错误 |
+| `strict_requests_<镜头>` | 只发相机声明支持的设置，且同 `raw_plain` | 简化输出流之后又一次致命错误 |
+| `zsl_blocked` | 这些镜头（`id`）不走零延迟 RAW，HDR 改普通连拍；`逻辑/物理` 不再单独取该物理镜头的 RAW | 镜头拒绝连续输出 RAW 和预览；钉住的镜头拒绝或不回应 |
+| `import_raw_inflight` / `import_raw_sealed` | 导入原相机 RAW 进行中 / 永久停用 | 见 3b |
+| `stall_reset_v39` | 一次性清理 beta39 之前误判的降级 | 每个安装第一次启动时检查并标记，之后学到的记忆不会被它清掉 |
 
-GPU 相关的记忆在 `CrashReport` 偏好里（`burst_off`）和 `GpuProbe` 的结论缓存里。
+系统更新后（`Build.FINGERPRINT` 变了，记在 `system_build`）设备记忆全部清除、重新检测，并在相机界面提示一次（`PhotoAllApp.resetQuirksAfterSystemUpdate`）；进行中的导入标记 `import_raw_inflight` 保留。第一次启动只记下系统版本。GPU 的记忆本来就按系统版本区分。
+
+GPU 相关的记忆：`CrashReport` 偏好里的 `burst_off`、`engine_safe`、`engine_off`（键含应用版本和系统版本），`GpuProbe` 的结论缓存（`ok` / `sealed` / `safe` / `off`），以及 `gpu_notice` 里已提示过的那一种。
 
 ---
 
