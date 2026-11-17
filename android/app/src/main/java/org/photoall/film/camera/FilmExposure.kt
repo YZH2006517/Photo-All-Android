@@ -198,6 +198,7 @@ class FilmExposure(
             val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100
             val e = Exposure(time, iso * boost / 100)
             live = e
+            if (Build.VERSION.SDK_INT >= 29) result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let { activePhysical = it }
             liveBoost = boost
             liveSensorIso = iso
             result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.takeIf { it.size == 3 }?.let { n ->
@@ -421,6 +422,10 @@ class FilmExposure(
      * own curve.
      */
     var plain = false
+
+    /** The lens a logical camera reports it is using (LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID), if it does. */
+    @Volatile var activePhysical: String? = null
+        private set
 
     /**
      * [strict]: only what this camera says it takes. A LIMITED camera handed a mode it does
