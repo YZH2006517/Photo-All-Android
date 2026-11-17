@@ -52,17 +52,7 @@ class ZslCamera(
      * error 4, when RAW is in the repeating request).
      */
     val onDemand: Boolean = false,
-    /**
-     * RAW from one lens inside a logical camera (an ultra-wide or a telephoto the logical
-     * camera switches to by zoom): the RAW stream is pinned to that physical camera and its
-     * DNG written with its own characteristics and result. The preview stays the logical
-     * camera's, zoomed to the same lens. Null: the logical camera's own RAW.
-     */
-    val physicalId: String? = null,
-    private val physicalCharacteristics: CameraCharacteristics? = null,
 ) {
-    /** What the RAW frames come from: the pinned lens, else the camera itself. */
-    private val rawCharacteristics: CameraCharacteristics get() = physicalCharacteristics ?: characteristics
     /**
      * A burst: one DNG per frame in native memory (newest = reference first; the caller
      * releases them) and their exposures.
@@ -103,7 +93,7 @@ class ZslCamera(
      * sensors, often MediaTek) list the full-resolution RAW here too; a ring of those is
      * gigabytes and gets the app killed, so the binned size is taken when there is one.
      */
-    val rawSize: Size = (physicalCharacteristics ?: characteristics).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+    val rawSize: Size = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
         .getOutputSizes(ImageFormat.RAW_SENSOR).let { sizes ->
             sizes.filter { it.width.toLong() * it.height <= MAX_RAW_PIXELS }.maxByOrNull { it.width.toLong() * it.height }
                 ?: sizes.minBy { it.width.toLong() * it.height }
@@ -121,6 +111,10 @@ class ZslCamera(
     private val results = LinkedHashMap<Long, TotalCaptureResult>()
     private var longWanted: Long = -1   // sensor timestamp of the long frame being waited for
     private var longFrame: Image? = null
+
+    /** The lens the logical camera says it is using now (LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID), if it says. */
+    @Volatile var activePhysical: String? = null
+        private set
 
     /** Zoom ratio (CONTROL_ZOOM_RATIO) and the tap-to-focus area. */
     @Volatile var zoom = 1f
@@ -225,11 +219,7 @@ class ZslCamera(
             }
         }
         fun config(withMeter: Boolean) = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
-            listOfNotNull(preview!!, yuvReader!!.surface.takeIf { withMeter }, rawReader!!.surface).map { surface ->
-                OutputConfiguration(surface).apply {
-                    if (surface === rawReader!!.surface && physicalId != null && Build.VERSION.SDK_INT >= 28) setPhysicalCameraId(physicalId)
-                }
-            },
+            listOfNotNull(preview!!, yuvReader!!.surface.takeIf { withMeter }, rawReader!!.surface).map { OutputConfiguration(it) },
             executor, callback)
         // ask first (Android 12+): a set of streams the camera cannot run is changed before it is
         // tried, rather than left to a HAL that may never answer
@@ -264,16 +254,13 @@ class ZslCamera(
             val now = android.os.SystemClock.uptimeMillis()
             if (statsSince == 0L) statsSince = now
             if (now - statsSince >= 5000) {
-                Log.i(TAG, "%.1f fps, %d gaps over 50 ms, %d restarts in %.1f s".format(java.util.Locale.US,
-                    frameCount * 1000.0 / (now - statsSince), gaps, restarts, (now - statsSince) / 1000.0))
+                Log.i(TAG, "%.1f fps, %d gaps over 50 ms, %d restarts in %.1f s, zoom %.2f, active lens %s".format(java.util.Locale.US,
+                    frameCount * 1000.0 / (now - statsSince), gaps, restarts, (now - statsSince) / 1000.0, zoom, activePhysical))
                 statsSince = now; frameCount = 0; gaps = 0; restarts = 0
             }
             results[ts] = result
-            // A pinned lens's RAW frames carry its own sensor's timestamp, not the logical
-            // camera's (which follows whichever lens the zoom is on): kept under both.
-            val own = if (physicalId != null) physical(result).get(CaptureResult.SENSOR_TIMESTAMP)?.takeIf { it != ts } else null
-            if (own != null) results[own] = result
-            while (results.size > 6 * keep) results.remove(results.keys.first())
+            if (Build.VERSION.SDK_INT >= 29) result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.let { activePhysical = it }
+            while (results.size > 3 * keep) results.remove(results.keys.first())
             if (request.tag == STILL_TAG) stillResult = ts
             if (request.tag == LONG_TAG) longWanted = ts
             takeLong()
@@ -546,14 +533,14 @@ class ZslCamera(
         val orientation = pendingOrientation
         val exposures = FloatArray(frames.size)
         val jobs = frames.mapIndexed { i, f ->
-            val result = physical(results[f.timestamp] ?: reference)
+            val result = results[f.timestamp] ?: reference
             val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
             exposures[i] = (time.toDouble() * iso).toFloat() // the RAW sees no post-RAW boost
             writers.submit<NativeDng?> {
                 val out = NativeDng(rawSize.width.toLong() * rawSize.height * 2 + 512 * 1024)
                 try {
-                    DngCreator(rawCharacteristics, result).use { creator ->
+                    DngCreator(characteristics, result).use { creator ->
                         creator.setOrientation(exifOrientation(orientation))
                         creator.writeImage(out, f)
                     }
@@ -607,15 +594,6 @@ class ZslCamera(
             done.countDown()
             thread.quitSafely()
         }
-    }
-
-    /** The pinned lens's own result inside a logical camera's (its exposure, white, noise model). */
-    private fun physical(result: TotalCaptureResult): CaptureResult {
-        val id = physicalId ?: return result
-        return runCatching {
-            if (Build.VERSION.SDK_INT >= 31) result.physicalCameraTotalResults[id]
-            else @Suppress("DEPRECATION") result.physicalCameraResults[id]
-        }.getOrNull() ?: result
     }
 
     companion object {
