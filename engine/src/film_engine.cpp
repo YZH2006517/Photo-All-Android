@@ -1647,6 +1647,12 @@ struct FilmEngine::Impl
       return false;
     }
     DevelopOptions opts = options;
+    // a file's own push (BaselineExposure), when nothing else sets the brightness: imports
+    if(src.raw && opts.stages.baseline && src.raw->baseline_ev != 0.0f)
+    {
+      opts.exposure_ev += src.raw->baseline_ev;
+      note("冲洗曝光", "DNG 基准曝光", "%+.2f EV", src.raw->baseline_ev);
+    }
     if(src.raw && opts.match_key > 0.0f)
     {
       const float key = raw_key(*src.raw);

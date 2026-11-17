@@ -129,6 +129,8 @@ class ImportActivity : ComponentActivity() {
     private lateinit var recipeLine: TextView
 
     private var source: Bitmap? = null      // the picture shown, small
+    /** The picture's RAW (a DNG from the phone's own camera), developed as RAW; null for a JPEG/HEIC. */
+    private var sourceDng: java.nio.ByteBuffer? = null
     private var developedPreview: Bitmap? = null
     private var request = 0
     private var developing = false
@@ -502,10 +504,12 @@ class ImportActivity : ComponentActivity() {
         busy.visibility = View.VISIBLE
         worker.later {
             val small = decode(uri, PREVIEW_EDGE)
+            val dng = readDng(uri)
             runOnUiThread {
                 if (ticket != request) return@runOnUiThread
                 if (small == null) { busy.text = "读不出这张照片"; return@runOnUiThread }
                 source = small
+                sourceDng = dng
                 developedPreview = null
                 preview.setImageBitmap(small)
                 schedulePreview()
@@ -649,18 +653,104 @@ class ImportActivity : ComponentActivity() {
     }
 
     /** Worker thread: [bitmap] through the recipe (a CCD camera LUT runs on the CPU after it). */
-    private fun develop(bitmap: Bitmap, r: Recipe, longEdge: Int, iso: Int): Pair<Bitmap, org.photoall.film.engine.Developed> {
-        val engine = engine()
+    private fun develop(bitmap: Bitmap, r: Recipe, longEdge: Int, iso: Int,
+                        dng: java.nio.ByteBuffer? = null): Pair<Bitmap, org.photoall.film.engine.Developed> {
         val digicam = LutLibrary.digicam(r.lut)?.takeIf { r.strength > 0f }
-        if (digicam != null || r.lut == 0) engine.setCreativeLut(null, LutLibrary.size, 0f)
-        else engine.setCreativeLut(LutLibrary.table(this, r.lut), LutLibrary.size, r.strength)
-        val developed = engine.develop(bitmap, params(r), DevelopOptions(maxLongEdge = longEdge, exposureEv = r.ev,
+        fun prepared(): FilmEngine = engine().also { e ->
+            if (digicam != null || r.lut == 0) e.setCreativeLut(null, LutLibrary.size, 0f)
+            else e.setCreativeLut(LutLibrary.table(this, r.lut), LutLibrary.size, r.strength)
+        }
+        // A camera RAW: scene light as it was, so no scene restore; its own push back
+        // (BaselineExposure, read by the engine) on top of the slider; the highlights held by
+        // the tone compression a camera RAW kept low for. Whatever goes wrong on the way falls
+        // back to the picture's way (see rawDevelop).
+        val raw = dng?.let { rawDevelop(it, bitmap, r, longEdge, ::prepared) }
+        lastRawUsed = raw != null
+        val developed = raw ?: prepared().develop(bitmap, params(r), DevelopOptions(maxLongEdge = longEdge, exposureEv = r.ev,
             seed = Random.nextInt(), displayP3 = false))
         val image = if (digicam == null) developed.bitmap else
             Digicam.apply(this, developed.bitmap, digicam, iso = iso, strength = r.strength, seed = Random.nextInt())
                 .also { if (it !== developed.bitmap) developed.bitmap.recycle() }
-        Edr.attach(image, bitmap, r.edr)
+        if (raw == null) Edr.attach(image, bitmap, r.edr)
         return image to developed
+    }
+
+    /** Whether the last develop took the RAW route, and why not when it did not. */
+    @Volatile private var lastRawUsed = false
+    private var saidFallback: String? = null
+    @Volatile private var lastRawFallback: String? = null
+
+    /**
+     * A phone's own RAW through the engine, guarded the way the camera's RAW had to be on
+     * phones we do not have (docs/COMPATIBILITY.md): sealed for good after the app died in
+     * one; refused when too large for the memory left; any engine error, and a result that
+     * is plainly wrong next to the phone's own rendering of the same file (blown out, black,
+     * a strong colour cast: a DNG this reader misread), fall back to the picture's way.
+     * Each fallback is noted for the diagnostics and said once.
+     */
+    private fun rawDevelop(buffer: java.nio.ByteBuffer, reference: Bitmap, r: Recipe, longEdge: Int,
+                           prepared: () -> FilmEngine): org.photoall.film.engine.Developed? {
+        val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+        fun fallback(reason: String, e: Throwable? = null): org.photoall.film.engine.Developed? {
+            lastRawFallback = reason
+            org.photoall.film.CrashReport.note(this, "导入 RAW 改按图片冲洗：$reason", e ?: IllegalStateException(reason))
+            return null
+        }
+        lastRawFallback = null
+        if (quirks.getBoolean("import_raw_inflight", false))
+            quirks.edit().remove("import_raw_inflight").putBoolean("import_raw_sealed", true).commit()
+        if (quirks.getBoolean("import_raw_sealed", false)) return fallback("上次按 RAW 冲洗时应用退出了，这台手机已停用 RAW 导入")
+        val bytes = buffer.capacity().toLong()
+        if (bytes > 200_000_000L) return fallback("文件太大（${bytes / 1_048_576} MB）")
+        val memory = android.app.ActivityManager.MemoryInfo().also {
+            getSystemService(android.app.ActivityManager::class.java).getMemoryInfo(it)
+        }
+        if (memory.availMem < bytes * 6 + 300_000_000L) return fallback("可用内存不足（${memory.availMem / 1_048_576} MB）")
+        quirks.edit().putBoolean("import_raw_inflight", true).commit()
+        org.photoall.film.CrashReport.stage(this, "导入 RAW 冲洗（${bytes / 1_048_576} MB）")
+        val developed = try {
+            buffer.rewind()
+            prepared().developDng(listOf(buffer), params(r) + ("stage restore" to 0f) + ("stage baseline" to 1f), DevelopOptions(maxLongEdge = longEdge,
+                exposureEv = r.ev, seed = Random.nextInt(), displayP3 = false, localTone = 0.6f,
+                chromaDenoise = store[Settings.CHROMA_NR], rawDenoise = store[Settings.RAW_DENOISE]))
+        } catch (e: Throwable) {
+            // a failed submission leaves the engine unusable: the picture's way gets a new one
+            if (e.message?.contains("DNG") != true) { runCatching { engine?.close() }; engine = null }
+            return fallback("引擎读不了这张 RAW：${e.message}", e)
+        } finally {
+            quirks.edit().remove("import_raw_inflight").commit()
+        }
+        misread(developed.bitmap, reference)?.let { why ->
+            developed.bitmap.recycle()
+            return fallback(why)
+        }
+        return developed
+    }
+
+    /** A RAW develop plainly wrong next to the phone's own rendering, or null. */
+    private fun misread(out: Bitmap, reference: Bitmap): String? {
+        fun stats(b: Bitmap): FloatArray {
+            val small = Bitmap.createScaledBitmap(if (b.config == Bitmap.Config.HARDWARE) b.copy(Bitmap.Config.ARGB_8888, false) else b, 48, 48, true)
+            val px = IntArray(48 * 48).also { small.getPixels(it, 0, 48, 0, 0, 48, 48) }
+            var r = 0.0; var g = 0.0; var bl = 0.0; var white = 0
+            for (c in px) {
+                val cr = Color.red(c) / 255.0; val cg = Color.green(c) / 255.0; val cb = Color.blue(c) / 255.0
+                r += cr; g += cg; bl += cb
+                if (cr > 0.97 && cg > 0.97 && cb > 0.97) white++
+            }
+            val n = px.size.toDouble()
+            return floatArrayOf((r / n).toFloat(), (g / n).toFloat(), (bl / n).toFloat(), (white / n).toFloat())
+        }
+        val a = stats(out)
+        val b = stats(reference)
+        val luma = 0.2126f * a[0] + 0.7152f * a[1] + 0.0722f * a[2]
+        if (a[3] > 0.5f && a[3] > b[3] + 0.3f) return "成片大面积过曝（${(a[3] * 100).toInt()}%）"
+        if (luma < 0.02f) return "成片几乎全黑"
+        fun cast(x: Float, y: Float) = kotlin.math.abs(kotlin.math.ln((x + 0.01f) / (y + 0.01f)))
+        val limit = kotlin.math.ln(2.2f)
+        if (cast(a[0] / (a[1] + 0.01f), b[0] / (b[1] + 0.01f)) > limit ||
+            cast(a[2] / (a[1] + 0.01f), b[2] / (b[1] + 0.01f)) > limit) return "成片严重偏色"
+        return null
     }
 
     private fun developPreview() {
@@ -670,13 +760,18 @@ class ImportActivity : ComponentActivity() {
         busy.text = "预览中…"
         busy.visibility = View.VISIBLE
         worker.later {
-            val result = runCatching { develop(src, r, PREVIEW_EDGE, 200).first }
+            val result = runCatching { develop(src, r, PREVIEW_EDGE, 200, sourceDng).first }
             runOnUiThread {
                 if (ticket != request) return@runOnUiThread
                 result.onSuccess {
                     developedPreview = it
                     preview.setImageBitmap(it)
                     busy.visibility = View.GONE
+                    val why = lastRawFallback
+                    if (sourceDng != null && why != null && why != saidFallback) {
+                        saidFallback = why
+                        android.widget.Toast.makeText(this, "这张 RAW 改按普通照片冲洗：$why", android.widget.Toast.LENGTH_LONG).show()
+                    }
                 }.onFailure { busy.text = "预览失败：${it.message}" }
             }
         }
@@ -717,7 +812,7 @@ class ImportActivity : ComponentActivity() {
         val start = System.nanoTime()
         val bitmap = decode(uri, longEdge) ?: error("读不出照片")
         val shot = ShotInfo.read(this, uri)
-        val (image, developed) = develop(bitmap, r, longEdge, shot?.iso ?: 200)
+        val (image, developed) = develop(bitmap, r, longEdge, shot?.iso ?: 200, readDng(uri))
         if (image !== bitmap) bitmap.recycle()
         val stock = FilmEngine.filmStocks[r.film]
         val paperName = FilmEngine.papers[r.paper]
@@ -727,6 +822,7 @@ class ImportActivity : ComponentActivity() {
         Photos.saveJpeg(this, image, name, quality, "$text · 导入", shot, private)
         val log = ShotLog()
         log.put("拍摄", "来源", "导入的照片")
+        log.put("拍摄", "冲洗方式", if (lastRawUsed) "按 RAW" else lastRawFallback?.let { "按图片（$it）" } ?: "按图片")
         log.put("拍摄", "原图尺寸", "${bitmap.width}x${bitmap.height}（冲洗长边上限 $longEdge）")
         log.put("胶片配方", "配方", text)
         log.put("胶片配方", "曝光", "%+.2f EV".format(Locale.US, r.ev))
@@ -741,6 +837,20 @@ class ImportActivity : ComponentActivity() {
         log.save(this, name)
         image.recycle()
     }
+
+    /** The file as a DNG in native memory when it is one (a TIFF), else null. At most 400 MB. */
+    private fun readDng(uri: Uri): java.nio.ByteBuffer? = runCatching {
+        contentResolver.openInputStream(uri)?.use { input ->
+            val head = ByteArray(4)
+            if (input.read(head) != 4) return@use null
+            val tiff = (head[0] == 'I'.code.toByte() && head[1] == 'I'.code.toByte() && head[2] == 42.toByte() && head[3] == 0.toByte()) ||
+                (head[0] == 'M'.code.toByte() && head[1] == 'M'.code.toByte() && head[2] == 0.toByte() && head[3] == 42.toByte())
+            if (!tiff) return@use null
+            val rest = input.readBytes()
+            if (rest.size + 4 > 400_000_000) return@use null
+            java.nio.ByteBuffer.allocateDirect(rest.size + 4).apply { put(head); put(rest); flip() }
+        }
+    }.getOrNull()
 
     /** At most [edge] px on the long side, upright, 8-bit sRGB in memory the engine can read. */
     private fun decode(uri: Uri, edge: Int): Bitmap? = runCatching {

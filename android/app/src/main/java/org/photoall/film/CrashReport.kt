@@ -228,7 +228,10 @@ object CrashReport {
             // the GPU probe's process is meant to take a driver crash: not the app's end
             val bad = exits.filterNot { it.processName.endsWith(org.photoall.film.engine.GpuProbe.PROCESS_SUFFIX) }.firstOrNull {
                 it.reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
-                    it.reason == ApplicationExitInfo.REASON_LOW_MEMORY ||
+                    // ended for memory while in the background (the user elsewhere): the
+                    // system's housekeeping, not something to apologise for on return
+                    (it.reason == ApplicationExitInfo.REASON_LOW_MEMORY &&
+                        it.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) ||
                     it.reason == ApplicationExitInfo.REASON_ANR ||
                     (it.reason == ApplicationExitInfo.REASON_CRASH && fatal.isEmpty())
             }
@@ -272,6 +275,12 @@ object CrashReport {
         val b = StringBuilder(header(context, why, e.timestamp, previousRun = true))
         b.append("系统描述：").append(e.description ?: "—").append('\n')
         b.append("占用内存：PSS ").append(e.pss / 1024).append(" MB · RSS ").append(e.rss / 1024).append(" MB\n")
+        b.append("当时状态：").append(when {
+            e.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND -> "前台"
+            e.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE -> "后台冲洗中"
+            e.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE -> "可见"
+            else -> "后台"
+        }).append("（").append(e.importance).append("）\n")
         // The native tombstone (Android 12+) is a protobuf; its readable strings carry the
         // signal, the abort message and the backtrace's libraries and functions.
         if (Build.VERSION.SDK_INT >= 31 && (e.reason == ApplicationExitInfo.REASON_CRASH_NATIVE || e.reason == ApplicationExitInfo.REASON_ANR))
