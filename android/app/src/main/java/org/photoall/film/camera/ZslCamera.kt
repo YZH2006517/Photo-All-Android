@@ -52,7 +52,17 @@ class ZslCamera(
      * error 4, when RAW is in the repeating request).
      */
     val onDemand: Boolean = false,
+    /**
+     * RAW from one lens inside a logical camera (an ultra-wide or a telephoto the logical
+     * camera switches to by zoom): the RAW stream is pinned to that physical camera and its
+     * DNG written with its own characteristics and result. The preview stays the logical
+     * camera's, zoomed to the same lens. Null: the logical camera's own RAW.
+     */
+    val physicalId: String? = null,
+    private val physicalCharacteristics: CameraCharacteristics? = null,
 ) {
+    /** What the RAW frames come from: the pinned lens, else the camera itself. */
+    private val rawCharacteristics: CameraCharacteristics get() = physicalCharacteristics ?: characteristics
     /**
      * A burst: one DNG per frame in native memory (newest = reference first; the caller
      * releases them) and their exposures.
@@ -93,7 +103,7 @@ class ZslCamera(
      * sensors, often MediaTek) list the full-resolution RAW here too; a ring of those is
      * gigabytes and gets the app killed, so the binned size is taken when there is one.
      */
-    val rawSize: Size = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+    val rawSize: Size = (physicalCharacteristics ?: characteristics).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
         .getOutputSizes(ImageFormat.RAW_SENSOR).let { sizes ->
             sizes.filter { it.width.toLong() * it.height <= MAX_RAW_PIXELS }.maxByOrNull { it.width.toLong() * it.height }
                 ?: sizes.minBy { it.width.toLong() * it.height }
@@ -143,8 +153,8 @@ class ZslCamera(
         step("正在打开相机 $cameraId")
         // a session that never comes up says where it stopped, instead of waiting forever
         handler.postDelayed({
-            if (!closed && session == null) onError("Camera2 会话 6 秒没建好，停在：$state", false)
-        }, 6000)
+            if (!closed && session == null) onError("Camera2 会话 12 秒没建好，停在：$state", false)
+        }, 12000)
         openDevice(0)
     }
 
@@ -171,7 +181,11 @@ class ZslCamera(
                         if (!closed) onError("这颗镜头不能同时连续输出 RAW 和预览：${e.message}", true)
                     }
                 }
-                override fun onDisconnected(camera: CameraDevice) { step("相机被断开（别的应用或系统占用）"); camera.close(); device = null }
+                override fun onDisconnected(camera: CameraDevice) {
+                    step("相机被断开（别的应用或系统占用）"); camera.close(); device = null
+                    // said, so the screen connects again instead of a dark viewfinder
+                    if (!closed) onError("相机被断开：被占用", false)
+                }
                 override fun onError(camera: CameraDevice, error: Int) {
                     step("相机报错 $error")
                     camera.close()
@@ -207,7 +221,11 @@ class ZslCamera(
             }
         }
         fun config(withMeter: Boolean) = SessionConfiguration(SessionConfiguration.SESSION_REGULAR,
-            listOfNotNull(preview!!, yuvReader!!.surface.takeIf { withMeter }, rawReader!!.surface).map { OutputConfiguration(it) },
+            listOfNotNull(preview!!, yuvReader!!.surface.takeIf { withMeter }, rawReader!!.surface).map { surface ->
+                OutputConfiguration(surface).apply {
+                    if (surface === rawReader!!.surface && physicalId != null && Build.VERSION.SDK_INT >= 28) setPhysicalCameraId(physicalId)
+                }
+            },
             executor, callback)
         // ask first (Android 12+): a set of streams the camera cannot run is changed before it is
         // tried, rather than left to a HAL that may never answer
@@ -247,8 +265,12 @@ class ZslCamera(
                 statsSince = now; frameCount = 0; gaps = 0; restarts = 0
             }
             results[ts] = result
-            while (results.size > 3 * keep) results.remove(results.keys.first())
-            if (request.tag == STILL_TAG) results[ts] = result.also { stillResult = ts }
+            // A pinned lens's RAW frames carry its own sensor's timestamp, not the logical
+            // camera's (which follows whichever lens the zoom is on): kept under both.
+            val own = if (physicalId != null) physical(result).get(CaptureResult.SENSOR_TIMESTAMP)?.takeIf { it != ts } else null
+            if (own != null) results[own] = result
+            while (results.size > 6 * keep) results.remove(results.keys.first())
+            if (request.tag == STILL_TAG) stillResult = ts
             if (request.tag == LONG_TAG) longWanted = ts
             takeLong()
             takeStill()
@@ -405,16 +427,23 @@ class ZslCamera(
     private fun takeStill() {
         if (!onDemand || pending == null) return
         val image = stillImage ?: return
-        if (results[image.timestamp] == null) return
+        // on demand the RAW stream is fed by the still request alone: its result is this
+        // frame's even where the timestamps differ (a HAL that stamps them apart)
+        val result = results[image.timestamp] ?: results[stillResult] ?: return
+        results[image.timestamp] = result
         stillImage = null
         pendingFrames = listOf(image)
         finish(null)
     }
 
-    private fun stillFailed(why: String) {
+    /** The last still was never answered (not refused): the caller steps down. */
+    @Volatile var stillTimedOut = false
+
+    private fun stillFailed(why: String, timeout: Boolean = false) {
         val done = pending ?: return
         pending = null
         stillError = why
+        stillTimedOut = timeout
         stillImage?.close(); stillImage = null
         done(null)
     }
@@ -429,6 +458,8 @@ class ZslCamera(
             pendingOrientation = orientationDegrees
             pending = done
             stillError = null
+            stillTimedOut = false
+            stillResult = -1L
             stillImage?.close(); stillImage = null
             try {
                 val b = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
@@ -438,7 +469,7 @@ class ZslCamera(
                 b.setTag(STILL_TAG)
                 s.capture(b.build(), resultCallback, handler)
                 val ms = (exposure.live?.timeNs ?: 50_000_000L) / 1_000_000
-                handler.postDelayed({ if (pending === done) stillFailed("相机 ${5000 + 3 * ms} ms 内没有交回 RAW") }, 5000 + 3 * ms)
+                handler.postDelayed({ if (pending === done) stillFailed("相机 ${5000 + 3 * ms} ms 内没有交回 RAW", timeout = true) }, 5000 + 3 * ms)
             } catch (e: Exception) {
                 Log.w(TAG, "still RAW", e)
                 stillFailed("拍摄请求被拒绝：${e.message}")
@@ -511,14 +542,14 @@ class ZslCamera(
         val orientation = pendingOrientation
         val exposures = FloatArray(frames.size)
         val jobs = frames.mapIndexed { i, f ->
-            val result = results[f.timestamp] ?: reference
+            val result = physical(results[f.timestamp] ?: reference)
             val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
             exposures[i] = (time.toDouble() * iso).toFloat() // the RAW sees no post-RAW boost
             writers.submit<NativeDng?> {
                 val out = NativeDng(rawSize.width.toLong() * rawSize.height * 2 + 512 * 1024)
                 try {
-                    DngCreator(characteristics, result).use { creator ->
+                    DngCreator(rawCharacteristics, result).use { creator ->
                         creator.setOrientation(exifOrientation(orientation))
                         creator.writeImage(out, f)
                     }
@@ -542,7 +573,18 @@ class ZslCamera(
         }
     }
 
-    fun close() {
+    /**
+     * Closes the camera on its thread. [wait]: until it is closed (up to 1.5 s), so the next
+     * camera opened does not find this one still held: a phone that lets an app hold one
+     * camera at a time (Xiaomi 14 Ultra, HyperOS) left a front / back switch hanging.
+     */
+    fun close(wait: Boolean = false) {
+        val done = java.util.concurrent.CountDownLatch(1)
+        closeAsync(done)
+        if (wait && Thread.currentThread() !== thread) runCatching { done.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS) }
+    }
+
+    private fun closeAsync(done: java.util.concurrent.CountDownLatch) {
         closed = true
         exposure.onSettings = null
         handler.post {
@@ -558,8 +600,18 @@ class ZslCamera(
             yuvReader?.close()
             results.clear()
             writers.shutdown()
+            done.countDown()
             thread.quitSafely()
         }
+    }
+
+    /** The pinned lens's own result inside a logical camera's (its exposure, white, noise model). */
+    private fun physical(result: TotalCaptureResult): CaptureResult {
+        val id = physicalId ?: return result
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= 31) result.physicalCameraTotalResults[id]
+            else @Suppress("DEPRECATION") result.physicalCameraResults[id]
+        }.getOrNull() ?: result
     }
 
     companion object {
@@ -568,7 +620,7 @@ class ZslCamera(
         const val RING = 6
         const val MAX_RAW_PIXELS = 26_000_000L
         /** Waits before asking again for a camera still held by its last user. */
-        private val RETRIES = longArrayOf(300, 700, 1500)
+        private val RETRIES = longArrayOf(300, 700, 1500, 2500, 4000)
         private const val LONG_TAG = "long"
         private const val STILL_TAG = "still"
 

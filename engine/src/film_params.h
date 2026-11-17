@@ -105,6 +105,7 @@ struct Stages
   // 8-bit sources only, 0..1: how much of a camera's own rendering (saturation, contrast,
   // the shoulder ending at 1.0) is taken back off before the film, see decode.comp.
   float restore = 0.0f;
+  bool baseline = false; // apply a DNG's BaselineExposure ("stage baseline", imports only)
   // 8-bit sources only, -1..1: white balance at the door, in linear light (warmer / greener).
   float temp = 0.0f;
   float tint = 0.0f;

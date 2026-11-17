@@ -140,7 +140,7 @@ object Settings {
             Setting.Toggle(FRAME_RECIPE, "白边印胶片配方（胶卷 · 相纸 · LUT）", "边框", false),
             Setting.Toggle(RAW, "RAW（DNG）拍摄并从 RAW 冲洗", "相机", true),
             Setting.Slider(FINDER_EV, "取景画面曝光（只调取景显示，不影响照片）", "取景", -2f, 2f, 0f, format = "%+.1f EV"),
-            Setting.Toggle(FINDER_LUT, "取景画面套用胶片模拟", "取景", false),
+            Setting.Toggle(FINDER_LUT, "取景画面套用胶片模拟", "取景", true),
             Setting.Slider(FINDER_SOFT, "取景画面柔化（降低锐度，0 = 原样）", "取景", 0f, 1f, 0.5f),
             Setting.Slider(FINDER_SAT, "取景画面饱和度（1 = 原样）", "取景", 0f, 1f, 0.7f),
             Setting.Slider(FINDER_GRAIN, "取景画面颗粒感（只调取景显示，0 = 无）", "取景", 0f, 1f, 0f),

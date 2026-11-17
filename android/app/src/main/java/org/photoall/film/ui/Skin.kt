@@ -59,11 +59,27 @@ object Skin {
 
     fun capture(v: View) {
         if (calm || v.width == 0 || v.height == 0) return
-        val b = Bitmap.createBitmap(v.width / 2, v.height / 2, Bitmap.Config.ARGB_8888)
-        val c = Canvas(b)
-        c.scale(0.5f, 0.5f)
-        v.draw(c)
-        lastFrame = b
+        val w = v.width / 2
+        val h = v.height / 2
+        lastFrame = try {
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { b ->
+                val c = Canvas(b)
+                c.scale(0.5f, 0.5f)
+                v.draw(c)
+            }
+        } catch (e: IllegalArgumentException) {
+            // a hardware bitmap on screen (Xiaomi, vivo, Meizu decode thumbnails so) cannot be
+            // drawn into a software canvas: record the screen and let the renderer draw it
+            runCatching {
+                val picture = android.graphics.Picture()
+                picture.beginRecording(w, h).apply { scale(0.5f, 0.5f) }.also { v.draw(it) }
+                picture.endRecording()
+                // immutable, and a HARDWARE bitmap when the screen held one: copied to a
+                // software one the frost can still be painted onto
+                val drawn = Bitmap.createBitmap(picture)
+                drawn.copy(Bitmap.Config.ARGB_8888, true).also { if (it !== drawn) drawn.recycle() }
+            }.getOrNull() // no snapshot: the theme changes without its reveal
+        }
     }
 
     /** Draws as another style for a moment (the theme picker's live cards). Main thread only. */

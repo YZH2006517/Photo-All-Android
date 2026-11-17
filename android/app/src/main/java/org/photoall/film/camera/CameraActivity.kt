@@ -216,6 +216,8 @@ class CameraActivity : ComponentActivity() {
     private var rawCapture = false
     private var front = false
     private var lensId: String? = null
+    /** RAW from this physical lens of the bound logical camera (an ultra-wide, a telephoto); null: the camera's own. */
+    private var pinnedLens: String? = null
     private var pendingZoom: Float? = null // applied once a lens switch has bound
     private val analysisThread = Executors.newSingleThreadExecutor()
     private var exposure: FilmExposure? = null
@@ -348,7 +350,7 @@ class CameraActivity : ComponentActivity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0x80151515.toInt()) }
             Style.pressable(this)
-            setOnClickListener { front = !front; lensId = null; pendingZoom = null; haptics.play(Haptics.Event.SEGMENT); bindCamera() }
+            setOnClickListener { front = !front; lensId = null; lastBoundId = null; lensWaits = 0; pinnedLens = null; pendingZoom = null; zslBusyTries = 0; reopenTries = 0; haptics.play(Haptics.Event.SEGMENT); bindCamera() }
         }
         flashIcon = iconButton("闪光") { showFlashModes(flashIcon) }
         histogramIcon = iconButton("直方图") {
@@ -1942,7 +1944,7 @@ class CameraActivity : ComponentActivity() {
             thread.startsWith("GLThread") -> recreate()
             // a camera thread (the zero-lag session's, CameraX's): the camera again
             thread == "zsl" || thread.contains("camera", ignoreCase = true) -> {
-                zsl?.close(); zsl = null
+                zsl?.close(wait = true); zsl = null
                 bindCamera()
             }
         }
@@ -2560,7 +2562,7 @@ class CameraActivity : ComponentActivity() {
     }
 
     /** A lens the user can pick: which camera to bind and the zoom ratio that selects it. */
-    private class LensOption(val camera: CameraInfo, val zoom: Float, val ratio: Float)
+    private class LensOption(val camera: CameraInfo, val zoom: Float, val ratio: Float, val physicalId: String? = null)
 
     /**
      * Every real lens, as a magnification of the main camera. Phones like the Galaxy
@@ -2584,7 +2586,7 @@ class CameraActivity : ComponentActivity() {
                     val mm = equivalentMm(lens)
                     if (mm <= 0f) continue
                     val z = snapRatio(mm / base).coerceIn(zoom.minZoomRatio, zoom.maxZoomRatio)
-                    options += LensOption(camera, z, snapRatio(z * scale))
+                    options += LensOption(camera, z, snapRatio(z * scale), runCatching { Camera2CameraInfo.from(lens).cameraId }.getOrNull())
                 }
                 options += LensOption(camera, 1f, snapRatio(scale))
             } else options += LensOption(camera, 1f, snapRatio(equivalentMm(camera) / reference))
@@ -2593,17 +2595,21 @@ class CameraActivity : ComponentActivity() {
         val unique = options.sortedBy { it.ratio }.fold(mutableListOf<LensOption>()) { acc, o ->
             val last = acc.lastOrNull()
             if (last != null && Math.abs(last.ratio / o.ratio - 1) < 0.08f) {
-                if (o.camera.physicalCameraInfosOrEmpty().size > last.camera.physicalCameraInfosOrEmpty().size)
+                val more = o.camera.physicalCameraInfosOrEmpty().size - last.camera.physicalCameraInfosOrEmpty().size
+                // the logical camera first; on it, the plain zoom stop (its own RAW) over a pinned lens
+                if (more > 0 || (more == 0 && o.camera === last.camera && o.physicalId == null && last.physicalId != null))
                     acc[acc.lastIndex] = o
             } else acc += o
             acc
         }
-        // A single lens still gets the usual digital stops.
-        if (unique.size == 1) {
-            val only = unique[0]
-            val max = only.camera.zoomState.value?.maxZoomRatio ?: 1f
-            for (r in listOf(2f, 4f)) if (r <= max) unique += LensOption(only.camera, r, r)
-        }
+        // The usual stops up to the main camera's reach where no lens is listed: many phones keep
+        // their telephoto out of the lists apps see, yet switch to it by zoom ratio.
+        // Only when no telephoto is listed at all: a phone that lists its lenses keeps just them.
+        val max = main.zoomState.value?.maxZoomRatio ?: 1f
+        if (unique.none { it.ratio > 1.5f })
+            for (r in listOf(2f, 3f, 5f, 10f))
+                if (r <= max && unique.none { Math.abs(it.ratio / r - 1) < 0.15f }) unique += LensOption(main, r, r)
+        unique.sortBy { it.ratio }
         return unique
     }
 
@@ -2633,10 +2639,25 @@ class CameraActivity : ComponentActivity() {
         return (focal * 43.27 / diagonal).toFloat()
     }
 
+    /** The physical lens behind [option] gives RAW of its own (and has not refused it here). */
+    private fun physicalRaw(option: LensOption): Boolean {
+        val id = option.physicalId ?: return false
+        val logical = Camera2CameraInfo.from(option.camera).cameraId
+        if ("$logical/$id" in zslBlocked) return false
+        if (getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_unusable_$id", false)) return false
+        return runCatching {
+            (getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager).getCameraCharacteristics(id)
+                .get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+        }.getOrDefault(false)
+    }
+
     /** Lenses that refused the zero-lag RAW session on this phone (kept across launches). */
     private val zslBlocked: MutableSet<String> by lazy {
         getSharedPreferences("camera_quirks", MODE_PRIVATE).getStringSet("zsl_blocked", emptySet())!!.toMutableSet()
     }
+
+    private var zslBusyTries = 0
 
     private fun blockZsl(id: String) {
         zslBlocked += id
@@ -2659,7 +2680,8 @@ class CameraActivity : ComponentActivity() {
      * HDR: the lens through a zero-lag Camera2 session (RAW frames kept in memory), the
      * sensor held under the meter and the viewfinder shown as metered.
      */
-    private fun bindZsl(provider: ProcessCameraProvider, id: String, full: CameraCharacteristics, controller: FilmExposure) {
+    private fun bindZsl(provider: ProcessCameraProvider, id: String, full: CameraCharacteristics, controller: FilmExposure,
+                        pinned: String? = null, physical: CameraCharacteristics? = null) {
         provider.unbindAll()
         camera = null
         rawCapture = true
@@ -2675,16 +2697,31 @@ class CameraActivity : ComponentActivity() {
             main.post {
                 if (zsl !== session) return@post
                 org.photoall.film.CrashReport.note(this@CameraActivity, "零延迟 RAW 会话失败（镜头 $id）", IllegalStateException(message))
-                if (!refused) { status.text = message; return@post }
+                if (!refused) {
+                    status.text = message
+                    // still held by the camera before it, or taken away: connected again, twice
+                    if (message.contains("被占用") && zslBusyTries++ < 2) {
+                        trail("零延迟会话：$message，重新连接（$zslBusyTries）")
+                        main.postDelayed({ if (zsl === session && !isFinishing) bindCamera() }, 1000)
+                    }
+                    return@post
+                }
                 // this lens will not stream RAW beside the preview: remembered, and HDR goes
-                // through the ordinary capture path instead of a black viewfinder
-                blockZsl(id)
-                status.text = "$message · HDR 改用普通连拍"
+                // through the ordinary capture path instead of a black viewfinder. A pinned
+                // lens refusing is remembered for itself only; the zoom stop then crops.
+                if (pinned != null) {
+                    blockZsl("$id/$pinned")
+                    pinnedLens = null
+                    status.text = "这颗镜头不能单独输出 RAW，改用变焦"
+                } else {
+                    blockZsl(id)
+                    status.text = "$message · HDR 改用普通连拍"
+                }
                 bindCamera()
             }
-        }, onDemand = !store.flag(Settings.HDR))
+        }, onDemand = !store.flag(Settings.HDR), physicalId = pinned, physicalCharacteristics = physical)
         zsl = session
-        org.photoall.film.CrashReport.stage(this, "打开零延迟 RAW 相机 $id · ${session.rawSize} × ${session.keep} 帧")
+        org.photoall.film.CrashReport.stage(this, "打开零延迟 RAW 相机 $id${pinned?.let { "（RAW 取自镜头 $it）" } ?: ""} · ${session.rawSize} × ${session.keep} 帧")
         val sensor = full.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val rotation = zslRotation(full)
         viewfinder.sensorRotation = sensor
@@ -2763,8 +2800,10 @@ class CameraActivity : ComponentActivity() {
         all.firstOrNull { Camera2CameraInfo.from(it).cameraId == lensId }?.let { return it }
         // the lens in use just left the system's list (its driver restarting): wait for it a
         // few seconds rather than take another lens
+        // (looked for among every camera: after a switch to the other side it is simply not
+        // on this side, which once read as a driver restart and held every switch up 8 s)
         val gone = lastBoundId
-        if (gone != null && all.none { Camera2CameraInfo.from(it).cameraId == gone } && lensWaits < 8) {
+        if (gone != null && provider.availableCameraInfos.none { Camera2CameraInfo.from(it).cameraId == gone } && lensWaits < 8) {
             lensWaits++
             trail("镜头 $gone 不在系统列表里，等它回来（$lensWaits）")
             status.text = "相机驱动正在重启，稍等…"
@@ -2841,6 +2880,40 @@ class CameraActivity : ComponentActivity() {
 
     private fun cameraOpen() = camera?.cameraInfo?.cameraState?.value?.type == CameraState.Type.OPEN
 
+    private var openedAt = 0L
+
+    /**
+     * The driver died within seconds of opening, before any shot (Huawei Kirin phones, LIMITED
+     * HAL: opened, then a fatal error 0.3 s later, every time). The streams asked for are what
+     * it fails on: once, this lens gets plain streams (smaller stills, no metering stream),
+     * remembered; the rebinding that follows uses them.
+     */
+    private fun fatalAfterOpen(id: String) {
+        val now = SystemClock.uptimeMillis()
+        // died while still opening (never open since this binding: a Huawei Kirin, Android 16,
+        // three fatal errors 3 s into OPENING, one after another), or within 4 s of opening
+        val opening = openedAt < boundAt && now - boundAt < 8000
+        if ((!opening && now - openedAt > 4000) || now - shutterAt < 4000) return
+        val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+        // a step down each time, kept for this lens: plain streams first, then no RAW
+        val step = when {
+            !quirks.getBoolean("plain_streams_$id", false) -> {
+                quirks.edit().putBoolean("plain_streams_$id", true).apply()
+                "简化输出流"
+            }
+            rawCapture && !quirks.getBoolean("raw_unusable_$id", false) -> {
+                quirks.edit().putBoolean("raw_unusable_$id", true).apply()
+                "JPEG（不取 RAW）"
+            }
+            else -> return
+        }
+        trail("${if (opening) "打开时" else "打开后"}驱动出错：这颗镜头改用$step")
+        org.photoall.film.CrashReport.note(this, "相机${if (opening) "打开时" else "打开后"}驱动出错，改用$step（镜头 $id）", IllegalStateException(trailText()))
+        status.text = "相机驱动出错，已改用更稳的设置（$step）重新连接"
+        reopenTries = 0 // a new setting: its own tries
+        main.postDelayed({ if (!isFinishing) bindCamera() }, 800)
+    }
+
     private fun watchCameraState(bound: androidx.camera.core.Camera, id: String) {
         boundAt = SystemClock.uptimeMillis()
         bound.cameraInfo.cameraState.observe(this) { state ->
@@ -2853,7 +2926,9 @@ class CameraActivity : ComponentActivity() {
                 org.photoall.film.CrashReport.stage(this, text)
             }
             if (state.error?.code == CAMERA_REMOVED && shutterRaw && SystemClock.uptimeMillis() - shutterAt < 3000) rawCrashed(id)
-            if (state.type == CameraState.Type.OPEN) reopenTries = 0
+            else if (state.error?.code == CameraState.ERROR_CAMERA_FATAL_ERROR || state.error?.code == CAMERA_REMOVED)
+                fatalAfterOpen(id)
+            if (state.type == CameraState.Type.OPEN) { reopenTries = 0; openedAt = SystemClock.uptimeMillis() }
             else if (state.error?.code == CameraState.ERROR_CAMERA_IN_USE || state.error?.code == CameraState.ERROR_MAX_CAMERAS_IN_USE)
                 status.text = "相机被其他应用或系统占用，空出来后会自动接上"
         }
@@ -2934,10 +3009,15 @@ class CameraActivity : ComponentActivity() {
             // Stills: the largest 4:3 size up to ~26 MP. Many phones (Xiaomi, vivo, OPPO
             // with 50 MP sensors) offer the full-resolution size here; a burst of those, or one
             // decoded and turned, is gigabytes, and the develop works at 4096 px or less anyway.
+            // a lens whose driver died just after opening (Huawei Kirin): plain streams, i.e.
+            // stills up to ~12 MP and no metering stream beside them
+            val plainStreams = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+                .getBoolean("plain_streams_${Camera2CameraInfo.from(info).cameraId}", false)
+            val stillCap = if (plainStreams) 12_600_000L else MAX_STILL_PIXELS
             val stillSize = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionFilter { sizes, _ ->
-                    sizes.filter { it.width.toLong() * it.height <= MAX_STILL_PIXELS }
+                    sizes.filter { it.width.toLong() * it.height <= stillCap }
                         .ifEmpty { listOfNotNull(sizes.minByOrNull { it.width.toLong() * it.height }) }
                 }
                 .build()
@@ -2971,16 +3051,22 @@ class CameraActivity : ComponentActivity() {
                     }
                 }
             }
-            zsl?.close()
+            zsl?.close(wait = true) // released before any camera opens
             zsl = null
             // HDR on a lens that streams RAW: the zero-lag session instead of CameraX.
             // a lens whose RAW this app cannot develop (an unreadable DNG format): JPEG
             val rawUnusable = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_unusable_${chars.cameraId}", false)
-            if (zslWanted() && chars.cameraId !in zslBlocked && !rawUnusable) {
-                val full = (getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager)
-                    .getCameraCharacteristics(chars.cameraId)
-                if (ZslCamera.supported(full)) {
-                    bindZsl(provider, chars.cameraId, full, controller)
+            val pinned = pinnedLens?.takeIf {
+                store.flag(Settings.RAW) && "${chars.cameraId}/$it" !in zslBlocked &&
+                    runCatching { info.physicalCameraInfos.any { p -> Camera2CameraInfo.from(p).cameraId == it } }.getOrDefault(false)
+            }
+            if (pinned == null) pinnedLens = null
+            if ((zslWanted() || pinned != null) && chars.cameraId !in zslBlocked && !rawUnusable) {
+                val manager = getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+                val full = manager.getCameraCharacteristics(chars.cameraId)
+                val physical = pinned?.let { runCatching { manager.getCameraCharacteristics(it) }.getOrNull() }
+                if (ZslCamera.supported(physical ?: full)) {
+                    bindZsl(provider, chars.cameraId, full, controller, pinned, physical)
                     return@addListener
                 }
             }
@@ -3024,8 +3110,11 @@ class CameraActivity : ComponentActivity() {
             // without the analysis stream, then JPEG instead of RAW.
             var finalCapture = imageCapture
             val bound = try {
-                org.photoall.film.CrashReport.stage(this, "绑定相机 ${chars.cameraId}${if (rawCapture) " RAW" else ""}")
-                provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, imageCapture, analysis)
+                org.photoall.film.CrashReport.stage(this, "绑定相机 ${chars.cameraId}${if (rawCapture) " RAW" else ""}${if (plainStreams) " 简化流" else ""}")
+                if (plainStreams) {
+                    analysisCase = null
+                    provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, imageCapture)
+                } else provider.bindToLifecycle(cameraLife, info.cameraSelector, preview, imageCapture, analysis)
             } catch (e: Exception) {
                 Log.w(TAG, "bind: preview + capture + analysis", e)
                 org.photoall.film.CrashReport.note(this, "相机绑定降级：去掉测光分析流（${if (rawCapture) "RAW" else "JPEG"}）", e)
@@ -3217,6 +3306,15 @@ class CameraActivity : ComponentActivity() {
 
     private fun selectLens(option: LensOption) {
         haptics.play(Haptics.Event.SEGMENT)
+        // RAW from the lens itself, not the main sensor cropped: pin it (or unpin) and bind again
+        val pin = option.physicalId?.takeIf { store.flag(Settings.RAW) && physicalRaw(option) }
+        if (pin != pinnedLens) {
+            pinnedLens = pin
+            lensId = Camera2CameraInfo.from(option.camera).cameraId
+            pendingZoom = option.zoom
+            bindCamera()
+            return
+        }
         zsl?.let { session ->
             val id = Camera2CameraInfo.from(option.camera).cameraId
             if (id == session.cameraId) {
@@ -3873,7 +3971,13 @@ class CameraActivity : ComponentActivity() {
             if (shot == null) {
                 val why = session.stillError
                 if (why != null) org.photoall.film.CrashReport.note(this, "Camera2 RAW 拍摄失败", IllegalStateException(why))
-                runOnUiThread { developing--; status.text = if (why != null) "拍摄失败：$why" else "拍摄失败：连拍帧还没准备好，请再按一次"; haptics.play(Haptics.Event.ERROR) }
+                val stalled = session.stillTimedOut
+                runOnUiThread {
+                    developing--
+                    status.text = if (why != null) "拍摄失败：$why" else "拍摄失败：连拍帧还没准备好，请再按一次"
+                    haptics.play(Haptics.Event.ERROR)
+                    if (stalled) zslStillStalled(session)
+                }
                 return@shoot
             }
             log.put("拍摄", "取帧用时", "%d ms（%d 帧%s）".format(Locale.US, SystemClock.uptimeMillis() - started,
@@ -3994,7 +4098,7 @@ class CameraActivity : ComponentActivity() {
      * which also clears the stuck request.
      */
     private fun rawStalled(last: String) {
-        if (crashSeen) { zsl?.close(); zsl = null; bindCamera(); return } // said and handled in rawCrashed
+        if (crashSeen) { zsl?.close(wait = true); zsl = null; bindCamera(); return } // said and handled in rawCrashed
         val trail = trailText()
         val state = describe(camera?.cameraInfo?.cameraState?.value)
         val open = cameraOpen()
@@ -4004,12 +4108,43 @@ class CameraActivity : ComponentActivity() {
             org.photoall.film.CrashReport.note(this, "拍摄无回应 · 相机$state · 相机日志（$last）",
                 IllegalStateException(trail + "\n" + if (tail.isEmpty()) "（读不到相机日志）" else tail))
         }.start()
-        if (open) {
+        val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+        val lens = boundInfo?.let { runCatching { Camera2CameraInfo.from(it).cameraId }.getOrNull() }
+        if (open && quirks.getBoolean("raw_camera2", false) && lens != null) {
+            // Camera2 did not answer either (Xiaomi 14 Pro, HyperOS: RAW listed, never delivered
+            // to an app): two paths, no RAW. This lens shoots JPEG from now on, said plainly.
+            quirks.edit().putBoolean("raw_unusable_$lens", true).apply()
+            status.text = "这台手机没有把 RAW 交给应用，这颗镜头已改用 JPEG，请再按一次快门"
+            android.widget.Toast.makeText(this, "这台手机不提供 RAW，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
+        } else if (open) {
             // the camera was open and still did not answer a RAW request: RAW through Camera2
-            getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_camera2", true).apply()
+            quirks.edit().putBoolean("raw_camera2", true).apply()
             status.text = "相机开着却没有交回 RAW，已改用 Camera2 直接取 RAW，请再按一次快门"
         } else status.text = "相机没有真正打开（$state），已重新连接，请再按一次快门"
-        zsl?.close(); zsl = null
+        zsl?.close(wait = true); zsl = null
+        bindCamera()
+    }
+
+    /**
+     * A Camera2 RAW still never answered (OPPO Find X8 Ultra, a pinned telephoto: the same
+     * request again and again, 5 s each). Not asked again: a pinned lens is dropped for the
+     * zoom stop on the logical camera; the camera's own RAW, already the step down from
+     * CameraX, goes to JPEG on this lens. Kept for next time, said once, rebound.
+     */
+    private fun zslStillStalled(session: ZslCamera) {
+        if (zsl !== session) return
+        val pinned = session.physicalId
+        if (pinned != null) {
+            blockZsl("${session.cameraId}/$pinned")
+            pinnedLens = null
+            status.text = "这颗镜头单独取 RAW 没有回应，已改用主摄 RAW 变焦，请再按一次快门"
+        } else {
+            getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_unusable_${session.cameraId}", true).apply()
+            status.text = "这台手机没有把 RAW 交给应用，这颗镜头已改用 JPEG，请再按一次快门"
+            android.widget.Toast.makeText(this, "这台手机不提供 RAW，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
+        }
+        trail("RAW 无回应 →${if (pinned != null) "取消镜头 $pinned 单独取 RAW" else "镜头 ${session.cameraId} 改 JPEG"}")
+        zsl?.close(wait = true); zsl = null
         bindCamera()
     }
 
@@ -4404,7 +4539,7 @@ class CameraActivity : ComponentActivity() {
                 val id = boundInfo?.let { Camera2CameraInfo.from(it).cameraId }
                 if (id != null) getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("raw_unusable_$id", true).apply()
                 android.widget.Toast.makeText(this, "这台手机的 RAW 格式暂时无法冲洗，已自动改用 JPEG 拍摄", android.widget.Toast.LENGTH_LONG).show()
-                zsl?.close(); zsl = null
+                zsl?.close(wait = true); zsl = null
                 bindCamera()
             } else runOnUiThread {
                 android.widget.Toast.makeText(this, "冲洗失败：${e.message}", android.widget.Toast.LENGTH_LONG).show()
@@ -5009,7 +5144,7 @@ class CameraActivity : ComponentActivity() {
                 org.photoall.film.ui.Skin.capture(window.decorView)
                 // the surface draws nothing in a capture: paint the frost where the glass is
                 val shot = org.photoall.film.ui.Skin.lastFrame
-                if (shot != null && frost != null) {
+                if (shot != null && frost != null && shot.isMutable) {
                     val at = IntArray(2)
                     viewfinderFrame.getLocationInWindow(at)
                     android.graphics.Canvas(shot).drawBitmap(frost, null,

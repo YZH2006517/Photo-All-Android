@@ -477,6 +477,12 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
     return it != ifd0.end() ? tiff.values(it->second) : std::vector<double>{};
   };
 
+  // tags of the CFA image itself, never inherited from IFD0 (often an RGB thumbnail there)
+  auto own = [&](uint16_t id) -> std::vector<double> {
+    auto it = raw->find(id);
+    return it != raw->end() ? tiff.values(it->second) : std::vector<double>{};
+  };
+
   const auto width = tag(256), height = tag(257), bits = tag(258), compression = tag(259);
   const auto offsets = tag(273), counts = tag(279);
   const auto tile_w = tag(322), tile_h = tag(323), tile_offsets = tag(324), tile_counts = tag(325);
@@ -593,13 +599,65 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
     }
   }
 
+  // What this reader cannot develop right is refused, so the caller can fall back, rather
+  // than turned into a wrong picture: a CFA other than 2x2 Bayer (Quad Bayer left
+  // un-remosaiced, X-Trans), more than one sample per pixel, a linearization table.
+  const auto repeat = own(33421), spp = own(277), linearization = own(50712);
+  if(repeat.size() == 2 && (repeat[0] != 2 || repeat[1] != 2))
+  {
+    error = "unsupported DNG: CFA repeats " + std::to_string(int(repeat[0])) + "x" + std::to_string(int(repeat[1]));
+    return false;
+  }
+  if(!spp.empty() && spp[0] != 1)
+  {
+    error = "unsupported DNG: " + std::to_string(int(spp[0])) + " samples per pixel";
+    return false;
+  }
+  if(!linearization.empty())
+  {
+    error = "unsupported DNG: linearization table";
+    return false;
+  }
   const auto pattern = tag(33422);
   if(pattern.size() == 4)
-    for(int i = 0; i < 4; i++) out.cfa_colour[i] = std::clamp(static_cast<int>(pattern[i]), 0, 2);
+  {
+    int counts[3] = {0, 0, 0};
+    for(int i = 0; i < 4; i++)
+    {
+      const int c = static_cast<int>(pattern[i]);
+      if(c < 0 || c > 2)
+      {
+        error = "unsupported DNG: CFA colour " + std::to_string(c);
+        return false;
+      }
+      counts[c]++;
+      out.cfa_colour[i] = c;
+    }
+    if(counts[0] != 1 || counts[1] != 2 || counts[2] != 1)
+    {
+      error = "unsupported DNG: CFA is not RGGB-like";
+      return false;
+    }
+  }
+  else if(!pattern.empty())
+  {
+    error = "unsupported DNG: CFA pattern of " + std::to_string(pattern.size());
+    return false;
+  }
   const auto black = tag(50714);
   for(int i = 0; i < 4; i++) out.black[i] = black.empty() ? 0.0f : static_cast<float>(black[black.size() == 4 ? i : 0]);
   const auto white = tag(50717);
   out.white = white.empty() ? static_cast<float>((1u << bps) - 1) : static_cast<float>(white[0]);
+  if(!(out.white > *std::max_element(out.black, out.black + 4) + 16.0f))
+  {
+    error = "unsupported DNG: white level " + std::to_string(int(out.white)) + " at or under black";
+    return false;
+  }
+  // BaselineExposure kept to a believable push: a broken tag must not blow a picture out
+  const auto baseline = tag(50730), baseline_offset = tag(51109);
+  out.baseline_ev = static_cast<float>((baseline.empty() ? 0.0 : baseline[0]) +
+                                       (baseline_offset.empty() ? 0.0 : baseline_offset[0]));
+  out.baseline_ev = std::isfinite(out.baseline_ev) ? std::clamp(out.baseline_ev, -3.0f, 4.0f) : 0.0f;
   const auto orientation = tag(274);
   out.orientation = orientation.empty() ? 1 : static_cast<int>(orientation[0]);
   // NoiseProfile: (S, O) per plane, variance = S * x + O for x in [0, 1]; averaged.

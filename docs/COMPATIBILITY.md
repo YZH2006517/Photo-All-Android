@@ -34,6 +34,9 @@
 | Xiaomi 11 Ultra（第三方 ROM） | RAW 冲洗失败 | DNG 用了 lossless JPEG 压缩（条带或分块），样本位深 8–16 位不等 | DNG 读取器支持这些格式；仍读不了的镜头改 JPEG（`raw_unusable_<id>`） |
 | 大底传感器（vivo X300 Pro、OPPO Find X9 Pro、Xiaomi 5000 万像素机型） | 内存暴涨、被系统杀掉 | 支持列表里有全尺寸输出，连拍或解码一次就是几个 GB | 静态照片上限约 2600 万像素；零延迟 RAW 优先取合并后的尺寸，缓冲环按内存限帧数（约 600 MB）；JPEG 按工作尺寸解码 |
 | 部分天玑机型 | 闪光不触发 | 同 OPPO | 同上 |
+| Xiaomi 14 Pro、vivo X200 Pro（天玑 9400）、魅族 21 Pro | 切换主题时报错（已自动恢复） | 主题过渡要截一张屏，软件画布画不了屏上的硬件位图（相册缩略图） | `Skin.capture` 失败时改用 `Picture` 交给渲染器画；仍不行就跳过过渡动画 |
+| Xiaomi 14 Pro（骁龙 8 Gen 3，HyperOS） | 开 RAW 按快门没反应，相机反复重连 | 相机声称支持 RAW（LEVEL_3），但 CameraX 和 Camera2 两条路的 RAW 请求都不回 | 第一次卡住改走 Camera2；Camera2 也卡住，这颗镜头记为 `raw_unusable_<id>`，改 JPEG 并提示 |
+| 华为麒麟（CMS-AL20 / Maleoon 935、PLA-AL10 / Maleoon 920） | 相机打开 0.3 秒后驱动致命错误、相机消失，反复重连 | LIMITED HAL，不给 RAW；打开时请求的输出流组合让驱动崩溃 | 打开后 4 秒内、或还在打开中（MLN-LX9 / Maleoon 935F，Android 16：打开 3 秒后致命错误，连续三次）就出致命错误，且没按快门：这颗镜头记 `plain_streams_<id>`，之后不带测光分析流、静态照片上限约 1200 万像素；再出错且在取 RAW 时记 `raw_unusable_<id>` 改 JPEG |
 
 ---
 
@@ -82,6 +85,17 @@
 
   参考 SpektraLab 的原则（入口处转成场景线性、在线性数据上测光），公式是自己写的。
 - 外部软件导出的图片无法逆推回场景光，只能按"典型手机渲染"做固定的还原，不追求精确反演。
+
+### 3b. 导入原相机 RAW
+
+- **以前 DNG 不走 RAW 流程。** 系统 `ImageDecoder` 把 DNG 解成内嵌预览或简单渲染（高光已剪掉），再当 JPEG 做场景还原，于是发白。现在 TIFF 开头的文件交给 `developDng`，不做场景还原，读 `BaselineExposure`（限制在 -3 到 +4 档），并开局部影调压缩（0.6）。
+- **读取器拒绝它处理不对的格式，而不是冲出错图：** CFA 不是 2×2（未重排的四合一、X-Trans）、每像素多个样本（线性 DNG）、带线性化表、拜耳排列不合法、白电平不高于黑电平。
+- **降级（`ImportActivity.rawDevelop`），全部退回按图片冲洗，记进诊断并提示一次：**
+  - 按 RAW 冲洗前写 `import_raw_inflight`，结束后清掉；下次发现它还在，说明上次中途退出，`import_raw_sealed` 永久停用 RAW 导入。
+  - 文件大于 200 MB，或可用内存少于文件的 6 倍加 300 MB。
+  - 引擎报错；不是 DNG 格式问题时（多半是 GPU 提交失败）重建引擎再按图片冲洗。
+  - 成片明显不对：过半过曝、几乎全黑，或与系统渲染相比 R/G、B/G 偏差超过 2.2 倍（读错 CFA 之类）。
+- 照片档案里记"冲洗方式：按 RAW / 按图片（原因）"。
 
 ### 4. HDR 输出（EDR / Ultra HDR）
 

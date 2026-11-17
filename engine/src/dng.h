@@ -25,6 +25,10 @@ struct RawImage
   // Sensor noise (DNG NoiseProfile): variance = scale * x + offset, x normalised to [0, 1].
   // Zero when the file has none; burst merging then falls back to a generic model.
   float noise_scale = 0.0f, noise_offset = 0.0f;
+  // DNG BaselineExposure (+ BaselineExposureOffset), in stops: how much brighter the file
+  // asks to be shown. A phone's own camera app often keeps its RAW 1-3 stops under to save
+  // the highlights and writes the push back here; CameraX / DngCreator files have none.
+  float baseline_ev = 0.0f;
 };
 
 // `neutral` (camera rgb of a neutral, as DNG AsShotNeutral) replaces the file's own when
