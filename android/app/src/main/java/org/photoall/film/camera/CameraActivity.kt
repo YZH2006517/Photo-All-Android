@@ -55,6 +55,7 @@ import org.photoall.film.MainActivity
 import org.photoall.film.engine.DevelopOptions
 import org.photoall.film.engine.Developed
 import org.photoall.film.engine.FilmEngine
+import org.photoall.film.engine.REFERENCE_EXPOSURE
 import org.photoall.film.gallery.GalleryActivity
 import org.photoall.film.gallery.Photos
 import org.photoall.film.settings.LutLibrary
@@ -3917,11 +3918,8 @@ class CameraActivity : ComponentActivity() {
             val torchFrame = if (flashMix != null) count - 1 else if (manualFlash) 0 else -1
             val keepRaw = store.flag(Settings.KEEP_RAW)
             val files = (0 until count).map { File(cacheDir, "FILM_${stamp}_$it.dng") }
-            // The viewfinder's brightness at the shot: the develop matches it, which also
-            // undoes any darker hold. Without a reading, push back explicitly.
-            val key = meter?.key ?: 0f
-            val pushBack = if (still != null && metered != null)
-                (Math.log(metered.total / still.total) / Math.log(2.0)).toFloat() else 0f
+            // brightness: the develop meters the frame itself (REFERENCE_EXPOSURE), which also
+            // undoes any darker hold
             // The DNG headers CameraX writes repeat an old capture result (exposure, white
             // balance, noise model); take them from the live camera state at the shot instead.
             // A single flash: its exposure and colour are the flash's (HAL-metered); the
@@ -3934,10 +3932,11 @@ class CameraActivity : ComponentActivity() {
                 else -> controller?.stillMetadata(still) ?: Triple(null, 0f, 0f)
             }
             val developOptions = options.copy(
-                exposureEv = rawEv + if (key > 0f || singleFlash) 0f else pushBack,
-                // a flash frame keeps the HAL's exposure where the flash lit it
-                // (it only lifts what the flash left under the viewfinder: "stage match lift")
-                matchKey = key,
+                exposureEv = rawEv,
+                // the reference spektrafilm's exposure (its centre-weighted meter, its print):
+                // matching the viewfinder's brightness instead lifted every frame half a stop
+                // and flattened the film's shadows into the phone's own look
+                matchKey = REFERENCE_EXPOSURE,
                 localTone = if (hdr) store[Settings.HDR_TONE] else 0f,
                 chromaDenoise = store[Settings.CHROMA_NR],
                 rawDenoise = store[Settings.RAW_DENOISE],
@@ -3960,7 +3959,7 @@ class CameraActivity : ComponentActivity() {
             }
             val dev = "冲洗参数（传给引擎）"
             log.put(dev, "曝光补偿 (RAW EV)", "%+.2f EV".format(Locale.US, developOptions.exposureEv))
-            log.put(dev, "对齐取景器亮度", if (developOptions.matchKey > 0) "%.5f".format(Locale.US, developOptions.matchKey) else "不对齐")
+            log.put(dev, "曝光方式", "原版（中央重点测光）")
             log.put(dev, "白平衡中性点", developOptions.neutral ?: "用 DNG 自带")
             log.put(dev, "噪声模型 (s o)", if (developOptions.noiseScale > 0) "%.4g %.4g".format(Locale.US, developOptions.noiseScale, developOptions.noiseOffset) else "用 DNG 自带")
             log.put(dev, "RAW 降噪 / 彩色降噪", "%.2f / %.2f".format(Locale.US, developOptions.rawDenoise, developOptions.chromaDenoise))
@@ -4134,7 +4133,7 @@ class CameraActivity : ComponentActivity() {
                     "曝光量 %.0f".format(Locale.US, shot.exposures[i] / 1e6) + if (i == 0) "（参考帧，最接近按快门的一帧）" else "")
             val developOptions = options.copy(
                 exposureEv = rawEv,
-                matchKey = key,
+                matchKey = REFERENCE_EXPOSURE, // see takePhoto
                 localTone = if (hdr) store[Settings.HDR_TONE] else 0f,
                 chromaDenoise = store[Settings.CHROMA_NR],
                 rawDenoise = store[Settings.RAW_DENOISE],
@@ -4142,7 +4141,7 @@ class CameraActivity : ComponentActivity() {
             )
             val dev = "冲洗参数（传给引擎）"
             log.put(dev, "曝光补偿 (RAW EV)", "%+.2f EV".format(Locale.US, developOptions.exposureEv))
-            log.put(dev, "对齐取景器亮度", "%.5f".format(Locale.US, developOptions.matchKey))
+            log.put(dev, "曝光方式", "原版（中央重点测光）")
             log.put(dev, "RAW 降噪 / 彩色降噪", "%.2f / %.2f".format(Locale.US, developOptions.rawDenoise, developOptions.chromaDenoise))
             log.put(dev, "HDR 影调压缩", developOptions.localTone)
             engineThread.later {

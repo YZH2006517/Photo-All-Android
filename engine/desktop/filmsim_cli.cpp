@@ -158,6 +158,7 @@ int main(int argc, char **argv)
     else if(arg == "--ev") options.exposure_ev = std::stof(next());
     else if(arg == "--seed") options.seed = static_cast<uint32_t>(std::stoul(next()));
     else if(arg == "--p3") options.output = film::ColourSpace::DisplayP3;
+    else if(arg == "--refexp") options.match_key = -1.0f; // the reference spektrafilm's exposure
     else if(arg == "--safe") safe = true; // the unoptimised SPIR-V (see DeviceInfo::safe_shaders)
     else if(arg == "--set")
     {
