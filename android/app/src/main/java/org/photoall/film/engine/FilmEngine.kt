@@ -47,6 +47,13 @@ class NativeDng(capacity: Long) : java.io.OutputStream() {
     }
 }
 
+
+/**
+ * [DevelopOptions.matchKey] for the reference spektrafilm's exposure: the develop meters the
+ * RAW itself (centre-weighted, to 0.184) and prints at the reference's print exposure.
+ */
+const val REFERENCE_EXPOSURE = -1f
+
 data class DevelopOptions(
     /** Working resolution; larger sources are area-resampled first. */
     val maxLongEdge: Int = 4096,
@@ -56,9 +63,9 @@ data class DevelopOptions(
     val seed: Int = 1,
     val displayP3: Boolean = true,
     /**
-     * RAW only: the viewfinder's centre-weighted log-average linear luminance at the
-     * shot. The develop scales the raw to it so the result matches the preview's
-     * brightness; [exposureEv] is then an offset. 0 disables.
+     * RAW only. > 0: a viewfinder's centre-weighted log-average linear luminance, the raw
+     * scaled to it. [REFERENCE_EXPOSURE]: the reference spektrafilm's own exposure (what
+     * the camera and imports use). 0: neither. [exposureEv] is an offset on top.
      */
     val matchKey: Float = 0f,
     /** RAW only: local tone compression before the film, 0..1 (shadows up, highlights down). */

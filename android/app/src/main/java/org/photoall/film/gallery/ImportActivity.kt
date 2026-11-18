@@ -660,9 +660,9 @@ class ImportActivity : ComponentActivity() {
             if (digicam != null || r.lut == 0) e.setCreativeLut(null, LutLibrary.size, 0f)
             else e.setCreativeLut(LutLibrary.table(this, r.lut), LutLibrary.size, r.strength)
         }
-        // A camera RAW: scene light as it was, so no scene restore; its own push back
-        // (BaselineExposure, read by the engine) on top of the slider; the highlights held by
-        // the tone compression a camera RAW kept low for. Whatever goes wrong on the way falls
+        // A camera RAW: scene light as it was, so no scene restore; exposed as the reference
+        // spektrafilm exposes (its own meter), the slider on top; the highlights held by the
+        // tone compression a camera RAW kept low for. Whatever goes wrong on the way falls
         // back to the picture's way (see rawDevelop).
         val raw = dng?.let { rawDevelop(it, bitmap, r, longEdge, ::prepared) }
         lastRawUsed = raw != null
@@ -710,7 +710,7 @@ class ImportActivity : ComponentActivity() {
         org.photoall.film.CrashReport.stage(this, "导入 RAW 冲洗（${bytes / 1_048_576} MB）")
         val developed = try {
             buffer.rewind()
-            prepared().developDng(listOf(buffer), params(r) + ("stage restore" to 0f) + ("stage baseline" to 1f), DevelopOptions(maxLongEdge = longEdge,
+            prepared().developDng(listOf(buffer), params(r) + ("stage restore" to 0f), DevelopOptions(maxLongEdge = longEdge, matchKey = org.photoall.film.engine.REFERENCE_EXPOSURE,
                 exposureEv = r.ev, seed = Random.nextInt(), displayP3 = false, localTone = 0.6f,
                 chromaDenoise = store[Settings.CHROMA_NR], rawDenoise = store[Settings.RAW_DENOISE]))
         } catch (e: Throwable) {

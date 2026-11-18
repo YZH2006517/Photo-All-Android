@@ -1653,7 +1653,22 @@ struct FilmEngine::Impl
       opts.exposure_ev += src.raw->baseline_ev;
       note("冲洗曝光", "DNG 基准曝光", "%+.2f EV", src.raw->baseline_ev);
     }
-    if(src.raw && opts.match_key > 0.0f)
+    if(src.raw && opts.match_key < 0.0f)
+    {
+      // The reference's exposure: spektrafilm meters the frame (centre-weighted mean to 0.184)
+      // and prints at its normalised print exposure. This engine's print lands 0.73 stop
+      // brighter for the same scene exposure (measured against spektrafilm 0.3.4 on Galaxy
+      // DNGs: -0.73 +- 0.02 over Portra 800, Vision3 500T, Ektar, Gold): taken off here.
+      constexpr float kReferencePrintOffset = -0.73f;
+      const float mean = raw_center_mean(*src.raw);
+      if(mean > 0.0f)
+      {
+        const float ev = std::clamp(-std::log2(mean / 0.184f) + kReferencePrintOffset, -6.0f, 6.0f);
+        opts.exposure_ev += ev;
+        note("冲洗曝光", "原版曝光（中央重点）", "测光 %.4f → %+.2f EV", mean, ev);
+      }
+    }
+    else if(src.raw && opts.match_key > 0.0f)
     {
       const float key = raw_key(*src.raw);
       if(key > 0.0f)
@@ -1735,7 +1750,7 @@ struct FilmEngine::Impl
     if(src.raw)
     {
       const float key = raw_key(*src.raw);
-      note("冲洗曝光", "取景器亮度 key", "%.5f", options.match_key);
+      if(options.match_key >= 0.0f) note("冲洗曝光", "取景器亮度 key", "%.5f", options.match_key);
       note("冲洗曝光", "参考帧亮度 key", "%.5f", key);
       note("冲洗曝光", "对齐取景器提亮", options.match_key > 0 && key > 0 ? "%+.2f EV" : "未对齐（%.0f）",
            options.match_key > 0 && key > 0 ? opts.exposure_ev - options.exposure_ev : 0.0f);
@@ -2311,6 +2326,42 @@ float raw_key(const RawImage &raw)
       weight_sum += w;
     }
   return static_cast<float>(std::exp(log_sum / weight_sum) - 1e-4);
+}
+
+float raw_center_mean(const RawImage &raw)
+{
+  constexpr int kCols = 128, kRows = 96;
+  const int qw = raw.width / 2, qh = raw.height / 2;
+  if(qw < kCols || qh < kRows) return 0.0f;
+  const float *m = raw.camera_to_rec2020;
+  const float yr = 0.2627f * m[0] + 0.6780f * m[3] + 0.0593f * m[6];
+  const float yg = 0.2627f * m[1] + 0.6780f * m[4] + 0.0593f * m[7];
+  const float yb = 0.2627f * m[2] + 0.6780f * m[5] + 0.0593f * m[8];
+  // coordinates normalised so the long edge spans [-0.5, 0.5], as spektrafilm's
+  const float longest = float(std::max(qw, qh));
+  double sum = 0.0, weight_sum = 0.0;
+  for(int r = 0; r < kRows; r++)
+    for(int c = 0; c < kCols; c++)
+    {
+      const int qx = (c * qw) / kCols, qy = (r * qh) / kRows;
+      float rgb[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+      for(int position = 0; position < 4; position++)
+      {
+        const int x = 2 * qx + (position & 1), y = 2 * qy + (position >> 1);
+        const float black = raw.black[position];
+        float v = (raw.cfa[size_t(y) * raw.width + x] - black) / (raw.white - black);
+        const int colour = raw.cfa_colour[position];
+        rgb[colour] += std::clamp(v * raw.wb[colour], 0.0f, 1.0f);
+        n[colour] += 1;
+      }
+      for(int k = 0; k < 3; k++) rgb[k] = n[k] > 0 ? rgb[k] / n[k] : 0.0f;
+      const float y = std::max(0.0f, yr * rgb[0] + yg * rgb[1] + yb * rgb[2]);
+      const double dx = ((c + 0.5) / kCols - 0.5) * qw / longest, dy = ((r + 0.5) / kRows - 0.5) * qh / longest;
+      const double w = std::exp(-(dx * dx + dy * dy) / (2 * 0.2 * 0.2));
+      sum += w * y;
+      weight_sum += w;
+    }
+  return weight_sum > 0 ? static_cast<float>(sum / weight_sum) : 0.0f;
 }
 
 float raw_luminance_quantile(const RawImage &raw, float q)

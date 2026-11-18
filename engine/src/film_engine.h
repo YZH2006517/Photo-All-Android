@@ -67,6 +67,8 @@ struct DevelopOptions
   // log-average luminance equals this (linear, the viewfinder's measured key),
   // making the develop start from the same brightness the preview showed.
   // exposure_ev is then an offset on top.
+  // > 0: the frame brought to this brightness (the viewfinder's key). < 0: the reference
+  // spektrafilm's own exposure (its centre-weighted meter, see raw_center_mean). 0: neither.
   float match_key = 0.0f;
   // Burst frames' exposures (time x gain) relative to each other, as the camera was
   // asked for, when known: frames with the same value need no exposure measurement,
@@ -93,6 +95,9 @@ float raw_key(const RawImage &raw);
 
 // Quantile `q` (0..1) of a raw's luminance (linear Y as raw_key renders it).
 float raw_luminance_quantile(const RawImage &raw, float q);
+// spektrafilm's centre-weighted meter on the raw: Gaussian weights (sigma 0.2 of the long
+// edge) over linear luminance, the arithmetic mean.
+float raw_center_mean(const RawImage &raw);
 
 struct DevelopResult
 {
