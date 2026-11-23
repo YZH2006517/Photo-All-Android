@@ -99,8 +99,8 @@ class ViewerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         org.photoall.film.ui.Style.apply(this)
         super.onCreate(savedInstanceState)
-        // Ultra HDR photos (EDR imports, the phone's own) shown with their highlights, not just the SDR base
-        if (android.os.Build.VERSION.SDK_INT >= 34) window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_HDR
+        // Ultra HDR photos (EDR imports, the phone's own) are shown with their highlights: the window
+        // goes HDR for them alone (Edr.fitWindow), ordinary photos are not dimmed by it
         index = intent.getIntExtra(INDEX, 0)
         favoritesOnly = intent.getBooleanExtra(FAVORITES, false)
         film = intent.getStringExtra(FILM)
@@ -214,9 +214,9 @@ class ViewerActivity : Activity() {
         val actions = LinearLayout(this).apply {
             setPadding(dp(8), dp(4), dp(8), dp(4))
             for ((kind, label, action) in listOf<Triple<Icon.Kind, String, () -> Unit>>(
-                Triple(Icon.Kind.SHARE, "分享") { share() },
+                Triple(Icon.Kind.SHARE, "分享") { shareMenu() },
+                Triple(Icon.Kind.EDIT, "编辑") { openEditor() },
                 Triple(Icon.Kind.FRAME, "边框") { openFrames() },
-                Triple(Icon.Kind.OPEN, "打开") { openWith() },
                 Triple(Icon.Kind.INFO, "信息") { setPanel(if (panelLevel == 2) 0 else 2) },
                 Triple(Icon.Kind.TRASH, "删除") { trash() },
             )) addView(action(kind, label, action), LinearLayout.LayoutParams(0, dp(60), 1f))
@@ -424,6 +424,7 @@ class ViewerActivity : Activity() {
             runOnUiThread {
                 if (ticket == request) {
                     image.setImageBitmap(bitmap as Bitmap?)
+                    Edr.fitWindow(window, bitmap as Bitmap?)
                     // arriving by a page turn, the preview is already in place: no fade
                     if (!arrived) {
                         image.alpha = 0f
@@ -785,6 +786,51 @@ class ViewerActivity : Activity() {
         startActivity(Intent.createChooser(
             Intent(Intent.ACTION_SEND).setType("image/jpeg").putExtra(Intent.EXTRA_STREAM, photo.uri)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), "分享照片"))
+    }
+
+    /** One key for both ways out: send the photo, or open it in another app. */
+    private fun shareMenu() {
+        current() ?: return
+        lateinit var sheet: org.photoall.film.ui.Sheet
+        fun row(kind: Icon.Kind, title: String, detail: String, go: () -> Unit) = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), 0, dp(16), 0)
+            background = Style.surface(this@ViewerActivity, fill = Style.SURFACE_2, radiusDp = 16f)
+            Style.pressable(this)
+            addView(ImageView(this@ViewerActivity).apply { setImageDrawable(Icon(kind, Style.TEXT)) },
+                LinearLayout.LayoutParams(dp(24), dp(24)))
+            addView(LinearLayout(this@ViewerActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@ViewerActivity).apply {
+                    text = title; textSize = 15f; setTextColor(Style.TEXT); typeface = Style.medium
+                })
+                addView(TextView(this@ViewerActivity).apply {
+                    text = detail; textSize = 12f; setTextColor(Style.TEXT_2); setPadding(0, dp(3), 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(14) })
+            addView(ImageView(this@ViewerActivity).apply { setImageDrawable(Icon(Icon.Kind.CHEVRON, Style.TEXT_3)) },
+                LinearLayout.LayoutParams(dp(18), dp(18)))
+            setOnClickListener { sheet.dismiss(); go() }
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(4), dp(16), dp(18))
+            addView(row(Icon.Kind.SHARE, "发送给…", "聊天、邮件、附近的设备") { share() }, LinearLayout.LayoutParams(-1, dp(68)))
+            addView(row(Icon.Kind.OPEN, "用其他应用打开", "系统相册、修图应用") { openWith() },
+                LinearLayout.LayoutParams(-1, dp(68)).apply { topMargin = dp(10) })
+        }
+        sheet = org.photoall.film.ui.Sheet(this, "分享", body)
+        sheet.show()
+    }
+
+    /** The editor: tone, colour, crop; the result is kept as a new photo. */
+    private fun openEditor() {
+        val photo = current() ?: return
+        startActivity(Intent(this, EditActivity::class.java)
+            .putExtra(EditActivity.URI, photo.uri)
+            .putExtra(EditActivity.NAME, photo.name)
+            .putExtra(EditActivity.PRIVATE, photo.file != null)
+            .putExtra(EditActivity.DESCRIPTION, photo.description))
     }
 
     /** The border editor for this photo, numbered as in the contact sheet. */

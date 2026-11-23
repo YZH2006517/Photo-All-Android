@@ -3,6 +3,8 @@
     <!-- Vulkan 1.1: compute subgroup arithmetic used by filmsim's setup pass -->
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
+    <!-- only to send a problem report when the user taps 发送给开发者 -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- 拍摄录屏: the screen through MediaProjection, held by a foreground service -->
@@ -16,6 +18,7 @@
 
     <application
         android:name=".PhotoAllApp"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:label="Photo All"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -33,14 +36,23 @@
             </intent-filter>
         </activity>
         <activity android:name=".settings.SettingsActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".settings.LogActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".settings.WhatsNewActivity" android:exported="false" android:screenOrientation="portrait"
+            android:theme="@style/FilmSeeThrough" />
+        <activity android:name=".gallery.TuneActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".settings.GuideActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.GalleryActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.ViewerActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.LightboxActivity" android:exported="false" android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".gallery.FrameActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.EditActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".ui.CameraBackActivity" android:exported="false" android:hardwareAccelerated="true"
             android:screenOrientation="sensorLandscape" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+        <activity android:name=".ui.ShelfActivity" android:exported="false" android:hardwareAccelerated="true"
+            android:screenOrientation="fullUser" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".ui.Cartridge3DActivity" android:exported="false" android:hardwareAccelerated="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+            android:screenOrientation="behind" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".gallery.ImportActivity" android:exported="false" android:screenOrientation="portrait" />
         <!-- the app's own photo folder, for sharing and opening those photos -->
         <provider

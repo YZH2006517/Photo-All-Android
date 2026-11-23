@@ -1,0 +1,30 @@
+#version 450
+// A diffusion filter's light, first step: what of the scene the filter spreads. Pro-Mist
+// and its kind spread all of it; Black Pro-Mist, Glimmerglass and Cinebloom mostly the
+// highlights: a soft threshold on luminance (scene-linear Rec.2020, mid-grey 0.18).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  float threshold; // luminance where the spreading starts (0: everything)
+  float knee;      // how gradually (a factor on the threshold)
+  float pad0, pad1;
+} push;
+
+float luminance(vec3 rgb) { return dot(rgb, vec3(0.2627, 0.6780, 0.0593)); }
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(img_out);
+  if(any(greaterThanEqual(p, size))) return;
+  vec3 c = max(texelFetch(img_in, p, 0).rgb, vec3(0.0));
+  float k = 1.0;
+  if(push.threshold > 0.0)
+  {
+    float y = luminance(c);
+    k = smoothstep(push.threshold / push.knee, push.threshold * push.knee, y);
+  }
+  imageStore(img_out, p, vec4(c * k, 1.0));
+}

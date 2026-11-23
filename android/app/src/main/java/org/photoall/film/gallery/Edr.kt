@@ -22,6 +22,18 @@ import kotlin.math.roundToInt
 object Edr {
     val supported get() = Build.VERSION.SDK_INT >= 34
 
+    /**
+     * The window in HDR mode only while the picture on it has a gain map. An HDR window makes
+     * the display leave room above SDR white, so on many phones (Samsung among them) an ordinary
+     * picture in it looks darker than the same picture elsewhere.
+     */
+    fun fitWindow(window: android.view.Window, bitmap: android.graphics.Bitmap?) {
+        if (!supported) return
+        val want = if (bitmap?.hasGainmap() == true) android.content.pm.ActivityInfo.COLOR_MODE_HDR
+            else android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+        if (window.colorMode != want) window.colorMode = want
+    }
+
     /** Gives [out] a gain map worked out from [source] (the picture before the film); [stops] 0 = none. */
     fun attach(out: Bitmap, source: Bitmap, stops: Float) {
         if (!supported || stops <= 0.01f || out.config != Bitmap.Config.ARGB_8888) return

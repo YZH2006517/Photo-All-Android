@@ -5,26 +5,167 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Cartridge</title>
 <style>
+  :root { --gold: #e3b341; --ink: #ece6da; --dim: rgba(236,230,218,0.58); --card: #1b1916; --line: rgba(236,230,218,0.12); }
   html, body { margin: 0; height: 100%; overflow: hidden; background: #141311; touch-action: none; }
   body { background: radial-gradient(120% 90% at 50% 38%, #3a3631 0%, #1c1a17 55%, #0e0d0c 100%); }
   canvas { display: block; width: 100%; height: 100%; }
-  #hint { position: fixed; left: 0; right: 0; bottom: max(28px, env(safe-area-inset-bottom)); text-align: center;
-          font: 13px/1.4 sans-serif; color: rgba(236, 230, 218, 0.62); letter-spacing: 0.06em; pointer-events: none;
+  #hint { position: fixed; left: 0; right: 0; top: max(20px, env(safe-area-inset-top)); text-align: center;
+          font: 12px/1.4 sans-serif; color: rgba(236, 230, 218, 0.5); letter-spacing: 0.08em; pointer-events: none;
           transition: opacity 0.6s; }
-  #pull { position: fixed; right: 20px; bottom: max(64px, calc(env(safe-area-inset-bottom) + 48px)); padding: 10px 16px;
+  #pull { position: fixed; right: 18px; bottom: max(64px, calc(env(safe-area-inset-bottom) + 48px)); padding: 9px 16px;
           border-radius: 20px; border: 1px solid rgba(236, 230, 218, 0.35); background: rgba(20, 19, 17, 0.55);
-          color: #ece6da; font: 14px sans-serif; letter-spacing: 0.04em; }
-  #name { position: fixed; left: 20px; top: max(22px, env(safe-area-inset-top)); color: #ece6da;
-          font: italic 20px Georgia, serif; }
-  #name small { display: block; font: 11px monospace; letter-spacing: 0.18em; color: rgba(236, 230, 218, 0.55); margin-top: 4px; font-style: normal; }
+          color: var(--ink); font: 14px sans-serif; letter-spacing: 0.04em; }
+  #name { position: fixed; left: 20px; top: max(22px, env(safe-area-inset-top)); color: var(--ink); font: italic 20px Georgia, serif; }
+  #name small { display: block; font: 11px monospace; letter-spacing: 0.18em; color: var(--dim); margin-top: 4px; font-style: normal; }
+  body.withcard #name { display: none; }
+
+  /* ---- the card: film edge on top, then the words ---- */
+  #card { display: none; position: fixed; left: 0; right: 0; bottom: 0; top: 52vh; background: var(--card); color: var(--ink);
+          border-radius: 22px 22px 0 0; box-shadow: 0 -18px 40px rgba(0,0,0,0.45); overflow: hidden;
+          transform: translateY(40px); opacity: 0; transition: transform 0.9s cubic-bezier(.2,.8,.2,1), opacity 0.7s; }
+  body.withcard #card { display: flex; flex-direction: column; }
+  body.shown #card { transform: none; opacity: 1; }
+  body.withcard #pull { bottom: calc(48vh + 14px); }
+  @media (orientation: landscape) {
+    #card { top: 0; left: auto; width: 44vw; border-radius: 22px 0 0 22px; box-shadow: -18px 0 40px rgba(0,0,0,0.45); transform: translateX(40px); }
+    body.withcard #pull { right: calc(44vw + 16px); bottom: 20px; }
+    body.withcard #hint { right: 44vw; }
+  }
+  #card::after { content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0.12; mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+  .edge { position: relative; flex: none; height: 44px; background: linear-gradient(#3b2414, #2a180c); overflow: hidden; }
+  .holes { position: absolute; left: 0; right: 0; height: 9px; top: 5px;
+    background: radial-gradient(circle at 50% 50%, transparent 0, transparent 0) ,
+      repeating-linear-gradient(90deg, transparent 0 6px, #141210 6px 15px, transparent 15px 22px); border-radius: 2px; }
+  .holes.b { top: auto; bottom: 5px; }
+  .print { position: absolute; top: 15px; white-space: nowrap; font: 600 11px monospace; letter-spacing: 0.32em; color: rgba(242,190,110,0.85);
+    animation: run 26s linear infinite; }
+  @keyframes run { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+  .body { flex: 1; overflow-y: auto; padding: 18px 22px 30px; touch-action: pan-y; }
+  .body::-webkit-scrollbar { display: none; }
+  .r { opacity: 0; transform: translateY(12px); transition: opacity 0.7s, transform 0.7s cubic-bezier(.2,.8,.2,1); }
+  body.shown .r { opacity: 1; transform: none; }
+  .kicker { font: 11px monospace; letter-spacing: 0.24em; color: var(--gold); }
+  h1 { margin: 8px 0 0; font: italic 32px/1.1 Georgia, serif; letter-spacing: 0.01em; }
+  .meta { display: flex; gap: 22px; margin-top: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .meta span { display: flex; flex-direction: column; }
+  .meta b { font: 600 20px Georgia, serif; color: var(--ink); }
+  .meta i { font: normal 10px monospace; letter-spacing: 0.2em; color: var(--dim); margin-top: 2px; }
+  .intro p { margin: 14px 0 0; font: 15px/1.75 sans-serif; color: rgba(236,230,218,0.86); }
+  .intro p:first-child::first-letter { font: italic 30px Georgia, serif; color: var(--gold); padding-right: 2px; }
+  .specs { margin-top: 18px; border-top: 1px solid var(--line); }
+  .specs div { display: grid; grid-template-columns: 5.5em 1fr; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+  .specs dt { font: 11px monospace; letter-spacing: 0.16em; color: var(--dim); padding-top: 2px; }
+  .specs dd { margin: 0; font: 14px/1.55 sans-serif; color: var(--ink); }
+  .note { margin-top: 12px; font: 11px/1.6 sans-serif; color: rgba(236,230,218,0.42); }
+  .src { margin-top: 16px; display: flex; gap: 10px; align-items: baseline; font: 11px/1.5 sans-serif; color: rgba(236,230,218,0.55); }
+  .src b { font: 600 10px monospace; letter-spacing: 0.2em; color: var(--gold); white-space: nowrap; }
+  /* the plain-words part: mood, colour, scenes, how to shoot it, how to use it here */
+  .mood { margin-top: 16px; padding: 12px 14px; border-left: 3px solid var(--gold); background: rgba(227,179,65,0.07);
+          font: italic 16px/1.5 Georgia, serif; color: var(--ink); border-radius: 0 10px 10px 0; }
+  .sec { margin-top: 20px; }
+  .sec h2 { margin: 0 0 6px; font: 600 11px monospace; letter-spacing: 0.24em; color: var(--gold); }
+  .sec p { margin: 0; font: 15px/1.8 sans-serif; color: rgba(236,230,218,0.86); }
+  .tags { display: flex; flex-wrap: wrap; gap: 7px; margin: 2px 0 10px; }
+  .tags span { padding: 5px 11px; border-radius: 14px; border: 1px solid rgba(227,179,65,0.45); color: var(--ink);
+               font: 13px sans-serif; background: rgba(227,179,65,0.08); }
+  mark { background: linear-gradient(transparent 58%, rgba(227,179,65,0.38) 58%); color: #fff2d4; font-weight: 600; padding: 0 1px; }
+  .sec strong { color: var(--gold); font-weight: 600; }
+  .foot { margin-top: 22px; font: 10px monospace; letter-spacing: 0.18em; color: rgba(236,230,218,0.3); }
 </style>
 </head>
 <body>
 <div id="name"></div>
 <button id="pull">抽出胶片</button>
 <div id="hint">单指旋转 · 双指缩放 · 双击抽出胶片</div>
+<div id="card">
+  <div class="edge"><div class="holes"></div><div class="print" id="edgeprint"></div><div class="holes b"></div></div>
+  <div class="body">
+    <div class="kicker r" id="kicker"></div>
+    <h1 class="r" id="ttl"></h1>
+    <div class="meta r"><span><b id="iso">0</b><i>ISO</i></span><span><b id="year">—</b><i>年 份</i></span><span><b id="proc">—</b><i>冲 洗</i></span><span id="codebox"><b id="code">—</b><i>编 号</i></span></div>
+    <div class="mood r" id="mood"></div>
+    <div class="intro" id="intro"></div>
+    <div id="notes"></div>
+    <dl class="specs" id="specs"></dl>
+    <div class="note r" id="note"></div>
+    <div class="src r"><b>资料</b><span id="src"></span></div>
+    <div class="foot r">PHOTO ALL · SPECTRAL FILM SIMULATION</div>
+  </div>
+</div>
 <script src="three.min.js"></script>
 <script src="cartmodel.js"></script>
+<script src="papermodel.js"></script>
+<script src="filminfo.js"></script>
+<script src="filmnotes.js"></script>
+<script>
+  // the card: what this film or paper is (filminfo.js), shown with a little ceremony
+  (function () {
+    const q = new URLSearchParams(location.search);
+    if (q.get('mode') === 'still') return;
+    const id = (q.get('id') || q.get('paper') || q.get('name') || '').toLowerCase().replace(/\s*(push|pull)\s*\d+/, '').replace(/\s*\([^)]*\)/, '').trim();
+    const notes = (window.FILM_NOTES || {})[id];
+    const info = (window.FILM_INFO || {})[id] || (notes && notes.intro ? notes : null);
+    if (!info) return;
+    const paper = !!q.get('paper');
+    const pretty = q.get('name') || id.replace(/\b\w/g, (c) => c.toUpperCase());
+    const $ = (x) => document.getElementById(x);
+    document.body.classList.add('withcard');
+    $('kicker').textContent = (info.maker + ' · ' + info.type + ' · ' + info.process).toUpperCase();
+    $('ttl').textContent = pretty;
+    $('year').textContent = info.year || '—';
+    $('proc').textContent = info.process;
+    const iso = parseInt(q.get('iso') || (id.match(/(\d{2,4})[a-z]?$/) || [])[1] || '0', 10);
+    if (paper || !iso) $('iso').parentElement.style.display = 'none';
+    const edge = (pretty.toUpperCase() + '   ▸ ' + (info.process) + '   ' + (iso ? 'ISO ' + iso + '   ' : '') + '▸ 1A   ▸ 2   ▸ 2A   ').repeat(4);
+    $('edgeprint').textContent = edge + edge;
+    // the plain words: its mood, then colour, scenes, shooting, use here; ==marked== and **bold**
+    const marked = (t) => t.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+      .replace(/==(.+?)==/g, '<mark>$1</mark>').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    if (notes && notes.mood) $('mood').textContent = notes.mood; else $('mood').style.display = 'none';
+    if (notes) {
+      const add = (title, body, tags) => {
+        if (!body && !tags) return;
+        const sec = document.createElement('div'); sec.className = 'sec r';
+        sec.innerHTML = '<h2>' + title + '</h2>' + (tags ? '<div class="tags">' + tags.map((x) => '<span>' + marked(x) + '</span>').join('') + '</div>' : '') +
+          (body ? '<p>' + marked(body) + '</p>' : '');
+        $('notes').appendChild(sec);
+      };
+      add('色彩风格', notes.style);
+      add('适合拍什么', notes.use, notes.scenes);
+      add('拍摄与冲洗', notes.tips);
+      add('在 Photo All 里', notes.here);
+    }
+    info.intro.forEach((t, i) => {
+      const p = document.createElement('p'); p.className = 'r'; p.textContent = t;
+      p.style.transitionDelay = (0.45 + i * 0.18) + 's'; $('intro').appendChild(p);
+    });
+    (info.specs || []).forEach(([k, v], i) => {
+      const row = document.createElement('div'); row.className = 'r';
+      row.style.transitionDelay = (0.75 + i * 0.09) + 's';
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.textContent = v;
+      row.append(dt, dd); $('specs').appendChild(row);
+    });
+    const grain = (info.specs || []).find(([k]) => k === '颗粒');
+    $('note').textContent = !grain ? '' : /PGI/.test(grain[1])
+      ? 'PGI：柯达的印片颗粒指数，以 35 mm 底片印 4×6 英寸照片、14 英寸观看时评定；25 约为肉眼可见颗粒的阈值，数值越低颗粒越细。'
+      : 'RMS：漫射均方根颗粒度，在密度 1.0 处以 48 μm 孔径测得，数值越低颗粒越细；与柯达的 PGI 不可直接比较。';
+    if (!$('note').textContent) $('note').style.display = 'none';
+    $('src').textContent = info.maker + ' · ' + info.source;
+    if (info.code) $('code').textContent = info.code; else $('codebox').style.display = 'none';
+    // the delays, top to bottom
+    [...document.querySelectorAll('.r')].forEach((el, i) => { if (!el.style.transitionDelay) el.style.transitionDelay = (0.15 + i * 0.1) + 's'; });
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      document.body.classList.add('shown');
+      if (iso) {                                       // the speed counted up
+        const t0 = performance.now();
+        const step = () => { const k = Math.min(1, (performance.now() - t0) / 900); $('iso').textContent = Math.round(iso * (1 - Math.pow(1 - k, 3))); if (k < 1) requestAnimationFrame(step); };
+        setTimeout(() => requestAnimationFrame(step), 350);
+      }
+    }));
+  })();
+</script>
 <script src="cartridge.js"></script>
 </body>
 </html>

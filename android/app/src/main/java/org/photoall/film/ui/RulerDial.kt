@@ -19,12 +19,25 @@ import kotlin.math.roundToInt
  * one step beyond the range per drag, so the caller can answer with the end-stop feel.
  */
 class RulerDial(context: Context) : View(context) {
+    companion object {
+        const val HOLD_MS = 3000L
+    }
+
     /** The value shown, in thirds of a stop. */
     var thirds = 0
         set(value) { field = value; invalidate() }
     var range = -9..9
     var onStep: (Int) -> Unit = {}
     var onReset: () -> Unit = {}
+    /**
+     * Held still for [HOLD_MS] (a finger on the ruler, not dragging it): a line along its foot
+     * fills as the time runs, and this runs at the end. Null: no hold.
+     */
+    var onHold: (() -> Unit)? = null
+    private var holdFrom = 0L
+    private var downX = 0f
+    private val holding = Runnable { holdFrom = 0L; invalidate(); onHold?.invoke() }
+    private val holdPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND }
     /** The label under a tick (null: a minor tick). EV by default: whole stops, "-1 0 +1". */
     var labelOf: (Int) -> String? = { t -> if (t % 3 == 0) (t / 3).let { if (it == 0) "0" else "%+d".format(it) } else null }
 
@@ -59,10 +72,18 @@ class RulerDial(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 parent?.requestDisallowInterceptTouchEvent(true)
                 lastX = event.x
+                downX = event.x
                 drag = 0f
                 pushedEnd = false
+                if (onHold != null) {
+                    holdFrom = android.os.SystemClock.uptimeMillis()
+                    postDelayed(holding, HOLD_MS)
+                    postInvalidateOnAnimation()
+                }
             }
             MotionEvent.ACTION_MOVE -> {
+                // a drag is not a hold
+                if (holdFrom != 0L && abs(event.x - downX) > 8 * density) { holdFrom = 0L; removeCallbacks(holding) }
                 // dragging left moves the ruler left: larger values come under the mark
                 drag += lastX - event.x
                 lastX = event.x
@@ -74,7 +95,7 @@ class RulerDial(context: Context) : View(context) {
                 }
                 invalidate()
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { drag = 0f; invalidate() }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { drag = 0f; holdFrom = 0L; removeCallbacks(holding); invalidate() }
         }
         return true
     }
@@ -98,6 +119,19 @@ class RulerDial(context: Context) : View(context) {
             }
         }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), fadePaint)
+        // the hold: after a moment's grace, a line filling along the foot
+        if (holdFrom != 0L) {
+            val held = android.os.SystemClock.uptimeMillis() - holdFrom
+            if (held > 500) {
+                val k = ((held - 500f) / (HOLD_MS - 500f)).coerceIn(0f, 1f)
+                holdPaint.color = Style.ACCENT
+                holdPaint.strokeWidth = 2.5f * density
+                val y = height - 3 * density
+                val half = width * 0.4f * k
+                canvas.drawLine(width / 2f - half, y, width / 2f + half, y, holdPaint)
+            }
+            postInvalidateOnAnimation()
+        }
         mark.color = Style.ACCENT
         canvas.drawLine(cx, base - 20 * density, cx, base + 2 * density, mark)
     }

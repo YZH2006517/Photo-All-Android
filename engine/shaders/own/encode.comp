@@ -18,7 +18,7 @@ layout(push_constant) uniform push_t
   vec4 row1;
   vec4 row2;
   vec4 lut;      // x strength (0 = off), y edge size n, z mode
-  vec4 mid;      // negative scan: log2 transmittance of mid grey per channel
+  vec4 mid;      // negative scan: log2 transmittance of mid grey per channel; print / slide: q, m, on
   vec4 slope;    // log2 transmittance drop per stop of exposure, per channel
   vec4 toe;      // relative exposure (stops) of unexposed film, per channel
 } push;
@@ -30,12 +30,16 @@ vec3 oetf(vec3 v)
   return mix(v * 12.92, 1.055 * pow(v, vec3(1.0 / 2.4)) - 0.055, greaterThan(v, vec3(0.0031308)));
 }
 
-// Gentle shoulder for a scanned negative: mid grey stays at 0.18, white reached about
-// 4 stops above it (the scan keeps the film's own contrast).
+// A scanned negative is scene light already (inverted and calibrated per stock, mid grey at
+// 0.18), so it is shown as it is for as long as the display can: straight up to 0.5
+// (about a stop and a half over mid grey), then rolled off toward white, the slope
+// continuous. A diffuse white (about +2.3 stops) lands near 0.77, +3 stops near 0.92, +4
+// at white. The earlier curve compressed from mid grey up, flattening every highlight.
 vec3 shoulder(vec3 x)
 {
-  x = max(x, 0.0) * 1.2;
-  return x * (1.0 + x / 16.0) / (1.0 + x);
+  x = max(x, 0.0);
+  const float knee = 0.5;
+  return mix(x, knee + (1.0 - knee) * (1.0 - exp(-(x - knee) / (1.0 - knee))), greaterThan(x, vec3(knee)));
 }
 
 // Display rendering for scene light without film: an S-curve like a camera's (the ACES
@@ -48,6 +52,53 @@ vec3 tone(vec3 x)
   return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
+// The film's output brought into the display's gamut softly instead of clipped: in OkLab
+// (Ottosson 2020), lightness rolls off towards white and chroma is compressed towards the
+// gamut boundary at that lightness and hue, both by one smooth knee d / (1 + d^p)^(1/p)
+// over the whole range, so nothing inside changes abruptly and nothing ends up outside.
+// The same kind of compression the reference spektrafilm applies at its output.
+const float kKnee = 6.0;
+const mat3 kRec2020ToXyzR = (mat3(0.636958, 0.144617, 0.168881, 0.262700, 0.677998, 0.059302,
+                                          0.0, 0.028073, 1.060985));
+const mat3 kXyzToLmsR = (mat3(0.8189330101, 0.3618667424, -0.1288597137, 0.0329845436, 0.9293118715,
+                                      0.0361456387, 0.0482003018, 0.2643662691, 0.6338517070));
+const mat3 kLmsToLabR = (mat3(0.2104542553, 0.7936177850, -0.0040720468, 1.9779984951, -2.4285922050,
+                                      0.4505937099, 0.0259040371, 0.7827717662, -0.8086757660));
+float knee(float d) { return d / pow(1.0 + pow(d, kKnee), 1.0 / kKnee); }
+// the matrices above are written row by row: v * M is the matrix applied to v
+vec3 to_lab(vec3 xyz)
+{
+  vec3 lms = xyz * kXyzToLmsR;
+  return (sign(lms) * pow(abs(lms), vec3(1.0 / 3.0))) * kLmsToLabR;
+}
+vec3 from_lab(vec3 lab)
+{
+  vec3 lms = lab * inverse(kLmsToLabR);
+  return (lms * lms * lms) * inverse(kXyzToLmsR);
+}
+vec3 gamut_compress(vec3 rgb)
+{ // rgb: linear, the output primaries
+  mat3 out_from_xyz = transpose(mat3(push.row0.xyz, push.row1.xyz, push.row2.xyz)) * inverse(transpose(kRec2020ToXyzR));
+  vec3 lab = to_lab(inverse(out_from_xyz) * rgb);
+  if(lab.x <= 0.0) return max(rgb, vec3(0.0));
+  float chroma = length(lab.yz);
+  vec2 hue = chroma > 1e-6 ? lab.yz / chroma : vec2(0.0);
+  // lightness is left as it is up to the display's white and only what lies above it is
+  // brought down to white; the roll-off toward kWhite took every white to about 0.97
+  // (245 of 255), so no film output ever reached white
+  float l = min(lab.x, 1.0);
+  // the boundary's chroma at this lightness and hue
+  float lo = 0.0, hi = 0.6;
+  for(int i = 0; i < 14; i++)
+  {
+    float mid = 0.5 * (lo + hi);
+    vec3 t = out_from_xyz * from_lab(vec3(l, hue * mid));
+    if(all(greaterThanEqual(t, vec3(-1e-4))) && all(lessThanEqual(t, vec3(1.0 + 1e-4)))) lo = mid;
+    else hi = mid;
+  }
+  float c = lo > 1e-5 ? knee(chroma / lo) * lo : 0.0;
+  return max(out_from_xyz * from_lab(vec3(l, hue * c)), vec3(0.0));
+}
 // Trilinear: the sampler interpolates red and green within a blue slice, we blend slices.
 vec3 creative(vec3 c)
 {
@@ -80,8 +131,16 @@ void main()
     vec3 base = exp2(push.toe.xyz);
     rgb = 0.18 * (exp2(stops) - base) / (1.0 - base);
   }
+  if(mode == 0 && push.mid.z > 0.5)
+  { // a print or a slide seen against its own base: luminance mapped Y' = m Y + q (mid: q, m),
+    // the colour kept (each pixel scaled by Y'/Y), as the reference's black/white correction
+    float y = dot(max(rgb, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    float y2 = max(push.mid.y * y + push.mid.x, 0.0);
+    rgb = y > 1e-7 ? rgb * (y2 / y) : vec3(y2);
+  }
   if(mode == 1) rgb = tone(rgb);
   else if(mode == 2) rgb = shoulder(rgb);
+  if(push.lut.w > 0.5) rgb = gamut_compress(rgb);
   vec3 c = oetf(clamp(rgb, 0.0, 1.0));
   if(push.lut.x > 0.0 && push.lut.y >= 2.0) c = mix(c, creative(c), push.lut.x);
   imageStore(img_out, p, vec4(c, 1.0));

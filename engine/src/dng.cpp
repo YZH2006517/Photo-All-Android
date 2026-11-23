@@ -1,5 +1,8 @@
 #include "dng.h"
 
+#include "camera_raw.h"
+#include "jxl_tile.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -434,9 +437,142 @@ bool ljpeg_decode(const uint8_t *p, size_t n, std::vector<uint16_t> &out, int &c
   return true;
 }
 
+// A TIFF whose first directory carries DNGVersion (50706): read by this file's own parser
+// only, never handed to LibRaw.
+bool is_dng(const uint8_t *data, size_t size);
+
+bool parse_dng_tiff(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override);
+
 } // namespace
 
 bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override)
+{
+  if(parse_dng_tiff(data, size, out, error, neutral_override)) return true;
+  if(is_dng(data, size)) return false;
+  // not a DNG: a camera's own RAW (NEF, CR2/CR3, ARW, RAF, ORF, RW2 ...), through LibRaw
+  std::string raw_error;
+  if(parse_camera_raw(data, size, out, raw_error)) { error.clear(); return true; }
+  error = raw_error;
+  return false;
+}
+
+namespace {
+
+bool is_dng(const uint8_t *data, size_t size)
+{
+  Tiff tiff(data, size);
+  uint32_t first = 0;
+  Ifd ifd0;
+  return tiff.header(first) && tiff.ifd(first, ifd0) && ifd0.count(50706);
+}
+
+/**
+ * A linear DNG (PhotometricInterpretation 34892): three samples per pixel, already
+ * demosaiced, in camera space. Uncompressed 16-bit, lossless JPEG (7) or JPEG XL (52546),
+ * in strips or tiles. Fills out.cfa (RGB interleaved), channels, black and white.
+ */
+template <typename Own, typename Tag>
+bool read_linear(Tiff &tiff, const uint8_t *data, size_t size, Own own, Tag tag, const std::vector<double> &width,
+                 const std::vector<double> &height, const std::vector<double> &bits, const std::vector<double> &compression,
+                 const std::vector<double> &offsets, const std::vector<double> &counts, const std::vector<double> &tile_w,
+                 const std::vector<double> &tile_h, const std::vector<double> &tile_offsets,
+                 const std::vector<double> &tile_counts, bool tiled, RawImage &out, std::string &error)
+{
+  const auto spp = own(277);
+  const int samples = spp.empty() ? 1 : static_cast<int>(spp[0]);
+  const int comp = compression.empty() ? 1 : static_cast<int>(compression[0]);
+  const int bps = bits.empty() ? 16 : static_cast<int>(bits[0]);
+  if(samples != 3 || (comp != 1 && comp != 7 && comp != 52546) || (comp == 1 && bps != 16))
+  {
+    error = "unsupported linear DNG: " + std::to_string(samples) + " samples, compression " + std::to_string(comp) +
+            ", " + std::to_string(bps) + " bits";
+    return false;
+  }
+  if(!own(50712).empty())
+  {
+    error = "unsupported DNG: linearization table";
+    return false;
+  }
+  out.channels = 3;
+  out.width = static_cast<int>(width[0]);
+  out.height = static_cast<int>(height[0]);
+  if(out.width <= 0 || out.height <= 0 || static_cast<size_t>(out.width) * out.height > 200'000'000ull)
+  {
+    error = "linear DNG of an unexpected size";
+    return false;
+  }
+  out.cfa.assign(static_cast<size_t>(out.width) * out.height * 3, 0);
+  const auto &offs = tiled ? tile_offsets : offsets;
+  const auto &cnts = tiled ? tile_counts : counts;
+  const int pw = tiled ? static_cast<int>(tile_w[0]) : out.width;
+  const int ph = tiled ? static_cast<int>(tile_h[0]) : 0;
+  const int across = tiled ? (out.width + pw - 1) / pw : 1;
+  int strip_y = 0;
+  std::vector<uint16_t> piece;
+  for(size_t s = 0; s < offs.size(); s++)
+  {
+    const size_t at = static_cast<size_t>(offs[s]), n = static_cast<size_t>(cnts[s]);
+    if(at + n > size)
+    {
+      error = "linear DNG piece outside the file";
+      return false;
+    }
+    int cols = 0, rows = 0, ch = 3;
+    if(comp == 52546)
+    {
+      int w = 0, h = 0;
+      if(!jxl_decode(data + at, n, piece, w, h, ch, error)) return false;
+      if(ch != 3)
+      {
+        error = "JPEG XL piece of " + std::to_string(ch) + " channels";
+        return false;
+      }
+      cols = w * 3; rows = h;
+    }
+    else if(comp == 7)
+    {
+      if(!ljpeg_decode(data + at, n, piece, cols, rows, error)) return false;
+    }
+    else
+    {
+      piece.resize(n / 2);
+      for(size_t i = 0; i < piece.size(); i++) piece[i] = tiff.u16(at + i * 2);
+      cols = pw * 3; rows = static_cast<int>(piece.size() / std::max(1, cols));
+    }
+    const int piece_w = cols / 3;
+    const int x0 = tiled ? static_cast<int>(s % across) * pw : 0;
+    const int y0 = tiled ? static_cast<int>(s / across) * ph : strip_y;
+    for(int r = 0; r < rows; r++)
+    {
+      const int y = y0 + r;
+      if(y >= out.height) break;
+      const int w = std::min(piece_w, out.width - x0);
+      if(w <= 0) break;
+      std::memcpy(&out.cfa[(static_cast<size_t>(y) * out.width + x0) * 3], piece.data() + static_cast<size_t>(r) * cols,
+                  static_cast<size_t>(w) * 3 * sizeof(uint16_t));
+    }
+    if(!tiled) strip_y += rows;
+  }
+  // black: per channel (a 2x2 repeat holds 2x2x3 values, averaged); white: per channel, the least
+  const auto black = tag(50714), white = tag(50717);
+  for(int c = 0; c < 3; c++)
+  {
+    double sum = 0;
+    int k = 0;
+    for(size_t i = c; i < black.size(); i += 3) { sum += black[i]; k++; }
+    out.black[c] = black.size() >= 3 && k ? static_cast<float>(sum / k) : black.empty() ? 0.0f : static_cast<float>(black[0]);
+  }
+  out.black[3] = out.black[1];
+  out.white = white.empty() ? 65535.0f : static_cast<float>(*std::min_element(white.begin(), white.end()));
+  if(!(out.white > std::max({out.black[0], out.black[1], out.black[2]}) + 16.0f))
+  {
+    error = "unsupported DNG: white level at or under black";
+    return false;
+  }
+  return true;
+}
+
+bool parse_dng_tiff(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override)
 {
   Tiff tiff(data, size);
   uint32_t first = 0;
@@ -465,6 +601,13 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
     auto photometric = c.find(262);
     if(photometric != c.end() && tiff.values(photometric->second)[0] == 32803) raw = &c;
   }
+  bool linear = false;
+  if(!raw)
+    for(const Ifd &c : candidates)
+    {
+      auto photometric = c.find(262);
+      if(photometric != c.end() && tiff.values(photometric->second)[0] == 34892) { raw = &c; linear = true; break; }
+    }
   if(!raw)
   {
     error = "DNG has no Bayer CFA image";
@@ -493,6 +636,14 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
     error = "DNG image layout missing";
     return false;
   }
+  if(linear)
+  {
+    if(!read_linear(tiff, data, size, own, tag, width, height, bits, compression, offsets, counts, tile_w, tile_h,
+                    tile_offsets, tile_counts, tiled, out, error))
+      return false;
+  }
+  else
+  {
   // Uncompressed samples of 8 to 16 bits. 16 bits are words in the file's byte order;
   // fewer are packed most significant bit first, each row padded to a whole byte (TIFF),
   // as some phones' DNGs come (seen on a custom Xiaomi ROM). Compression 7 is lossless
@@ -653,6 +804,31 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
     error = "unsupported DNG: white level " + std::to_string(int(out.white)) + " at or under black";
     return false;
   }
+  // The CFA pattern and a per-position black level start at the ActiveArea's corner (DNG
+  // spec), not the image's: a corner at an odd row or column moves them by a pixel (red and
+  // blue swapped, or green with them: a strong cast). An even corner, by far the usual one
+  // (Android's DngCreator), changes nothing.
+  const auto active = own(50829);
+  if(active.size() == 4)
+  {
+    const int dy = static_cast<int>(active[0]) & 1, dx = static_cast<int>(active[1]) & 1;
+    if(dx || dy)
+    {
+      int colour[4];
+      float level[4];
+      for(int i = 0; i < 4; i++)
+      {
+        // image position (x, y) sits at ((x - left) mod 2, (y - top) mod 2) of the pattern
+        const int x = i % 2, y = i / 2;
+        const int j = ((y + dy) % 2) * 2 + (x + dx) % 2;
+        colour[i] = out.cfa_colour[j];
+        level[i] = out.black[j];
+      }
+      std::copy(colour, colour + 4, out.cfa_colour);
+      std::copy(level, level + 4, out.black);
+    }
+  }
+  } // the Bayer-only part
   // BaselineExposure kept to a believable push: a broken tag must not blow a picture out
   const auto baseline = tag(50730), baseline_offset = tag(51109);
   out.baseline_ev = static_cast<float>((baseline.empty() ? 0.0 : baseline[0]) +
@@ -722,8 +898,11 @@ bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &err
   auto opcodes = ifd0.find(51009);
   auto raw_opcodes = raw->find(51009);
   const Entry *list = raw_opcodes != raw->end() ? &raw_opcodes->second : opcodes != ifd0.end() ? &opcodes->second : nullptr;
-  if(list) read_gain_maps(data + list->offset, list->count, out);
+  // a linear DNG's gain maps act on its colour planes, not 2x2 positions: not read (Samsung's
+  // Expert RAW writes unit maps; the shading is corrected already)
+  if(list && !linear) read_gain_maps(data + list->offset, list->count, out);
   return true;
 }
 
+} // namespace
 } // namespace film

@@ -74,6 +74,8 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
 
     /** Brighter or darker to look at, in stops; the photo is not touched. */
     @Volatile var exposure = 0f
+    /** The EV dial when it is the film's exposure (a RAW): shown as the develop will make it. */
+    @Volatile var filmEv = 0f
         set(value) { field = value; requestRender() }
 
     /** Called once, on the main thread, when the next camera frame arrives. */
@@ -103,13 +105,31 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
      * focus there and hold it.
      */
     var onPinch: (Float) -> Unit = {}
+    /** Both fingers lifted after a pinch. */
+    var onPinchEnd: () -> Unit = {}
     var onTap: (Float, Float) -> Unit = { _, _ -> }
     var onDoubleTap: (Float, Float) -> Unit = { _, _ -> }
+    var onLongPress: () -> Unit = {}
+
+    /**
+     * 旁轴: the rangefinder patch, in view pixels (left, top, right, bottom; empty = none), and
+     * how far its second image stands off, in view pixels along the finder's long side — 0
+     * when the lens is focused where the patch looks, the images then one.
+     */
+    @Volatile var patch = floatArrayOf(0f, 0f, 0f, 0f)
+    /**
+     * Through the eyepiece: the finder's image moved by (x, y) view pixels and enlarged about
+     * the centre, as the eye shifts behind the eyepiece (the image lies far off; the rim near).
+     */
+    @Volatile var imageShift = floatArrayOf(0f, 0f)
+    @Volatile var imageScale = 1f
+    @Volatile var patchGhost = floatArrayOf(0f, 0f)
     private val pinch = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
             onPinch(detector.scaleFactor)
             return true
         }
+        override fun onScaleEnd(detector: ScaleGestureDetector) { onPinchEnd() }
     })
     private val taps = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         // A single tap waits out the double-tap window to tell the two apart.
@@ -120,6 +140,9 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         override fun onDoubleTap(e: MotionEvent): Boolean {
             onDoubleTap(e.x, e.y)
             return true
+        }
+        override fun onLongPress(e: MotionEvent) {
+            if (!pinch.isInProgress) onLongPress()
         }
     })
 
@@ -277,9 +300,19 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
         GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uTransform"), 1, false, transform, 0)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uPeaking"), if (peaking) 1 else 0)
         GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uGain"), gain * Math.pow(2.0, exposure.toDouble()).toFloat())
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uFilm"), Math.pow(2.0, filmEv.toDouble()).toFloat())
         // One sensor-buffer texel in texture coordinates, for the edge detector.
         GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uTexel"),
             1f / bufferWidth.coerceAtLeast(1), 1f / bufferHeight.coerceAtLeast(1))
+        // the patch in GL's window coordinates (origin at the bottom left)
+        val pr = patch
+        val pg = patchGhost
+        GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "uPatch"), pr[0], height - pr[3], pr[2], height - pr[1])
+        val sh = imageShift
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uShift"),
+            2f * sh[0] / width.coerceAtLeast(1), -2f * sh[1] / height.coerceAtLeast(1))
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uScale"), imageScale)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uGhost"), pg[0], -pg[1])
 
         fillQuad()
         val stride = 4 * 4
@@ -343,9 +376,11 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             layout(location = 0) in vec2 aPosition;
             layout(location = 1) in vec2 aBuffer;
             uniform mat4 uTransform;
+            uniform vec2 uShift;  // the finder image moved (NDC), through the eyepiece
+            uniform float uScale; // and enlarged
             out vec2 vTexcoord;
             void main() {
-              gl_Position = vec4(aPosition, 0.0, 1.0);
+              gl_Position = vec4(aPosition * uScale + uShift, 0.0, 1.0);
               vTexcoord = (uTransform * vec4(aBuffer, 0.0, 1.0)).xy;
             }
         """.trimIndent()
@@ -362,9 +397,12 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
             uniform bool uPeaking;
             uniform vec2 uTexel;
             uniform float uGain;
+            uniform float uFilm;   // the EV dial as film exposure, 2^EV (1 = none)
             uniform float uGrain;     // 0..1
             uniform float uGrainSeed; // changes every frame
             uniform float uGrainCell; // screen pixels per grain
+            uniform vec4 uPatch;      // the rangefinder patch, window pixels; empty = none
+            uniform vec2 uGhost;      // its second image's offset, window pixels
             in vec2 vTexcoord;
             out vec4 colour;
             float luma(vec2 t) { return dot(texture(uCamera, t).rgb, vec3(0.299, 0.587, 0.114)); }
@@ -380,13 +418,14 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
               float a = hash(i), b = hash(i + vec2(1.0, 0.0)), c = hash(i + vec2(0.0, 1.0)), d = hash(i + vec2(1.0, 1.0));
               return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) - 0.5;
             }
-            void main() {
-              vec3 c = texture(uCamera, vTexcoord).rgb;
+            // the picture at a buffer point, through the viewfinder's look
+            vec3 shade(vec2 t) {
+              vec3 c = texture(uCamera, t).rgb;
               if (uSoften > 0.0) {
                 // a soft cross of four taps two texels out: the camera's edge sharpening undone
                 vec2 ox = vec2(2.0 * uTexel.x, 0.0), oy = vec2(0.0, 2.0 * uTexel.y);
-                vec3 b = 0.25 * (texture(uCamera, vTexcoord + ox).rgb + texture(uCamera, vTexcoord - ox).rgb
-                               + texture(uCamera, vTexcoord + oy).rgb + texture(uCamera, vTexcoord - oy).rgb);
+                vec3 b = 0.25 * (texture(uCamera, t + ox).rgb + texture(uCamera, t - ox).rgb
+                               + texture(uCamera, t + oy).rgb + texture(uCamera, t - oy).rgb);
                 c = mix(c, b, 0.8 * uSoften);
               }
               if (uGain != 1.0) { // sRGB -> linear, the gain, back
@@ -394,8 +433,34 @@ class FilmViewfinder(context: Context) : GLSurfaceView(context), GLSurfaceView.R
                 l = clamp(l, 0.0, 1.0);
                 c = mix(12.92 * l, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, l));
               }
+              if (uFilm != 1.0) {
+                // the EV dial as the film's exposure (a RAW): brighter, the mid tones lift and the
+                // highlights roll off towards white as on film (an extended Reinhard whose white is
+                // the gain: black and white stay put); darker, a plain scale
+                vec3 l = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)) * uFilm;
+                if (uFilm > 1.0) { // on the luminance, the colour carried along (a film keeps its hues brightening)
+                  float y = max(dot(l, vec3(0.2126, 0.7152, 0.0722)), 1e-5);
+                  float yd = y * (1.0 + y / (uFilm * uFilm)) / (1.0 + y);
+                  l *= yd / y;
+                }
+                l = clamp(l, 0.0, 1.0);
+                c = mix(12.92 * l, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, l));
+              }
               if (uHasLut) c = texture(uLut, clamp(c, 0.0, 1.0) * uLutMap.x + uLutMap.y).rgb;
               else c = mix(vec3(dot(c, vec3(0.299, 0.587, 0.114))), c, uSat);
+              return c;
+            }
+            void main() {
+              vec3 c = shade(vTexcoord);
+              // buffer steps per window pixel, taken outside any branch
+              vec2 tdx = dFdx(vTexcoord), tdy = dFdy(vTexcoord);
+              if (uPatch.z > uPatch.x && gl_FragCoord.x > uPatch.x && gl_FragCoord.x < uPatch.z
+                  && gl_FragCoord.y > uPatch.y && gl_FragCoord.y < uPatch.w) {
+                // the rangefinder's second image, through its window: laid over the first,
+                // a little warm; one with it when the focus is right
+                vec3 g = shade(vTexcoord + tdx * uGhost.x + tdy * uGhost.y);
+                c = clamp(c * 0.62 + g * 0.5 + vec3(0.025, 0.02, 0.0), 0.0, 1.0);
+              }
               if (uGrain > 0.0) {
                 // two sizes of grain, fresh each frame; strongest in the mid tones and shadows
                 // (as on a negative), little in the deepest black and the brightest white

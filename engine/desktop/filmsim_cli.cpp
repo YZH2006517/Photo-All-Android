@@ -159,6 +159,11 @@ int main(int argc, char **argv)
     else if(arg == "--seed") options.seed = static_cast<uint32_t>(std::stoul(next()));
     else if(arg == "--p3") options.output = film::ColourSpace::DisplayP3;
     else if(arg == "--refexp") options.match_key = -1.0f; // the reference spektrafilm's exposure
+    else if(arg == "--raw-nr") options.raw_denoise = std::stof(next());       // as the app's RAW 降噪
+    else if(arg == "--chroma-nr") options.chroma_denoise = std::stof(next()); // as the app's 彩色降噪
+    else if(arg == "--local-tone") options.local_tone = std::stof(next());
+    // the scene as developed, film off, written as log2 of the linear value ((v * 20) - 16)
+    else if(arg == "--linear") { options.calibrate = true; options.stages.film = false; }
     else if(arg == "--safe") safe = true; // the unoptimised SPIR-V (see DeviceInfo::safe_shaders)
     else if(arg == "--set")
     {
@@ -193,8 +198,9 @@ int main(int argc, char **argv)
   film::Lut filmsim, spectra;
   Loaded image;
   film::RawImage raw;
-  const bool is_dng = in_path.size() > 4 && (in_path.substr(in_path.size() - 4) == ".dng" ||
-                                             in_path.substr(in_path.size() - 4) == ".DNG");
+  // DNG and the cameras' own RAWs (read through LibRaw by the same parser): anything not PPM/PFM
+  const std::string ext = in_path.size() > 4 ? in_path.substr(in_path.size() - 4) : "";
+  const bool is_dng = !ext.empty() && ext != ".ppm" && ext != ".PPM" && ext != ".pfm" && ext != ".PFM";
   bool loaded = load_lut(filmsim_path, filmsim, error) && load_lut(spectra_path, spectra, error);
   if(loaded && is_dng)
   {
@@ -279,7 +285,8 @@ int main(int argc, char **argv)
   { // the alignment and timing lines of the record
     const size_t end = result.note.find('\n', at);
     const std::string line = result.note.substr(at, end == std::string::npos ? std::string::npos : end - at);
-    if(line.rfind("对齐", 0) == 0 || line.find("用时") != std::string::npos) std::cout << line << "\n";
+    if(line.rfind("对齐", 0) == 0 || line.find("用时") != std::string::npos || line.rfind("冲洗曝光", 0) == 0 || line.rfind("降噪", 0) == 0)
+      std::cout << line << "\n";
     if(end == std::string::npos) break;
     at = end + 1;
   }

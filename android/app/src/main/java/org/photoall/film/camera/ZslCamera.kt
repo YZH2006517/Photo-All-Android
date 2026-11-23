@@ -575,7 +575,16 @@ class ZslCamera(
         if (wait && Thread.currentThread() !== thread) runCatching { done.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS) }
     }
 
-    private fun closeAsync(done: java.util.concurrent.CountDownLatch) {
+    /**
+     * Closes without blocking the caller: [then] runs (on the camera thread) once the camera is
+     * released, the same moment close(wait = true) would return.
+     */
+    fun closeThen(then: () -> Unit) {
+        val done = java.util.concurrent.CountDownLatch(1)
+        closeAsync(done) { then() }
+    }
+
+    private fun closeAsync(done: java.util.concurrent.CountDownLatch, then: (() -> Unit)? = null) {
         closed = true
         exposure.onSettings = null
         handler.post {
@@ -592,6 +601,7 @@ class ZslCamera(
             results.clear()
             writers.shutdown()
             done.countDown()
+            then?.let { runCatching(it) }
             thread.quitSafely()
         }
     }

@@ -39,10 +39,17 @@ object Skin {
     const val CAMERA = 2
     const val ANIME = 3
     const val FATE = 4
-    val names = listOf("", "光", "经典", "漫", "风")
+    /**
+     * 旁轴: a rangefinder body — black vulcanite, satin chrome, a chrome release with its
+     * cable thread — and its optical finder over the picture (bright-line frames, the patch,
+     * the red display; see camera.Rangefinder). Held sideways when chosen.
+     */
+    const val RANGEFINDER = 5
+    val names = listOf("", "光", "经典", "漫", "风", "旁轴")
 
     var kind = CLASSIC
         private set
+    val rangefinder get() = kind == RANGEFINDER
     val active get() = kind != CLASSIC
 
     /** The phone's tilt, -1..1 each way, smoothed; and the running time in seconds. */
@@ -112,11 +119,14 @@ object Skin {
             NAVY, 0xff4a438c.toInt(), 0xffa9a5cc.toInt(), SAKURA, NAVY, 0xd91b1464.toInt(), light = true),
         FATE to Palette("宿命", PAPER, 0xffefede6.toInt(), 0xffe4e2da.toInt(), 0xffb5b3ab.toInt(),
             0xff121212.toInt(), 0xff4a4944.toInt(), 0xff8a8983.toInt(), ULTRA, 0xffffffff.toInt(), 0xd9121212.toInt(), light = true),
+        // vulcanite black, chrome-white engraving, the display's red
+        RANGEFINDER to Palette("旁轴", 0xff111111.toInt(), 0xff1a1a1a.toInt(), 0xff252525.toInt(), 0xff383838.toInt(),
+            0xffeceae4.toInt(), 0xffa9a69f.toInt(), 0xff5c5a56.toInt(), 0xffe0362a.toInt(), 0xffffffff.toInt(), 0xd90a0a0a.toInt()),
     )
 
     /** Chooses the style; returns its palette, or null for the theme's own. */
     fun load(index: Int): Palette? {
-        kind = index.coerceIn(CLASSIC, FATE)
+        kind = index.coerceIn(CLASSIC, RANGEFINDER)
         return palettes[kind]
     }
 
@@ -124,8 +134,34 @@ object Skin {
     fun figures(): Typeface = when (kind) {
         SACRED, FATE -> Typeface.create(Typeface.SERIF, Typeface.BOLD_ITALIC)
         CAMERA -> Typeface.create("sans-serif-condensed", Typeface.BOLD)
+        RANGEFINDER -> Typeface.create("sans-serif-light", Typeface.NORMAL) // engraved, fine
         ANIME -> Typeface.create("sans-serif-black", Typeface.ITALIC)
         else -> Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    }
+
+    /**
+     * Vulcanite: the pebbled black covering of a rangefinder body, each pebble lit from the
+     * upper left (a highlight) with its shadow below right. A tile that repeats seamlessly.
+     */
+    private fun vulcanite(size: Int, density: Float): BitmapShader {
+        val b = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        c.drawColor(0xff121212.toInt())
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        val rnd = java.util.Random(11)
+        repeat(size * size / 12) {
+            val x = rnd.nextFloat() * size
+            val y = rnd.nextFloat() * size
+            val r = (0.55f + rnd.nextFloat() * 0.8f) * density
+            for (dx in intArrayOf(-size, 0, size)) for (dy in intArrayOf(-size, 0, size)) {
+                val px = x + dx; val py = y + dy
+                if (px < -3 * r || px > size + 3 * r || py < -3 * r || py > size + 3 * r) continue
+                p.color = 0xff070707.toInt(); c.drawCircle(px + r * 0.4f, py + r * 0.4f, r, p)
+                p.color = 0xff1c1c1c.toInt(); c.drawCircle(px, py, r, p)
+                p.color = 0x1effffff; c.drawCircle(px - r * 0.3f, py - r * 0.3f, r * 0.45f, p)
+            }
+        }
+        return BitmapShader(b, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     }
 
     /** A fine stipple of dark dots, densest at the top: grain for a band fading into paper. */
@@ -186,10 +222,150 @@ object Skin {
         path.close()
     }
 
+    // ----- 光: the engraved layer ---------------------------------------------------------
+
+    /**
+     * Everything still on the 光 page, engraved once per size at half resolution: a hatched
+     * ground, a double rule round the page with scrolls at the corners and a lozenge at each side,
+     * stippled shade in the corners, and round the shutter a glory (long and short rays, straight
+     * and flame) inside three interlaced guilloche bands. Gold hairlines and ink, on nothing.
+     */
+    private fun engraving(w: Int, h: Int, density: Float, cx: Float, cy: Float): Bitmap {
+        val k = 0.5f
+        val b = Bitmap.createBitmap((w * k).toInt().coerceAtLeast(1), (h * k).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        c.scale(k, k)
+        val d = density
+        val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = INK; strokeCap = Paint.Cap.ROUND }
+        val gold = Paint(ink).apply { color = GOLD }
+        val dot = Paint(Paint.ANTI_ALIAS_FLAG)
+        val path = Path()
+        val wf = w.toFloat()
+        val hf = h.toFloat()
+
+        // the hatched ground: fine diagonals, as an engraver lays a tint
+        ink.strokeWidth = 0.5f * d
+        ink.alpha = 14
+        var t = -hf
+        while (t < wf) { c.drawLine(t, 0f, t + hf * 0.55f, hf, ink); t += 3.2f * d }
+
+        // stipple shade gathering in the corners
+        val rnd = java.util.Random(11)
+        dot.color = INK
+        for (i in 0 until 9000) {
+            val x = rnd.nextFloat() * wf
+            val y = rnd.nextFloat() * hf
+            val ex = min(x, wf - x) / (wf * 0.5f)
+            val ey = min(y, hf - y) / (hf * 0.5f)
+            val near = 1f - min(1f, kotlin.math.hypot(ex, ey) / 0.55f)
+            if (rnd.nextFloat() < near * near * 0.9f) {
+                dot.alpha = (60 + 120 * near).toInt()
+                c.drawCircle(x, y, (0.45f + 0.5f * near) * d, dot)
+            }
+        }
+
+        // the double rule round the page
+        val m = 10 * d
+        ink.alpha = 150; ink.strokeWidth = 0.9f * d
+        c.drawRect(m, m, wf - m, hf - m, ink)
+        gold.alpha = 190; gold.strokeWidth = 0.6f * d
+        c.drawRect(m + 3 * d, m + 3 * d, wf - m - 3 * d, hf - m - 3 * d, gold)
+        // a scroll in each corner: a C turning into a spiral, a leaf off its back, a stud
+        for ((sx, sy) in listOf(1f to 1f, -1f to 1f, 1f to -1f, -1f to -1f)) {
+            val ox = if (sx > 0) m else wf - m
+            val oy = if (sy > 0) m else hf - m
+            c.save()
+            c.translate(ox, oy)
+            c.scale(sx * d, sy * d)
+            path.reset()
+            path.moveTo(0f, 34f)
+            path.cubicTo(0f, 12f, 12f, 0f, 34f, 0f)
+            path.moveTo(6f, 30f)
+            path.cubicTo(6f, 16f, 16f, 6f, 30f, 6f)
+            var a = 0f; var r = 9f
+            val sxc = 18f; val syc = 18f
+            path.moveTo(sxc + r, syc)
+            while (r > 1.2f) { a += 0.25f; r *= 0.965f; path.lineTo(sxc + r * cos(a), syc + r * sin(a)) }
+            path.moveTo(34f, 0f); path.cubicTo(44f, 2f, 50f, 8f, 52f, 16f); path.cubicTo(46f, 12f, 40f, 10f, 34f, 12f)
+            path.moveTo(0f, 34f); path.cubicTo(2f, 44f, 8f, 50f, 16f, 52f); path.cubicTo(12f, 46f, 10f, 40f, 12f, 34f)
+            ink.strokeWidth = 0.8f; ink.alpha = 170
+            c.drawPath(path, ink)
+            dot.color = GOLD; dot.alpha = 230
+            c.drawCircle(0f, 0f, 2.6f, dot)
+            c.drawCircle(52f, 16f, 1.2f, dot); c.drawCircle(16f, 52f, 1.2f, dot)
+            c.restore()
+        }
+        // a lozenge in the middle of each side, with its little rays
+        for ((x, y) in listOf(wf / 2 to m, wf / 2 to hf - m, m to hf / 2, wf - m to hf / 2)) {
+            path.reset()
+            path.moveTo(x, y - 6 * d); path.lineTo(x + 6 * d, y); path.lineTo(x, y + 6 * d); path.lineTo(x - 6 * d, y); path.close()
+            dot.color = BONE; dot.alpha = 255
+            c.drawPath(path, dot)
+            gold.strokeWidth = 0.7f * d; gold.alpha = 230
+            c.drawPath(path, gold)
+            dot.color = RUBRIC
+            c.drawCircle(x, y, 1.4f * d, dot)
+        }
+
+        // round the shutter: the glory, long and short rays, straight and flame
+        val r0 = 70 * d
+        for (i in 0 until 96) {
+            val a = (2 * Math.PI * i / 96).toFloat()
+            val long = i % 2 == 0
+            val r1 = r0 + (if (long) 210f else 140f) * d * (if (i % 8 == 0) 1.12f else 1f)
+            if (long) {
+                gold.strokeWidth = (if (i % 8 == 0) 0.9f else 0.6f) * d
+                gold.alpha = if (i % 8 == 0) 150 else 95
+                c.drawLine(cx + r0 * cos(a), cy + r0 * sin(a), cx + r1 * cos(a), cy + r1 * sin(a), gold)
+            } else {
+                path.reset()
+                val steps = 28
+                for (st in 0..steps) {
+                    val u = st / steps.toFloat()
+                    val rr = r0 + (r1 - r0) * u
+                    val wob = 0.012f * sin(u * 18f) * (1f - u)
+                    val x = cx + rr * cos(a + wob)
+                    val y = cy + rr * sin(a + wob)
+                    if (st == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                ink.strokeWidth = 0.5f * d; ink.alpha = 70
+                c.drawPath(path, ink)
+            }
+        }
+        // three guilloche bands, interlaced: each a circle breathing in and out as it goes round
+        for ((band, spec) in listOf(Triple(104f, 3.4f, 40), Triple(132f, 4.2f, 48), Triple(158f, 3.0f, 56)).withIndex()) {
+            val (rad, amp, lobes) = spec
+            for (strand in 0 until 3) {
+                path.reset()
+                val ph = strand * (2 * Math.PI / 3).toFloat() / lobes
+                for (st in 0..720) {
+                    val a = (2 * Math.PI * st / 720).toFloat()
+                    val rr = (rad + amp * sin(lobes * (a + ph))) * d
+                    val x = cx + rr * cos(a)
+                    val y = cy + rr * sin(a)
+                    if (st == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                val q = if (band == 1) gold else ink
+                q.strokeWidth = 0.55f * d
+                q.alpha = if (band == 1) 170 else 85
+                c.drawPath(path, q)
+            }
+        }
+        return b
+    }
+
+    private var engraved: Bitmap? = null
+    private var engravedKey = ""
+
     // ----- backdrop ---------------------------------------------------------------------
 
     class Backdrop(private val density: Float, private val landscape: Boolean) : Drawable() {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val numerals = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = INK; alpha = 150; textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.SERIF, Typeface.NORMAL); letterSpacing = 0.08f
+        }
         private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
         private val path = Path()
         private val band: BitmapShader? = when (kind) {
@@ -198,6 +374,7 @@ object Skin {
         }
         private val texture: BitmapShader? = when (kind) {
             CAMERA -> grain(64, 0xff1c1c1d.toInt(), 0xff252526.toInt(), 0xff121213.toInt())
+            RANGEFINDER -> vulcanite((44 * density).toInt().coerceAtLeast(32), density)
             ANIME -> {
                 val s = (14 * density).toInt()
                 val b = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
@@ -221,6 +398,22 @@ object Skin {
                     val ly = -h * 0.08f
                     paint.shader = RadialGradient(lx, ly, maxOf(w, h) * 0.95f, intArrayOf(0x70fff4d6, 0x26f3deb0, 0x00f3deb0), floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP)
                     canvas.drawRect(0f, 0f, w, h, paint)
+                    paint.shader = null
+                    // the engraving: made once for this size, drawn a touch behind the tilt
+                    val gx = if (landscape) w * 0.88f else w / 2
+                    val gy = if (landscape) h / 2 else h * 0.9f
+                    val key = "${w.toInt()}x${h.toInt()}@$landscape"
+                    if (engravedKey != key || engraved == null) {
+                        engraved?.recycle()
+                        engraved = engraving(w.toInt(), h.toInt(), d, gx, gy)
+                        engravedKey = key
+                    }
+                    engraved?.let { e ->
+                        canvas.save()
+                        canvas.translate(sx * 0.35f, sy * 0.35f)
+                        canvas.drawBitmap(e, null, android.graphics.RectF(0f, 0f, w, h), bitmapPaint)
+                        canvas.restore()
+                    }
                     // shafts of it, slowly crossing the page: each a long wedge laid down three times, narrower each time, so its edges are soft
                     val reach = kotlin.math.hypot(w, h) * 1.15f
                     val shafts = FloatArray(4)
@@ -269,6 +462,28 @@ object Skin {
                         canvas.drawCircle(cx, cy, r * d, line)
                     }
                     line.pathEffect = null
+                    line.alpha = 255
+                    // a dial on the middle sphere: sixty ticks and the twelve hours, turning slowly back
+                    canvas.save()
+                    canvas.rotate(-time * 2.4f, cx, cy)
+                    val rr = 128 * d
+                    line.strokeWidth = 0.6f * d
+                    for (i in 0 until 60) {
+                        val a = (2 * Math.PI * i / 60).toFloat()
+                        val len = (if (i % 5 == 0) 7f else 3.2f) * d
+                        line.color = if (i % 15 == 0) GOLD else INK
+                        line.alpha = if (i % 5 == 0) 150 else 90
+                        canvas.drawLine(cx + rr * cos(a), cy + rr * sin(a), cx + (rr - len) * cos(a), cy + (rr - len) * sin(a), line)
+                    }
+                    numerals.textSize = 7.5f * d
+                    for ((i, n) in listOf("XII", "I", "II", "III", "IIII", "V", "VI", "VII", "VIII", "IX", "X", "XI").withIndex()) {
+                        val a = (2 * Math.PI * i / 12 - Math.PI / 2).toFloat()
+                        canvas.save()
+                        canvas.rotate(i * 30f, cx, cy)
+                        canvas.drawText(n, cx, cy - rr + 16 * d, numerals)
+                        canvas.restore()
+                    }
+                    canvas.restore()
                     line.alpha = 255
                 }
                 FATE -> {
@@ -338,6 +553,20 @@ object Skin {
                     canvas.drawRect(0f, 0f, w, h, paint)
                     paint.shader = LinearGradient(0f, 0f, 0f, h, intArrayOf(0x00000000, 0x59000000), null, Shader.TileMode.CLAMP)
                     canvas.drawRect(0f, 0f, w, h, paint)
+                    paint.shader = null
+                }
+                RANGEFINDER -> {
+                    // vulcanite, lit from above the upper left, the light moving a little with the tilt
+                    paint.shader = texture
+                    canvas.drawRect(0f, 0f, w, h, paint)
+                    paint.shader = RadialGradient(w * 0.2f + sx * 3, -h * 0.1f + sy * 3, maxOf(w, h) * 1.1f,
+                        intArrayOf(0x1affffff, 0x08ffffff, 0x00000000, 0x66000000), floatArrayOf(0f, 0.35f, 0.7f, 1f), Shader.TileMode.CLAMP)
+                    canvas.drawRect(0f, 0f, w, h, paint)
+                    paint.shader = null
+                    // the top plate's edge: a band of satin chrome along the top (the long side in landscape)
+                    val band = 3.2f * d
+                    paint.shader = LinearGradient(0f, 0f, 0f, band, intArrayOf(0xffd9d8d2.toInt(), 0xff8e8d88.toInt(), 0xff3a3a38.toInt()), null, Shader.TileMode.CLAMP)
+                    canvas.drawRect(0f, 0f, w, band, paint)
                     paint.shader = null
                 }
                 ANIME -> {
@@ -422,6 +651,26 @@ object Skin {
                     paint.shader = leaf
                     canvas.drawCircle(cx, cy, r * 0.92f, paint)
                     paint.shader = null
+                    // the rim: a row of pearls, each lit on its upper left
+                    for (i in 0 until 40) {
+                        val a = (2 * Math.PI * i / 40).toFloat()
+                        val px = cx + r * 0.95f * cos(a)
+                        val py = cy + r * 0.95f * sin(a)
+                        paint.color = 0xff8c6c28.toInt()
+                        canvas.drawCircle(px, py, r * 0.034f, paint)
+                        paint.color = 0xffe9d49a.toInt()
+                        canvas.drawCircle(px - r * 0.01f, py - r * 0.01f, r * 0.018f, paint)
+                    }
+                    // a dial engraved inside the rim: sixty ticks, longer each fifth
+                    paint.style = Paint.Style.STROKE
+                    paint.color = INK
+                    paint.strokeWidth = 0.6f * d
+                    for (i in 0 until 60) {
+                        val a = (2 * Math.PI * i / 60).toFloat()
+                        val inner = if (i % 5 == 0) 0.79f else 0.84f
+                        canvas.drawLine(cx + r * 0.88f * cos(a), cy + r * 0.88f * sin(a), cx + r * inner * cos(a), cy + r * inner * sin(a), paint)
+                    }
+                    paint.style = Paint.Style.FILL
                     // ink tracery: twelve lobes in a ring, turning; a shot turns it a step further
                     canvas.save()
                     val turn = time * 6f + (if (since in 0f..0.9f) 30f * (1 - (1 - since / 0.9f) * (1 - since / 0.9f)) else if (since > 0.9f) 30f else 0f)
@@ -429,8 +678,16 @@ object Skin {
                     paint.style = Paint.Style.STROKE
                     paint.color = INK
                     paint.strokeWidth = 0.9f * d
-                    canvas.drawCircle(cx, cy, r * 0.82f, paint)
+                    canvas.drawCircle(cx, cy, r * 0.78f, paint)
                     canvas.drawCircle(cx, cy, r * 0.24f, paint)
+                    // a sunburst inside the lobes, long and short rays
+                    paint.strokeWidth = 0.5f * d
+                    for (i in 0 until 24) {
+                        val a = (2 * Math.PI * i / 24).toFloat()
+                        val out = if (i % 2 == 0) 0.4f else 0.32f
+                        canvas.drawLine(cx + r * 0.26f * cos(a), cy + r * 0.26f * sin(a), cx + r * out * cos(a), cy + r * out * sin(a), paint)
+                    }
+                    paint.strokeWidth = 0.9f * d
                     for (i in 0 until 12) {
                         canvas.save()
                         canvas.rotate(i * 30f, cx, cy)
@@ -456,6 +713,11 @@ object Skin {
                     paint.style = Paint.Style.FILL
                     paint.color = RUBRIC
                     canvas.drawCircle(cx, cy, r * (0.11f + (if (since in 0f..0.4f) 0.05f * sin(since / 0.4f * Math.PI.toFloat()) else 0f)), paint)
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = 0.8f * d
+                    paint.color = 0xffe9d49a.toInt()
+                    canvas.drawCircle(cx, cy, r * 0.16f, paint)
+                    paint.style = Paint.Style.FILL
                 }
                 CAMERA -> {
                     // the collar stands off the plate: its wall below it, a shadow under that
@@ -514,6 +776,52 @@ object Skin {
                     paint.color = 0xff3a3a3c.toInt()
                     canvas.drawCircle(cx, cy, r * 0.13f, paint)
                     canvas.drawCircle(cx, cy, r * 0.07f, paint)
+                    paint.style = Paint.Style.FILL
+                    canvas.restore()
+                }
+                RANGEFINDER -> {
+                    // a chrome release, domed and polished, in a black knurled collar; the cable thread at its heart
+                    canvas.save()
+                    canvas.scale(0.86f, 0.86f, cx, cy)
+                    paint.color = 0xff000000.toInt()
+                    paint.setShadowLayer(8 * d, -tiltX * 4 * d, 5 * d, 0xc0000000.toInt())
+                    canvas.drawCircle(cx, cy, r, paint)
+                    paint.clearShadowLayer()
+                    paint.color = 0xff1a1a1a.toInt()
+                    canvas.drawCircle(cx, cy, r * 0.98f, paint)
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = 1f * d
+                    paint.color = 0xff303030.toInt()
+                    for (i in 0 until 72) {
+                        val a = i * 5f * Math.PI.toFloat() / 180f
+                        canvas.drawLine(cx + r * 0.86f * cos(a), cy + r * 0.86f * sin(a), cx + r * 0.97f * cos(a), cy + r * 0.97f * sin(a), paint)
+                    }
+                    paint.style = Paint.Style.FILL
+                    // the chrome: a bright dome, the light at the upper left moving with the tilt
+                    val press = if (pressed) 0.95f else 1f
+                    val rb = r * 0.74f * press
+                    val lx = cx - rb * (0.3f - tiltX * 0.25f)
+                    val ly = cy - rb * (0.35f - tiltY * 0.2f)
+                    paint.color = 0xff2a2a29.toInt()
+                    canvas.drawCircle(cx, cy, rb * 1.04f, paint)
+                    paint.shader = RadialGradient(lx, ly, rb * 1.5f, intArrayOf(0xffffffff.toInt(), 0xffe3e2dc.toInt(), 0xff9a9993.toInt(), 0xff53524e.toInt()),
+                        floatArrayOf(0f, 0.18f, 0.62f, 1f), Shader.TileMode.CLAMP)
+                    canvas.drawCircle(cx, cy, rb, paint)
+                    paint.shader = null
+                    if (pressed) { paint.color = 0x22000000; canvas.drawCircle(cx, cy, rb, paint) }
+                    // a bright rim on the lit side
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = 1.2f * d
+                    paint.color = 0x99ffffff.toInt()
+                    canvas.drawArc(cx - rb, cy - rb, cx + rb, cy + rb, 190f, 80f, false, paint)
+                    // the cable-release socket: a dark well and its thread
+                    paint.style = Paint.Style.FILL
+                    paint.color = 0xff1c1c1b.toInt()
+                    canvas.drawCircle(cx, cy, rb * 0.24f, paint)
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = 0.8f * d
+                    paint.color = 0xff5a5955.toInt()
+                    for (k in 1..3) canvas.drawCircle(cx, cy, rb * (0.06f + 0.055f * k), paint)
                     paint.style = Paint.Style.FILL
                     canvas.restore()
                 }
@@ -635,6 +943,21 @@ object Skin {
                     paint.strokeWidth = 1f * d
                     paint.color = INK
                     canvas.drawRoundRect(rect, radius, radius, paint)
+                    if (kind == SACRED) {
+                        // a gold hairline just inside, and on a round key four studs on it
+                        val g = 2.6f * d
+                        paint.strokeWidth = 0.6f * d
+                        paint.color = GOLD
+                        canvas.drawRoundRect(rect.left + g, rect.top + g, rect.right - g, rect.bottom - g, (radius - g).coerceAtLeast(0f), (radius - g).coerceAtLeast(0f), paint)
+                        if (radiusDp < 0) {
+                            paint.style = Paint.Style.FILL
+                            val rr = min(rect.width(), rect.height()) / 2 - g
+                            for (i in 0 until 4) {
+                                val a = (Math.PI / 2 * i).toFloat()
+                                canvas.drawCircle(rect.centerX() + rr * cos(a), rect.centerY() + rr * sin(a), 1.1f * d, paint)
+                            }
+                        }
+                    }
                 }
                 CAMERA -> {
                     paint.color = 0xff050505.toInt()
@@ -646,6 +969,18 @@ object Skin {
                     paint.strokeWidth = 1f * d
                     paint.color = 0xff55544f.toInt()
                     canvas.drawRoundRect(rect, radius, radius, paint)
+                }
+                RANGEFINDER -> {
+                    paint.color = 0xff000000.toInt()
+                    canvas.drawRoundRect(rect.left, rect.top + lip, rect.right, rect.bottom + lip, radius, radius, paint)
+                    if (pressed) rect.offset(0f, lip * 0.7f)
+                    paint.shader = LinearGradient(0f, rect.top, 0f, rect.bottom, intArrayOf(0xff202020.toInt(), 0xff0e0e0e.toInt()), null, Shader.TileMode.CLAMP)
+                    canvas.drawRoundRect(rect, radius, radius, paint)
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = 1.3f * d
+                    paint.shader = LinearGradient(0f, rect.top, 0f, rect.bottom, intArrayOf(0xffeeede8.toInt(), 0xff77766f.toInt(), 0xffb9b8b2.toInt()), null, Shader.TileMode.CLAMP)
+                    canvas.drawRoundRect(rect, radius, radius, paint)
+                    paint.shader = null
                 }
                 ANIME -> {
                     paint.color = NAVY
@@ -674,12 +1009,28 @@ object Skin {
     fun drawFinderFrame(canvas: Canvas, w: Float, h: Float, density: Float, around: Int) {
         edgePaint.strokeWidth = (if (kind == ANIME) 3f else 1.2f) * density
         edgePaint.color = when (kind) {
-            CAMERA -> 0xff000000.toInt()
+            CAMERA, RANGEFINDER -> 0xff000000.toInt()
             ANIME -> NAVY
             else -> INK
         }
         val half = edgePaint.strokeWidth / 2
         canvas.drawRect(half, half, w - half, h - half, edgePaint)
+        if (kind == SACRED) {
+            // a gold rule inside the ink one, and an ink bracket at each corner
+            val g = 3.2f * density
+            edgePaint.color = GOLD
+            edgePaint.strokeWidth = 0.7f * density
+            canvas.drawRect(g, g, w - g, h - g, edgePaint)
+            edgePaint.color = INK
+            edgePaint.strokeWidth = 1.8f * density
+            val l = 14 * density
+            val o = 6 * density
+            for ((x, y, sx, sy) in listOf(floatArrayOf(o, o, 1f, 1f), floatArrayOf(w - o, o, -1f, 1f),
+                                          floatArrayOf(o, h - o, 1f, -1f), floatArrayOf(w - o, h - o, -1f, -1f))) {
+                canvas.drawLine(x, y, x + sx * l, y, edgePaint)
+                canvas.drawLine(x, y, x, y + sy * l, edgePaint)
+            }
+        }
     }
 
     // ----- what a shot looks like ---------------------------------------------------------
@@ -722,6 +1073,25 @@ object Skin {
                     paint.alpha = (217 * glow).toInt()
                     canvas.drawRect(0f, 0f, w, h, paint)
                     paint.shader = null
+                    // the glory, its rays reaching out as the light swells
+                    val gx = w / 2
+                    val gy = h * 0.3f
+                    val reach = maxOf(w, h) * (0.35f + 0.6f * t)
+                    paint.color = 0xfffff6dc.toInt()
+                    paint.alpha = (150 * glow).toInt()
+                    path.reset()
+                    for (i in 0 until 48) {
+                        val a = (2 * Math.PI * i / 48).toFloat() + t * 0.2f
+                        val half = if (i % 2 == 0) 0.012f else 0.006f
+                        val inner = min(w, h) * 0.08f
+                        val out = reach * (if (i % 2 == 0) 1f else 0.7f)
+                        path.moveTo(gx + inner * cos(a), gy + inner * sin(a))
+                        path.lineTo(gx + out * cos(a - half), gy + out * sin(a - half))
+                        path.lineTo(gx + out * cos(a + half), gy + out * sin(a + half))
+                        path.close()
+                    }
+                    canvas.drawPath(path, paint)
+                    paint.alpha = 255
                 }
                 FATE -> {
                     paint.color = 0xff121212.toInt()
@@ -849,6 +1219,20 @@ class ThemeReveal(context: Context, private val old: Bitmap) : View(context) {
                     p.shader = null
                 }
             }
+            Skin.RANGEFINDER -> {
+                // a cloth focal-plane shutter running across: one curtain, its rubberised edge leading
+                val e = ease(t * 1.1f)
+                val edge = w * (1 - e)
+                c.save()
+                c.clipRect(0f, 0f, edge, h)
+                c.drawBitmap(old, null, dst, p)
+                c.restore()
+                p.shader = android.graphics.LinearGradient(edge, 0f, edge + 30 * d, 0f, 0xf20b0b0b.toInt(), 0x000b0b0b, Shader.TileMode.CLAMP)
+                c.drawRect(edge, 0f, edge + 30 * d, h, p)
+                p.shader = null
+                p.color = 0xff050505.toInt()
+                c.drawRect(edge - 3 * d, 0f, edge, h, p)
+            }
             Skin.ANIME -> {
                 // popped: a ring of ink bursts out from the middle, a little past and back
                 val o = ease(t).let { it + 0.12f * sin(it * Math.PI.toFloat()) }
@@ -924,6 +1308,7 @@ class ThemePicker(context: Context, current: Int, onPick: (Int) -> Unit) : andro
                     backdrop.draw(c)
                     p.color = 0xff0b0b0d.toInt()
                     c.drawRect(finder, p)
+                    if (skin == Skin.RANGEFINDER) org.photoall.film.camera.Rangefinder.drawMini(c, finder, d)
                     shutter!!.setBounds((w / 2 - r).toInt(), (box.bottom - 2 * r - 9 * d).toInt(), (w / 2 + r).toInt(), (box.bottom - 9 * d).toInt())
                     shutter.draw(c)
                 }

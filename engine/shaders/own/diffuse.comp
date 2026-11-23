@@ -1,0 +1,32 @@
+#version 450
+// A diffusion filter in front of the lens, second step: the spread light (a near and a far
+// blur of what diffpick kept) laid back over the scene, tinted warmer or cooler, and a share
+// of the direct light taken away (a filter scatters light, it does not make it). The filters
+// differ in what they spread and how far (see the engine's diffusion presets).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 1, binding = 0) uniform sampler2D img_in;
+layout(set = 1, binding = 1) uniform sampler2D img_near;
+layout(set = 1, binding = 2) uniform sampler2D img_far;
+layout(set = 1, binding = 3, rgba16f) uniform writeonly restrict image2D img_out;
+layout(push_constant) uniform push_t
+{
+  vec4 tint;   // rgb of the spread light; w unused
+  float amount; // 0..1
+  float near_w; // the near blur's share of the spread light (the far one has the rest)
+  float loss;   // share of the direct light scattered away at full amount
+  float gain;   // how strong the spread light is at full amount
+} push;
+
+void main()
+{
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(img_out);
+  if(any(greaterThanEqual(p, size))) return;
+  vec4 c = texelFetch(img_in, p, 0);
+  vec2 uv = (vec2(p) + 0.5) / vec2(size);
+  vec3 near = texture(img_near, uv).rgb;
+  vec3 far = texture(img_far, uv).rgb;
+  vec3 glow = mix(far, near, push.near_w) * push.tint.rgb;
+  vec3 rgb = c.rgb * (1.0 - push.loss * push.amount) + glow * (push.gain * push.amount);
+  imageStore(img_out, p, vec4(rgb, c.a));
+}

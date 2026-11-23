@@ -152,6 +152,27 @@ object Photos {
         }
     }
 
+    /**
+     * A picture as it is, its bytes unchanged (a straight import: no film, nothing to develop),
+     * into the album or the private folder. Its EXIF, colour profile and HDR gain map stay.
+     */
+    fun saveCopy(context: Context, source: Uri, name: String, mime: String, description: String = "", private: Boolean = false): Uri {
+        if (description.isNotEmpty()) recipes(context).edit().putString(name, description).apply()
+        val input = { checkNotNull(context.contentResolver.openInputStream(source)) { "读不出原图" } }
+        if (private) {
+            val target = File(privateDir(context), name)
+            input().use { i -> target.outputStream().use { i.copyTo(it) } }
+            return uriOf(context, target)
+        }
+        val uri = insert(context, name, mime, FOLDER, description)
+        context.contentResolver.openOutputStream(uri).use { out ->
+            checkNotNull(out) { "保存失败" }
+            input().use { it.copyTo(out) }
+        }
+        publish(context, uri)
+        return uri
+    }
+
     /** Copies a camera DNG into the shared RAW folder so other editors can open it. */
     /** Recipe text per saved file name (film · paper · LUT · source). */
     private fun recipes(context: Context) = context.getSharedPreferences("photo_recipes", Context.MODE_PRIVATE)

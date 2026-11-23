@@ -36,7 +36,7 @@
   // top of the screen; the body fills the screen. The phone's turn tilts the view a few degrees.
   const camera = new THREE.PerspectiveCamera(22, vw() / vh(), 10, 4000);
   camera.up.set(0, 0, -1);
-  const BODY_W = 178, BODY_H = 118, BODY_Z = -11;
+  const BODY_W = 182, BODY_H = 106, BODY_Z = -14;
   let dist = 400, tiltX = 0, tiltZ = 0;
   function placeCamera() {
     const aspect = vw() / vh();
@@ -112,8 +112,8 @@
   // ------------------------------------------------------------------ materials
   const paint = new THREE.MeshPhysicalMaterial({ color: 0x151515, metalness: 0.25, roughness: 0.5, roughnessMap: paintRough, clearcoat: 0.55, clearcoatRoughness: 0.32, envMapIntensity: 1.0 });
   const worn = new THREE.MeshPhysicalMaterial({ color: 0x9c9993, metalness: 1.0, roughness: 0.32, envMapIntensity: 1.2 }); // paint rubbed off the arrises
-  const flock = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 1.0, metalness: 0.0 });
-  const flockSide = new THREE.MeshStandardMaterial({ color: 0x0b0b0b, roughness: 1.0, side: THREE.BackSide });
+  const flock = new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 1.0, metalness: 0.0, envMapIntensity: 0.25 });
+  const flockSide = new THREE.MeshStandardMaterial({ color: 0x040404, roughness: 1.0, side: THREE.BackSide, envMapIntensity: 0.2 });
   const polished = new THREE.MeshPhysicalMaterial({ color: 0xe2e1de, metalness: 1.0, roughness: 0.14, roughnessMap: brushed, envMapIntensity: 1.5 });
   const satin = new THREE.MeshPhysicalMaterial({ color: 0xc7c5c0, metalness: 1.0, roughness: 0.34, roughnessMap: brushed, envMapIntensity: 1.2 });
   const darkMetal = new THREE.MeshPhysicalMaterial({ color: 0x2c2b29, metalness: 0.9, roughness: 0.42, envMapIntensity: 0.9 });
@@ -172,118 +172,93 @@
     head.position.y = r * 0.25; g.add(head);
     const slot = new THREE.Mesh(new THREE.BoxGeometry(r * 1.8, r * 0.3, r * 0.28), flock);
     slot.position.y = r * 0.5; slot.rotation.y = rnd(x * 3 + z) * Math.PI; g.add(slot);
-    g.position.set(x, y, z); scene.add(g);
+    g.position.set(x, y, z); rig.add(g);
   }
 
-  // ------------------------------------------------------------------ the body
-  const FL = 4;           // the flange's top, above the film plane (y = 0)
+  // ------------------------------------------------------------------ the body: Camera 01 (Poly Haven, CC0), its back cut into a door
+  // camera01.js carries the model in this scene's frame (mm, seen from the back); the flat back
+  // between the rounded ends was cut out as the door, so the opening is where the interior goes
+  const FL = 4;           // the back's surface, above the film plane (y = 0)
   placeCamera();
-  const OX = 80, OZ = 40; // the body's outline
-  const IX = 74, IZ = 24; // the opening in the back
-  const outline = rrect(-OX, -OZ, OX, OZ, 11);
-  const opening = rrect(-IX, -IZ, IX, IZ, 3.5);
-  // the flange: black paint, its arrises worn to metal
-  const flangeShape = rrect(-OX, -OZ, OX, OZ, 11); flangeShape.holes.push(holeOf(opening));
-  scene.add(plate(flangeShape, 3.2, FL, [paint, worn], 0.55));
-  // the shell's sides below it: leatherette, a paint band at its top
-  const shellShape = rrect(-OX + 0.6, -OZ + 0.6, OX - 0.6, OZ - 0.6, 10.5); shellShape.holes.push(holeOf(rrect(-IX - 2, -IZ - 2, IX + 2, IZ + 2, 4)));
-  scene.add(plate(shellShape, 30, FL - 4.4, [leather, leather], 0.3));
-  // the inside: flocked black walls and floor
-  const pit = new THREE.Mesh(new THREE.BoxGeometry(IX * 2, 34, IZ * 2), flockSide);
-  pit.position.set(0, FL - 17, 0); pit.receiveShadow = true; scene.add(pit);
+  const CAM = window.CAMERA01;
+  // the whole camera turns as one, about its middle (it is shown front first, then turned round)
+  const PIVOT_Y = -17;
+  const pivot = new THREE.Group(); pivot.position.set(0, PIVOT_Y, 0); scene.add(pivot);
+  const rig = new THREE.Group(); rig.position.set(0, -PIVOT_Y, 0); pivot.add(rig);
+  const texLoader = new THREE.TextureLoader();
+  function modelTex(name, srgb) {
+    const t = texLoader.load('camera01/' + name + '.jpg', () => wake());
+    t.flipY = false;              // glTF's texture convention
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    return t;
+  }
+  function modelMat(prefix) {
+    const arm = modelTex(prefix + '_arm');            // occlusion, roughness, metalness in R, G, B
+    return new THREE.MeshStandardMaterial({
+      map: modelTex(prefix + '_diff', true), normalMap: modelTex(prefix + '_nor_gl'), normalScale: new THREE.Vector2(1, -1),
+      aoMap: arm, roughnessMap: arm, metalnessMap: arm, roughness: 1, metalness: 1, envMapIntensity: 1.15,
+    });
+  }
+  function b64(str, T) {
+    const bin = atob(str); const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return new T(u.buffer);
+  }
+  function modelGeo(part) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(b64(part.pos, Float32Array), 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(b64(part.nor, Float32Array), 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(b64(part.uv, Float32Array), 2));
+    g.setIndex(new THREE.BufferAttribute(b64(part.idx, part.wide ? Uint32Array : Uint16Array), 1));
+    return g;
+  }
+  const bodyMat = modelMat('body');
+  for (const [part, mat] of [[CAM.parts.body, bodyMat], [CAM.parts.lugs, modelMat('strap')]]) {
+    const m = new THREE.Mesh(modelGeo(part), mat);
+    m.castShadow = true; m.receiveShadow = true; rig.add(m);
+  }
+  // the lens: its barrel, and glass dark as a well
+  rig.add(Object.assign(new THREE.Mesh(modelGeo(CAM.parts.lensbody), modelMat('lens_body')), { castShadow: true }));
+  rig.add(new THREE.Mesh(modelGeo(CAM.parts.lens), new THREE.MeshPhysicalMaterial({
+    color: 0x0b0f16, metalness: 0, roughness: 0.04, clearcoat: 1, clearcoatRoughness: 0.02, envMapIntensity: 1.8,
+    iridescence: 0.35, iridescenceIOR: 1.6, side: THREE.DoubleSide })));
+  const IX = -CAM.meta.hole[0], IZ = -CAM.meta.hole[1]; // the opening: 138 x 55 mm
+  // the inside: flocked black walls and floor, a little proud of the cut so no edge shows
+  const pit = new THREE.Mesh(new THREE.BoxGeometry(IX * 2, 37, IZ * 2), flockSide);
+  pit.position.set(0, FL + 2 - 18.5, 0); pit.receiveShadow = true; rig.add(pit);
 
   // the film channel between the chambers: a plate at the film plane with the 36 x 24 gate in it
   const CH0 = -35, CH1 = 37;
   const channel = rrect(CH0, -IZ + 0.4, CH1, IZ - 0.4, 1.2);
   const gate = rrect(-18.1, -12.15, 18.1, 12.15, 0.6);
   channel.holes.push(holeOf(gate));
-  scene.add(plate(channel, 1.2, -0.7, [paint, worn], 0.25));
+  rig.add(plate(channel, 1.2, -0.7, [paint, worn], 0.25));
   // its front and back walls down into the chambers
-  for (const x of [CH0, CH1]) scene.add(box(1.4, 26, IZ * 2 - 1, paint, x + (x < 0 ? 0.7 : -0.7), -14, 0));
+  for (const x of [CH0, CH1]) rig.add(box(1.4, 26, IZ * 2 - 1, paint, x + (x < 0 ? 0.7 : -0.7), -14, 0));
   // the shutter behind the gate: titanium foil, its fine ribs across the travel
-  const foil = box(40, 0.4, 28, titanium, 0, -7.5, 0); scene.add(foil);
-  for (let i = 0; i < 34; i++) scene.add(box(0.35, 0.25, 27, satin, -19 + i * 1.15, -7.15, 0));
+  const foil = box(40, 0.4, 28, titanium, 0, -7.5, 0); rig.add(foil);
+  for (let i = 0; i < 34; i++) rig.add(box(0.35, 0.25, 27, satin, -19 + i * 1.15, -7.15, 0));
   // the gate's own frame, a hairline of bright metal round the opening
   const gateRim = rrect(-19.0, -13.0, 19.0, 13.0, 1.0); gateRim.holes.push(holeOf(gate));
-  scene.add(plate(gateRim, 0.2, -0.45, [satin, satin], 0.1));
+  rig.add(plate(gateRim, 0.2, -0.45, [satin, satin], 0.1));
 
   // the rails: outer ones carry the film's edges, the gate rails just inside, both polished
-  for (const z of [-16.9, 16.9]) scene.add(box(CH1 - CH0 - 2, 0.9, 1.6, polished, (CH0 + CH1) / 2, -0.45, z));
-  for (const z of [-13.4, 13.4]) scene.add(box(44, 0.8, 1.3, polished, 0, -0.55, z));
+  for (const z of [-16.9, 16.9]) rig.add(box(CH1 - CH0 - 2, 0.9, 1.6, polished, (CH0 + CH1) / 2, -0.45, z));
+  for (const z of [-13.4, 13.4]) rig.add(box(44, 0.8, 1.3, polished, 0, -0.55, z));
   // guide rollers either side of the gate
   for (const x of [CH0 + 3.5, CH1 - 4.5]) {
     const roller = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.4, 38, 32), satin);
-    roller.rotation.x = Math.PI / 2; roller.position.set(x, -1.6, 0); roller.castShadow = true; scene.add(roller);
+    roller.rotation.x = Math.PI / 2; roller.position.set(x, -1.6, 0); roller.castShadow = true; rig.add(roller);
   }
-  // screws: the flange's corners, the channel's
-  for (const [x, z] of [[-OX + 6, -OZ + 6], [OX - 6, -OZ + 6], [-OX + 6, OZ - 6], [OX - 6, OZ - 6]]) screw(x, FL, z, 1.4, satin);
+  // screws: the channel's
   for (const [x, z] of [[CH0 + 2.2, -20.5], [CH0 + 2.2, 20.5], [CH1 - 2.2, -20.5], [CH1 - 2.2, 20.5]]) screw(x, -0.7, z, 0.9, darkMetal);
-
-  // ------------------------------------------------------------------ the body's outside, seen past the back's edges
-  const glass = new THREE.MeshPhysicalMaterial({ color: 0x05070a, metalness: 0.0, roughness: 0.04, clearcoat: 1.0, envMapIntensity: 1.6 });
-  // a knurled cylinder standing on the top plate (its axis along z, the camera's up)
-  function knob(r, h, mat, x, y, z, ribs) {
-    const g = new THREE.CylinderGeometry(r, r, h, 160, 1);
-    const pos = g.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      const px = pos.getX(i), pz = pos.getZ(i), a = Math.atan2(pz, px);
-      const k = 1 + 0.03 * Math.max(0, Math.cos(a * (ribs || 48)));
-      pos.setX(i, px * k); pos.setZ(i, pz * k);
-    }
-    g.computeVertexNormals();
-    const m = new THREE.Mesh(g, mat); m.rotation.x = Math.PI / 2; m.position.set(x, y, z);
-    m.castShadow = true; m.receiveShadow = true; scene.add(m);
-    return m;
-  }
-  (function () {
-    const TOP = -OZ, BASE = OZ;
-    // the top plate, brushed chrome, the full width; the base plate likewise
-    scene.add(plate(rrect(-OX + 4, TOP - 7, OX - 4, TOP + 4, 3.5), 24, FL - 2.0, [satin, worn], 0.6));
-    scene.add(plate(rrect(-OX + 4, BASE - 4, OX - 4, BASE + 4, 3.5), 24, FL - 2.0, [satin, worn], 0.6));
-    // the prism's housing over the middle, black, its slopes catching the light
-    const prism = new THREE.Shape();
-    prism.moveTo(-27, -(TOP - 5)); prism.lineTo(-18, -(TOP - 19)); prism.quadraticCurveTo(-15, -(TOP - 22.5), -10, -(TOP - 22.5));
-    prism.lineTo(10, -(TOP - 22.5)); prism.quadraticCurveTo(15, -(TOP - 22.5), 18, -(TOP - 19)); prism.lineTo(27, -(TOP - 5));
-    prism.closePath();
-    scene.add(plate(prism, 26, FL + 0.5, [paint, worn], 0.8));
-    // the accessory shoe on its top
-    scene.add(plate(rrect(-9.5, TOP - 27, 9.5, TOP - 22, 1), 3, FL - 3, [satin, worn], 0.3));
-    for (const x of [-8, 8]) scene.add(box(1.2, 1.2, 5, polished, x, FL - 2.6, TOP - 24.5));
-    // the eyepiece toward us: a rubber cup, its dark glass
-    scene.add(plate(rrect(-10, TOP - 18, 10, TOP - 4, 3), 4, FL + 5, [foam, foam], 0.8));
-    scene.add(plate(rrect(-6.5, TOP - 15, 6.5, TOP - 7, 1.2), 0.3, FL + 5.9, [glass, glass], 0));
-    // left: the rewind knob, its crank folded on top
-    knob(9.5, 9, satin, -55, FL - 9, TOP - 11.5, 60);
-    scene.add(box(14, 1.6, 2.2, satin, -55, FL - 6, TOP - 16.6));
-    scene.add(box(2.2, 2.4, 3.2, darkMetal, -61, FL - 5, TOP - 18));
-    // right: the shutter speed dial, the release, the advance lever standing off
-    knob(8.5, 5.5, darkMetal, 34, FL - 9, TOP - 9.6, 40);
-    const dialTop = new THREE.Mesh(new THREE.CylinderGeometry(7.6, 7.6, 0.6, 48), satin);
-    dialTop.rotation.x = Math.PI / 2; dialTop.position.set(34, FL - 9, TOP - 12.5); scene.add(dialTop);
-    knob(4.2, 3.2, satin, 49, FL - 8, TOP - 8.6, 36);
-    const release = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.4, 2.4, 32), polished);
-    release.rotation.x = Math.PI / 2; release.position.set(49, FL - 8, TOP - 11.2); release.castShadow = true; scene.add(release);
-    knob(6, 3.4, satin, 64, FL - 9, TOP - 9.2, 30);
-    const lever = new THREE.Group(); lever.position.set(64, FL - 9, TOP - 11.6);
-    const arm = box(26, 2.4, 1.8, satin, -13, 0, 0); lever.add(arm);
-    const tip = box(7, 3.6, 2.6, darkMetal, -25, 0.4, 0); lever.add(tip);
-    lever.rotation.z = -0.28; // off the body, toward the thumb
-    scene.add(lever);
-    // the strap lugs at the ends, chrome eyelets
-    for (const sx of [-1, 1]) {
-      scene.add(box(4, 6, 6, satin, sx * (OX + 1.2), FL - 10, TOP + 11));
-      const ring = new THREE.Mesh(new THREE.TorusGeometry(2.6, 0.75, 16, 40), polished);
-      ring.position.set(sx * (OX + 3.8), FL - 10, TOP + 11); ring.castShadow = true; scene.add(ring);
-    }
-    // the self-timer lever on the front's left, peeking past the end
-    scene.add(box(3, 3, 9, darkMetal, -OX - 1.2, FL - 14, BASE - 18));
-  })();
 
   // ------------------------------------------------------------------ the sprocket and the train
   const SPX = 31.5, SPR = 5.8, SPY = -SPR;
   const sprocket = new THREE.Group();
   sprocket.position.set(SPX, SPY, 0);
-  scene.add(sprocket);
+  rig.add(sprocket);
   (function () {
     const drum = new THREE.Mesh(new THREE.CylinderGeometry(SPR - 0.6, SPR - 0.6, 36, 48), satin);
     drum.rotation.x = Math.PI / 2; drum.castShadow = true; sprocket.add(drum);
@@ -301,7 +276,7 @@
   const SPOOL_X = 55, SPOOL_R = 7.4, SPOOL_Y = -SPOOL_R - 0.2;
   const spool = new THREE.Group();
   spool.position.set(SPOOL_X, SPOOL_Y, 0);
-  scene.add(spool);
+  rig.add(spool);
   (function () {
     const core = new THREE.Mesh(new THREE.CylinderGeometry(SPOOL_R, SPOOL_R, 35.4, 64), darkMetal);
     core.rotation.x = Math.PI / 2; core.castShadow = true; core.receiveShadow = true; spool.add(core);
@@ -329,7 +304,7 @@
     m.castShadow = true; m.receiveShadow = true;
     const hub = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.24, r * 0.24, 2.4, 24), polished);
     hub.rotation.x = Math.PI / 2; hub.position.z = 1.0; g.add(hub);
-    scene.add(g); train.push({ g, ratio });
+    rig.add(g); train.push({ g, ratio });
   }
   gear(7.2, 30, SPX, SPY, 1);
   gear(4.6, 19, (SPX + SPOOL_X) / 2 + 0.6, SPY - 3.2, -30 / 19);
@@ -341,45 +316,35 @@
   fork.position.set(CHX, -10.5, -IZ + 2);
   for (const dx of [-1.6, 1.6]) { const p = new THREE.Mesh(new THREE.BoxGeometry(0.9, 2.6, 5.5), satin); p.position.set(dx, 0, 2.6); p.castShadow = true; fork.add(p); }
   const forkHub = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 3.4, 2.4, 32), satin); forkHub.rotation.x = Math.PI / 2; fork.add(forkHub);
-  scene.add(fork);
+  rig.add(fork);
 
-  // ------------------------------------------------------------------ the back door, hinged on the left, open
+  // ------------------------------------------------------------------ the back door: the model's own back, hinged on the left
   const door = new THREE.Group();
-  door.position.set(-OX, FL, 0);
-  scene.add(door);
+  door.position.set(CAM.meta.hinge[0], CAM.meta.hinge[1], CAM.meta.hinge[2]);
+  rig.add(door);
   (function () {
-    // in its own frame the door lies over the back (x 0 .. 160) when shut; its inside faces -y
-    const shell = plate(rrect(0, -OZ, 2 * OX, OZ, 11), 2.6, 0, [paint, worn], 0.5);
-    shell.position.y = 0.3; door.add(shell);
-    const skin = plate(rrect(1.2, -OZ + 1.2, 2 * OX - 1.2, OZ - 1.2, 10), 2.0, 5.4, [leather, leather], 0.2);
-    door.add(skin);
-    // outside: the memo holder (a film box's end slides in), its chrome frame and clips
-    const memo = rrect(OX - 27, -13, OX + 27, 13, 2); memo.holes.push(holeOf(rrect(OX - 24, -10, OX + 24, 10, 1.2)));
-    const holder = plate(memo, 0.8, 6.4, [satin, worn], 0.25); door.add(holder);
-    const well = plate(rrect(OX - 24, -10, OX + 24, 10, 1.2), 0.4, 5.6, [darkMetal, darkMetal], 0); door.add(well);
-    for (const x of [OX - 27, OX + 27]) door.add(box(3, 1.4, 16, satin, x, 6.4, 0));
-    // the door's own edge: a thin chrome bead along the latch side
-    door.add(box(1.6, 1.2, 2 * OZ - 22, satin, 2 * OX - 0.8, 4.2, 0));
-    // inside: the pressure plate over the gate, on its springs; the light seals round the edge
-    const pp = plate(rrect(OX - 31, -14.5, OX + 31, 14.5, 2.5), 1.0, -0.2, [polished, polished], 0.3);
-    pp.rotation.x = Math.PI / 2; pp.position.y = -0.1; door.add(pp);
-    for (const x of [OX - 22, OX + 22]) {
-      const spring = new THREE.Mesh(new THREE.BoxGeometry(6, 0.3, 3), satin); spring.position.set(x, -1.6, 0); door.add(spring);
-    }
-    for (const [x0, x1, z] of [[3, 2 * OX - 3, -OZ + 3], [3, 2 * OX - 3, OZ - 3]]) {
-      const s = new THREE.Mesh(new THREE.BoxGeometry(x1 - x0, 1.2, 2), foam); s.position.set((x0 + x1) / 2, -0.6, z); door.add(s);
-    }
-    // the hinge's knuckles
-    for (const z of [-30, -10, 10, 30]) {
-      const k = new THREE.Mesh(new THREE.CylinderGeometry(2, 2, 8, 24), satin); k.rotation.x = Math.PI / 2; k.position.set(0, 1, z); door.add(k);
-    }
+    const DW = IX * 2;
+    // outside: the leather and its frame, as cut from the body
+    const skin = new THREE.Mesh(modelGeo(CAM.parts.door), bodyMat);
+    skin.castShadow = true; skin.receiveShadow = true; door.add(skin);
+    // inside (its inside faces -y): a black-painted plate under the leather, worn at the arrises
+    door.add(plate(rrect(0.8, -IZ + 0.8, DW - 0.8, IZ - 0.8, 2.2), 1.4, -4.0, [paint, worn], 0.3));
+    // the pressure plate over the gate, on its springs; the light seals along the long edges
+    const pp = plate(rrect(IX - 31, -14.5, IX + 31, 14.5, 2.5), 0.9, -5.6, [polished, polished], 0.25);
+    door.add(pp);
+    for (const x of [IX - 22, IX + 22]) door.add(box(6, 0.4, 3, satin, x, -5.9, 0));
+    for (const z of [-IZ + 2.4, IZ - 2.4]) door.add(box(DW - 6, 1.0, 1.8, foam, IX, -5.9, z));
+    // the latch on the far edge, bright metal
+    door.add(box(2.2, 1.6, 14, satin, DW - 1.6, -5.2, 0));
   })();
-  const DOOR_OPEN = Math.PI; // open flat, out past the left edge of the screen
+  const DOOR_OPEN = Math.PI * 0.94; // open, lying back past the left end, lifted a little off it
   door.rotation.z = DOOR_OPEN;
+  // checks: back.html?door=0 shows it shut
+  { const q = new URLSearchParams(location.search); if (q.has('door')) door.rotation.z = +q.get('door'); }
 
   // a soft floor to throw shadows on
   const floor = new THREE.Mesh(new THREE.PlaneGeometry(1200, 800), new THREE.ShadowMaterial({ opacity: 0.35 }));
-  floor.rotation.x = -Math.PI / 2; floor.position.y = FL - 34.6; floor.receiveShadow = true; scene.add(floor);
+  floor.rotation.x = -Math.PI / 2; floor.position.y = -40; floor.receiveShadow = true; scene.add(floor);
 
   // ------------------------------------------------------------------ the cartridge
   const cart = CartridgeModel(THREE, renderer, look);
@@ -617,6 +582,35 @@
   });
   // the cartridge settles in the air on arrival
   const r0 = holder.rotation.z;
-  // (not once it is being put in: the seating sets its own angle)
-  tween(900, (k) => { if (stage === 0 && !busy) holder.rotation.z = r0 * (1 - 0.4 * ease(k)); });
+  function arrive() {
+    holder.visible = true;
+    // (not once it is being put in: the seating sets its own angle)
+    tween(900, (k) => { if (stage === 0 && !busy) holder.rotation.z = r0 * (1 - 0.4 * ease(k)); });
+  }
+  // the opening: the camera shown from the front, held a moment, turned round to its back, the
+  // back swung open; then the cartridge comes. (back.html?door=... skips it, for checks.)
+  if (new URLSearchParams(location.search).has('door')) arrive();
+  else {
+    busy = true;
+    holder.visible = false;
+    ui.act.style.visibility = 'hidden';
+    pivot.rotation.z = Math.PI;
+    const shut = door.rotation.z;
+    door.rotation.z = 0;
+    tween(1300, (k) => { pivot.rotation.z = Math.PI + 0.12 * Math.sin(k * Math.PI); }, () => {
+      tween(1900, (k) => {
+        const e = ease(k);
+        pivot.rotation.z = Math.PI * (1 - e);
+        pivot.position.y = PIVOT_Y - 18 * Math.sin(k * Math.PI);    // drawn back a little as it turns
+      }, () => {
+        pivot.rotation.z = 0; pivot.position.y = PIVOT_Y;
+        tween(1000, (k) => { door.rotation.z = shut * ease(k); }, () => {
+          door.rotation.z = shut;
+          busy = false;
+          ui.act.style.visibility = '';
+          arrive();
+        });
+      });
+    });
+  }
 })();

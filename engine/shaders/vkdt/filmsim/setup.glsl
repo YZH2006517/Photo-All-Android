@@ -166,7 +166,8 @@ void setup_film_density_model(int film)
 void setup_paper_density_model(int paper)
 {
   setup_density_model_slot(s_model_paper, paper,
-      params.gamma_paper * vec3(params.g_fast_p, params.g_slow_p, params.g_slow_p),
+      params.gamma_paper * vec3(params.g_fast_p, params.g_slow_p, params.g_slow_p)
+        * vec3(params.gamma_p_r, params.gamma_p_g, params.gamma_p_b),
       params.p_exh, false);
 }
 
@@ -176,6 +177,12 @@ void setup_coupler_matrix()
   if (tid == 0)
   {
     mat3 M_raw = mat3(shared_coupler_col0, shared_coupler_col1, shared_coupler_col2);
+    // Reversal stocks carry their own inhibitor set, as the reference spektrafilm's: weak
+    // same-layer terms and the red layer holding back green the most (columns are donors:
+    // the red, green and blue layers' effect on red, green, blue), not the negatives' set
+    // scaled down.
+    if (shared_model_positive[s_model_film] != 0)
+      M_raw = mat3(vec3(0.12, 0.12, 0.06), vec3(0.08, 0.08, 0.06), vec3(0.06, 0.06, 0.06));
     vec3 c_ref = M_raw * (0.5 * shared_model_dmax);
     vec3 lang_k = max(vec3(params.langmuir_r, params.langmuir_g, params.langmuir_b), vec3(1e-3));
     shared_M = M_raw * params.cp_amt;
@@ -225,6 +232,38 @@ float dichroic_transmittance(float lambda, vec3 neutral)
   return f.x * f.y * f.z;
 }
 
+// Each colour stock's spectral band: a soft blue and red edge (centre, width in nm, normal
+// CDF shaped) on its sensitivity, from the spektrafilm profiles' adaptation window (profile
+// data by Andrea Volpato, CC BY-SA 4.0). The exposure normalisation below keeps each
+// layer's response to the stock's own light, so the band only reshapes saturated colours.
+const vec4 s_film_band[20] = vec4[20](
+  vec4(413.708, 25.796, 602.229, 59.085), vec4(421.524, 26.695, 593.144, 56.102),
+  vec4(421.796, 29.240, 594.697, 51.854), vec4(419.424, 26.095, 616.496, 69.595),
+  vec4(433.492, 31.559, 593.134, 68.763), vec4(420.045, 23.380, 592.439, 51.811),
+  vec4(420.045, 23.380, 592.439, 51.811), vec4(420.045, 23.380, 592.439, 51.811),
+  vec4(408.285, 18.521, 618.998, 50.466), vec4(401.871, 23.260, 627.119, 52.569),
+  vec4(408.816, 28.193, 618.046, 48.930), vec4(414.258, 27.045, 599.979, 40.301),
+  vec4(423.888, 30.689, 589.545, 44.743), vec4(417.688, 28.126, 628.735, 21.898),
+  vec4(420.399, 27.406, 615.598, 40.428), vec4(423.315, 27.579, 596.692, 52.748),
+  vec4(438.104, 34.960, 581.905, 50.100), vec4(455.975, 49.710, 594.068, 35.861),
+  vec4(396.690, 34.615, 601.356, 39.563), vec4(405.276, 32.477, 594.476, 48.786));
+
+// The camera's UV- and IR-cut filters in front of the film, as the reference spektrafilm's
+// (erf edges at 410 nm, 8 nm wide, and 675 nm, 15 nm wide); off unless asked for.
+float camera_band(float lambda)
+{
+  float uv = 1.0 - params.uv_cut + params.uv_cut * norm_cdf((lambda - 410.0) / 8.0 * 1.41421356);
+  float ir = 1.0 - params.ir_cut + params.ir_cut * norm_cdf((675.0 - lambda) / 15.0 * 1.41421356);
+  return uv * ir;
+}
+
+float film_band(int film, float lambda)
+{
+  if(film < 0 || film >= 20) return 1.0; // the b/w stocks: none
+  vec4 b = s_film_band[film];
+  return norm_cdf((lambda - b.x) / b.y) * norm_cdf((b.z - lambda) / b.w);
+}
+
 void setup_expose_film(int film)
 {
   int tid = int(gl_LocalInvocationIndex);
@@ -247,7 +286,7 @@ void setup_expose_film(int film)
   vec3 neutral = vec3(0.0);
   if (tid < n_expose_bands)
   {
-    env_sens = fetch_sensitivity(film, tid) * envelope(lambda);
+    env_sens = fetch_sensitivity(film, tid) * envelope(lambda) * film_band(film, lambda) * camera_band(lambda);
     spd.x = eval_illuminant_spd(d65_cct, lambda, tid, m_d65);
     float scene = (params.scene_ill != 0.0) ? eval_illuminant_spd(params.scene_ill, lambda, tid, m_scene) : spd.x;
     if (params.scene_tint != 0.0)
@@ -388,7 +427,9 @@ void setup_scan_illuminant()
     FILMSIM_PACK_BANDS(shared_scan_dye, tid, dye_density.xyz);
     FILMSIM_PACK_BANDS(shared_scan_factor, tid, factor_vec);
 
-    ae_val = (params.process != s_process_scan_neg) ? (scan_illuminant * cmf.y) : factor_vec.g;
+    // A slide is seen as it is: against the lamp, its clear base no whiter than its own
+    // transmittance (as the reference spektrafilm scans one). Negatives keep filmsim's rule.
+    ae_val = (params.process != s_process_scan_neg || is_positive_stock) ? (scan_illuminant * cmf.y) : factor_vec.g;
     if(missing) ae_val = 0.0;
     wp_val = missing ? vec3(0.0) : scan_illuminant * cmf;
   }
@@ -407,11 +448,39 @@ void setup_scan_illuminant()
   barrier();
 }
 
+// Grain strength per stock and dye layer (red, green, blue), fitted to the reference
+// spektrafilm on flat greys at -2, 0 and +2 stops (2400 px across a 35 mm frame, printed on
+// Portra Endura; slides scanned), with the sublayers developing together. Same order as the
+// film list; the reference's grain carries more in the blue layer and far less in the
+// Vision3 stocks than filmsim's particle areas give.
+const vec3 s_grain_match[20] = vec3[20](
+vec3(0.633, 0.504, 0.985),
+vec3(0.565, 0.456, 0.926),
+vec3(0.881, 0.713, 1.535),
+vec3(0.911, 0.784, 1.576),
+vec3(0.797, 0.629, 1.318),
+vec3(0.598, 0.469, 0.914),
+vec3(0.594, 0.445, 0.846),
+vec3(0.498, 0.364, 0.715),
+vec3(0.802, 0.809, 1.809),
+vec3(0.982, 0.875, 1.939),
+vec3(0.756, 0.655, 1.465),
+vec3(0.441, 0.346, 0.445),
+vec3(0.332, 0.250, 0.323),
+vec3(0.451, 0.304, 0.320),
+vec3(0.356, 0.195, 0.233),
+vec3(0.511, 0.381, 0.463),
+vec3(0.650, 0.562, 0.759),
+vec3(0.689, 0.680, 1.174),
+vec3(0.656, 0.581, 0.821),
+vec3(0.734, 0.814, 1.135));
+
 void setup_grain(ivec2 input_size, ivec2 output_size)
 {
   if (int(gl_LocalInvocationIndex) != 0) return;
   float scale = float(input_size.x) / float(output_size.x);
-  float lattice_um = FILMSIM_FRAME_WIDTH_UM / float(max(input_size.x, input_size.y));
+  float frame_um = params.frame_um > 0.0 ? params.frame_um : FILMSIM_FRAME_WIDTH_UM;
+  float lattice_um = frame_um / float(max(input_size.x, input_size.y));
   vec3 density_max = max(shared_model_dmax, vec3(0.1)), dmin = shared_grain_dmin;
   vec3 amp0 = shared_model_amps[s_model_film][0].rgb, amp1 = shared_model_amps[s_model_film][1].rgb;
   vec3 amp2 = max(density_max - amp0 - amp1, 0.0);
@@ -431,9 +500,13 @@ void setup_grain(ivec2 input_size, ivec2 output_size)
   vec3 particle_frac_fast = min(shared_grain_area_fast * inv_pixel_area_um2, vec3(1.0));
   vec3 particle_frac_mid  = min(shared_grain_area_mid  * inv_pixel_area_um2, vec3(1.0));
   vec3 particle_frac_slow = min(shared_grain_area_slow * inv_pixel_area_um2, vec3(1.0));
-  prep.grain.variance_weight_fast = 3.0 * density_max_abs * particle_frac_fast * amp0_abs;
-  prep.grain.variance_weight_mid  = 3.0 * density_max_abs * particle_frac_mid  * amp1_abs;
-  prep.grain.variance_weight_slow = 3.0 * density_max_abs * particle_frac_slow * amp2_abs;
+  // Each stock's grain, per dye layer, against the reference spektrafilm's (see s_grain_match);
+  // the b/w stocks, which it has not, as filmsim's.
+  vec3 layer_match = (params.film >= 0 && params.film < 20) ? s_grain_match[params.film] : vec3(1.0);
+  vec3 lm2 = layer_match * layer_match;
+  prep.grain.variance_weight_fast = 3.0 * density_max_abs * particle_frac_fast * amp0_abs * lm2;
+  prep.grain.variance_weight_mid  = 3.0 * density_max_abs * particle_frac_mid  * amp1_abs * lm2;
+  prep.grain.variance_weight_slow = 3.0 * density_max_abs * particle_frac_slow * amp2_abs * lm2;
   const float blur_dye_clouds_um_sq = 4.0, global_blur_px = 0.89, min_effective_sigma_sq = 0.16;
   float sigma_sq_base_lattice = blur_dye_clouds_um_sq / lattice_um_sq + global_blur_px * global_blur_px;
   float coord_scale = max(1e-3, params.grain_size), inv_coord_scale = 1.0 / coord_scale;

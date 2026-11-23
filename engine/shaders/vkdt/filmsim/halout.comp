@@ -12,6 +12,7 @@ layout(set = 1, binding = 6) uniform sampler2D img_hal2;
 layout(set = 1, binding = 7) uniform sampler2D img_hal3;
 layout(set = 1, binding = 8) uniform sampler2D img_hal4;
 layout(set = 1, binding = 9) uniform sampler2D img_hal5;
+layout(set = 1, binding = 10) uniform sampler2D img_coupler;
 #include "state_ops.glsl"
 #include "sampling.glsl"
 #include "develop.glsl"
@@ -22,6 +23,12 @@ void main()
 {
   FILMSIM_BOUNDS_INIT(ipos);
   vec3 log_raw = combine_halation(ipos, img_in, img_hal0, img_hal1, img_hal2, img_hal3, img_hal4, img_hal5);
+  // development: the DIR inhibitors off the exposure with its halation and scatter
+  if (params.couplers > 0)
+  {
+    ivec2 out_sz = imageSize(img_out);
+    log_raw -= coupler_saturate_post_blur(texture(img_coupler, (ipos + 0.5) / vec2(out_sz)).rgb);
+  }
 
   vec3 density_cmy = develop_film(log_raw, ipos, img_curvewarp);
   imageStore(img_out, ipos, vec4(finalize_film_density(density_cmy, ipos), 1));

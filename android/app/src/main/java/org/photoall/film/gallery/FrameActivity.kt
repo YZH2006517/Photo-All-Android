@@ -1,5 +1,6 @@
 package org.photoall.film.gallery
 
+import android.content.Intent
 import android.animation.LayoutTransition
 import android.app.Activity
 import android.content.Context
@@ -80,6 +81,22 @@ class FrameActivity : Activity() {
     private val frame by lazy { intent.getIntExtra(FRAME, 0) }
     private val film by lazy { intent.getStringExtra(FILM) ?: "" }
     private val taken by lazy { intent.getLongExtra(TAKEN, System.currentTimeMillis()) }
+    /** Straight after an import: blank to begin with and on 还原, and the album's design left alone. */
+    private val blank by lazy { intent.getBooleanExtra(BLANK, false) }
+
+    /** The design kept for next time (the album's border page only). */
+    private fun keep() { if (!blank) FrameDesign.save(this, design) }
+
+    /** The next picture of an import, to its own border page. */
+    override fun finish() {
+        val first = !isFinishing
+        super.finish()
+        if (!first) return
+        @Suppress("DEPRECATION")
+        val queue = intent.getParcelableArrayListExtra<Intent>(QUEUE) ?: return
+        if (queue.isEmpty()) return
+        startActivity(queue.first().putParcelableArrayListExtra(QUEUE, ArrayList(queue.drop(1))))
+    }
 
     // Apple-like neutrals for this page, light or dark with the theme
     private val light by lazy { Style.palette.light }
@@ -96,7 +113,7 @@ class FrameActivity : Activity() {
         Style.apply(this)
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
-        design = FrameDesign.load(this)
+        design = if (blank) FrameDesign.blank() else FrameDesign.load(this)
         window.statusBarColor = canvasColor
         window.navigationBarColor = canvasColor
 
@@ -219,7 +236,8 @@ class FrameActivity : Activity() {
 
     /** Something changed: keep it, and draw it again (soon, so a dragged slider stays smooth). */
     private fun changed(rebuild: Boolean = false) {
-        FrameDesign.save(this, design)
+        main.removeCallbacks(quick)
+        keep()
         main.removeCallbacks(redraw)
         main.postDelayed(redraw, 30)
         if (rebuild) tab?.let { fillPanel(it, animate = false) }
@@ -251,23 +269,52 @@ class FrameActivity : Activity() {
 
     private var refreshTurned = false
 
-    private fun refresh() {
-        val photo = (if (turns % 4 == 0) small else upright ?: small?.let { turned(it).also { u -> upright = u } }) ?: return
+    /** The photo as the preview lays it out (turned as it is turned): its size. */
+    private var photoW = 0
+    private var photoH = 0
+    private var shownPhoto: Bitmap? = null
+    /** A film border's picture on the preview, as shares of it (null for other borders). */
+    private var filmPicture: RectF? = null
+    private var lastQuick = 0L
+
+    /** While a finger moves the photo: the sheet laid out at a small size, at most every 60 ms. */
+    private fun quickRefresh() {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastQuick < 60) { main.removeCallbacks(quick); main.postDelayed(quick, 60); return }
+        lastQuick = now
+        refresh(quick = true)
+    }
+    private val quick = Runnable { lastQuick = android.os.SystemClock.uptimeMillis(); refresh(quick = true) }
+
+    /**
+     * The sheet with an empty place where the photo goes: the background while a finger moves
+     * or sizes the photo (drawn live on top). One render when the photo is picked up, none
+     * while it moves, so a slow sheet never trails a stale photo behind the finger.
+     */
+    private fun refreshBare() = refresh(quick = true, bare = true)
+
+    private fun refresh(quick: Boolean = false, bare: Boolean = false) {
+        val shot = (if (turns % 4 == 0) small else upright ?: small?.let { turned(it).also { u -> upright = u } }) ?: return
+        photoW = shot.width; photoH = shot.height; shownPhoto = shot
+        val photo = if (!bare) shot else
+            Bitmap.createBitmap(maxOf(1, shot.width / 8), maxOf(1, shot.height / 8), Bitmap.Config.ARGB_8888)
         val d = data ?: return
         // the cartridge is drawn live over the preview (CartridgePreview), not into it
         val snapshot = design.copy().apply { cartridge = false }
         val t = ++ticket
+        val picture = RectF()
         worker.later {
             if (t != ticket) return@later // a newer change is already on its way
             // the 3D cartridge of a poster is drawn when ready, without holding this one up
             org.photoall.film.ui.CartridgeSprites.onScreen.set { if (t == ticket) refresh() }
             val shown = try {
-                runCatching { FrameDesigner.render(photo, snapshot, d, maxLong = 1400) }.getOrNull()
+                runCatching { FrameDesigner.render(photo, snapshot, d, maxLong = if (quick) 640 else 1400, pictureOut = picture) }.getOrNull()
             } finally {
                 org.photoall.film.ui.CartridgeSprites.onScreen.set(null)
             } ?: return@later
             runOnUiThread {
                 if (t != ticket) return@runOnUiThread
+                filmPicture = if (snapshot.border.kind != null && !picture.isEmpty) picture else null
                 val first = preview.drawable == null
                 preview.setImageBitmap(shown)
                 if (refreshTurned) {
@@ -405,13 +452,15 @@ class FrameActivity : Activity() {
         addView(choices(Border.entries.map { it.label }, setOf(design.border.ordinal)) { picked ->
             val before = design.border
             design.border = Border.entries[picked.first()]
+            if (design.border != before) design.placed = false
             changed(rebuild = group(before) != group(design.border))
         })
         if (design.border.film) {
             val stock = data?.filmKey?.takeIf { it.isNotBlank() && it != "直出" }
                 ?.let { org.photoall.film.ui.CanisterView.displayName(it) }
             fold("片边细节", stock ?: "PHOTO ALL") {
-            addView(hint(if (stock != null) "片边按这张照片的胶卷印：$stock" else "这张照片没用胶卷，片边印 PHOTO ALL"),
+            addView(hint((if (stock != null) "片边按这张照片的胶卷印：$stock" else "这张照片没用胶卷，片边印 PHOTO ALL") +
+                "。画幅和照片比例不同时，按住画面拖动，选裁哪一部分"),
                 LinearLayout.LayoutParams(-1, -2))
             addView(LinearLayout(this@FrameActivity).apply {
                 isBaselineAligned = false
@@ -426,8 +475,12 @@ class FrameActivity : Activity() {
             addView(slider("漏光", design.leak) { design.leak = it; changed() })
             }
         } else if (design.border.theme != null) {
-            addView(chip("换一张纸", false) { design.leakSeed++; changed() },
-                LinearLayout.LayoutParams(-2, dp(34)).apply { topMargin = dp(8) })
+            addView(LinearLayout(this@FrameActivity).apply {
+                addView(chip("换一张纸", false) { design.leakSeed++; changed() }, LinearLayout.LayoutParams(-2, dp(34)))
+                if (design.placed) addView(chip("照片复位", false) { design.placed = false; changed(rebuild = true) },
+                    LinearLayout.LayoutParams(-2, dp(34)).apply { marginStart = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            addView(hint("长按照片拖动位置；双击照片调大小"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         } else if (design.border == Border.CUSTOM) {
             // the card made to measure: its proportions, the photo's size and place, its colour
             addView(section("画幅比例"))
@@ -739,7 +792,7 @@ class FrameActivity : Activity() {
         repeat((4 - turns) % 4) { tiny = tiny?.let { t -> quarter(t) } }
         turns = 0
         upright = null
-        design = FrameDesign.presets[0].build(palette, design.caption)
+        design = if (blank) FrameDesign.blank() else FrameDesign.presets[0].build(palette, design.caption)
         changed()
         tab?.let { fillPanel(it, animate = true) }
     }
@@ -826,22 +879,138 @@ class FrameActivity : Activity() {
 
     /**
      * The preview, with the cartridge drawn live over it: one finger on the cartridge moves
-     * it, two fingers anywhere make it bigger or smaller. The preview has the sheet's own
-     * proportions, so its place and size, kept as shares of the sheet, are the saved ones.
+     * it, two fingers anywhere make it bigger or smaller. On a theme's sheet the photo can be
+     * moved and sized: a long press picks it up to drag it; a double tap shows its corners, to
+     * pull one or pinch (a tap outside, or another double tap, puts the corners away). While a
+     * finger is on it the photo is drawn where the finger is, at once; the sheet round it is
+     * laid out again behind it, quickly, and properly when the finger lifts. The preview has
+     * the sheet's own proportions, so places and sizes, kept as shares of the sheet, are the saved ones.
      */
+    /** The photo on a theme's sheet: untouched, held (a long press coming?), being moved, its corners out. */
+    private enum class PlaceMode { IDLE, HOLD, MOVING, SIZING }
+
     private inner class CartridgePreview(context: Context) : ImageView(context) {
         private var dragging = false
         private var lastX = 0f
         private var lastY = 0f
         private var moved = false
+        private val density = resources.displayMetrics.density
         private val pinch = android.view.ScaleGestureDetector(context, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(det: android.view.ScaleGestureDetector): Boolean {
+                if (mode != PlaceMode.IDLE) {
+                    design.placeSize *= det.scaleFactor
+                    keepOnSheet()
+                    live()
+                    return true
+                }
                 design.cartSize = (design.cartSize * det.scaleFactor).coerceIn(0.08f, 0.8f)
                 moved = true
                 invalidate()
                 return true
             }
         })
+
+        // ---- the photo on a theme's sheet ----
+        private var mode = PlaceMode.IDLE
+        private var pulling = false          // a corner is being pulled (SIZING)
+        private var touching = false         // a finger is on the photo (draw it live)
+        private var downX = 0f
+        private var downY = 0f
+        private var downAt = 0L
+        private var lastTapAt = 0L
+        private var lastTapX = 0f
+        private var lastTapY = 0f
+        private var startSize = 0f
+        private var startDist = 1f
+        private val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+        private val pickUp = Runnable {
+            if (mode == PlaceMode.HOLD) {
+                begin(); mode = PlaceMode.MOVING; touching = true
+                performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                live()
+            }
+        }
+        /** The bare sheet is behind the photo now (until the finger lifts). */
+        private var bare = false
+        private val dash = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE; strokeWidth = 2.2f * density; color = 0xeeffffff.toInt()
+            pathEffect = android.graphics.DashPathEffect(floatArrayOf(14f, 10f), 0f)
+        }
+        private val dashShade = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 4f * density; color = 0x55000000 }
+        private val knob = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val photoPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x55000000; maskFilter = android.graphics.BlurMaskFilter(6f * density, android.graphics.BlurMaskFilter.Blur.NORMAL)
+        }
+
+        /** The photo's rectangle in this view (null where it cannot be moved). */
+        private fun photoRect(): RectF? {
+            if (design.border.theme == null || photoW <= 0 || photoH <= 0 || width == 0) return null
+            if (design.placed && mode != PlaceMode.IDLE && mode != PlaceMode.HOLD) {
+                val w = design.placeSize * width
+                val h = w * photoH / photoW
+                val cx = design.placeX * width; val cy = design.placeY * height
+                return RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+            }
+            val f = FrameDesigner.themePhoto(photoW, photoH, design) ?: return null
+            return RectF(f.left * width, f.top * height, f.right * width, f.bottom * height)
+        }
+
+        /** The photo taken from where the layout has it, to be moved or sized by hand. */
+        private fun begin() {
+            val r = photoRect() ?: return
+            design.placeX = r.centerX() / width
+            design.placeY = r.centerY() / height
+            design.placeSize = r.width() / width
+            design.placed = true
+            lastX = downX; lastY = downY
+            parent.requestDisallowInterceptTouchEvent(true)
+        }
+
+        /** The photo kept whole on the sheet (its size first, then its centre). */
+        private fun keepOnSheet() {
+            if (width == 0 || height == 0 || photoW <= 0) return
+            fun tall(size: Float) = size * width * photoH / photoW / height
+            design.placeSize = design.placeSize.coerceIn(0.15f, 1f)
+            if (tall(design.placeSize) > 1f) design.placeSize = design.placeSize / tall(design.placeSize)
+            val hw = design.placeSize / 2; val hh = tall(design.placeSize) / 2
+            design.placeX = if (hw >= 0.5f) 0.5f else design.placeX.coerceIn(hw, 1f - hw)
+            design.placeY = if (hh >= 0.5f) 0.5f else design.placeY.coerceIn(hh, 1f - hh)
+        }
+
+        /** Drawn where the finger is now; the sheet behind laid out again, quickly. */
+        private fun live() {
+            invalidate()
+            if (!bare) { bare = true; refreshBare() }
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (width == 0 || drawable == null) return
+            if (design.cartridge) FrameDesigner.drawCartridge(canvas, width, height, design, data?.filmKey ?: "") { invalidate() }
+            if (dragging) canvas.drawRoundRect(cartBounds(), 8f, 8f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE; strokeWidth = 2f; color = 0x99ffffff.toInt()
+                pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f)
+            })
+            if (mode != PlaceMode.MOVING && mode != PlaceMode.SIZING) return
+            val r = photoRect() ?: return
+            // the photo itself under the finger, at once: a print's edge, its shadow
+            val shot = shownPhoto
+            if (touching && shot != null) {
+                val e = r.width() * 0.018f
+                canvas.drawRect(r.left - e, r.top - e + 3 * density, r.right + e, r.bottom + e + 3 * density, shadowPaint)
+                knob.color = 0xffffffff.toInt(); canvas.drawRect(r.left - e, r.top - e, r.right + e, r.bottom + e, knob)
+                canvas.drawBitmap(shot, null, r, photoPaint)
+            }
+            canvas.drawRect(r, dashShade); canvas.drawRect(r, dash)
+            if (mode == PlaceMode.SIZING) for ((x, y) in corners(r)) {
+                knob.color = 0x66000000; canvas.drawCircle(x, y + 1 * density, 9 * density, knob)
+                knob.color = 0xffffffff.toInt(); canvas.drawCircle(x, y, 8 * density, knob)
+                knob.color = Style.ACCENT; canvas.drawCircle(x, y, 4.5f * density, knob)
+            }
+        }
+
+        private fun corners(r: RectF) = listOf(r.left to r.top, r.right to r.top, r.left to r.bottom, r.right to r.bottom)
 
         private fun cartBounds(): RectF {
             val h = design.cartSize * min(width, height)
@@ -850,17 +1019,57 @@ class FrameActivity : Activity() {
             return RectF(cx - h * 0.4f, base - h, cx + h * 0.6f, base).apply { inset(-h * 0.25f, -h * 0.2f) }
         }
 
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            if (!design.cartridge || width == 0 || drawable == null) return
-            FrameDesigner.drawCartridge(canvas, width, height, design, data?.filmKey ?: "") { invalidate() }
-            if (dragging) canvas.drawRoundRect(cartBounds(), 8f, 8f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                style = Paint.Style.STROKE; strokeWidth = 2f; color = 0x99ffffff.toInt()
-                pathEffect = android.graphics.DashPathEffect(floatArrayOf(10f, 8f), 0f)
-            })
+        // ---- the crop inside a film border's picture ----
+        private var cropping = false
+
+        /** How far the photo can slide in the picture, in view pixels, across and down (one is 0). */
+        private fun cropRoom(): Pair<Float, Float>? {
+            val f = filmPicture ?: return null
+            if (photoW <= 0 || photoH <= 0 || width == 0) return null
+            val pw = f.width() * width; val ph = f.height() * height
+            val a = photoW.toFloat() / photoH
+            val rx = ph * a - pw; val ry = pw / a - ph
+            return if (rx > 1f) rx to 0f else if (ry > 1f) 0f to ry else null
+        }
+
+        private fun cropTouch(e: MotionEvent): Boolean {
+            val (rx, ry) = cropRoom() ?: return false.also { cropping = false }
+            when (e.actionMasked) {
+                MotionEvent.ACTION_MOVE -> {
+                    if (rx > 0f) design.cropX = (design.cropX - (e.x - lastX) / rx).coerceIn(0f, 1f)
+                    if (ry > 0f) design.cropY = (design.cropY - (e.y - lastY) / ry).coerceIn(0f, 1f)
+                    lastX = e.x; lastY = e.y
+                    refresh(quick = true)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    cropping = false
+                    changed()
+                }
+            }
+            return true
         }
 
         override fun onTouchEvent(e: MotionEvent): Boolean {
+            if (cropping) return cropTouch(e)
+            if (mode != PlaceMode.IDLE) return photoTouch(e)
+            if (e.actionMasked == MotionEvent.ACTION_DOWN && !(design.cartridge && cartBounds().contains(e.x, e.y))) {
+                // a film border cutting the photo: one finger on the picture slides the photo in it
+                val f = filmPicture
+                if (f != null && width > 0 && f.contains(e.x / width, e.y / height) && cropRoom() != null) {
+                    cropping = true
+                    lastX = e.x; lastY = e.y
+                    parent.requestDisallowInterceptTouchEvent(true)
+                    return true
+                }
+            }
+            if (e.actionMasked == MotionEvent.ACTION_DOWN && !(design.cartridge && cartBounds().contains(e.x, e.y))) {
+                if (photoRect()?.contains(e.x, e.y) == true) {
+                    mode = PlaceMode.HOLD
+                    downX = e.x; downY = e.y; downAt = android.os.SystemClock.uptimeMillis()
+                    postDelayed(pickUp, android.view.ViewConfiguration.getLongPressTimeout().toLong())
+                    return true
+                }
+            }
             if (!design.cartridge) return super.onTouchEvent(e)
             pinch.onTouchEvent(e)
             when (e.actionMasked) {
@@ -887,11 +1096,102 @@ class FrameActivity : Activity() {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     dragging = false
-                    if (moved) FrameDesign.save(this@FrameActivity, design)
+                    if (moved) keep()
                     invalidate()
                 }
             }
             return true
+        }
+
+        /** The photo: held for a long press or a double tap, moved, sized, set down. */
+        private fun photoTouch(e: MotionEvent): Boolean {
+            if (mode == PlaceMode.MOVING || mode == PlaceMode.SIZING) pinch.onTouchEvent(e)
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    // with the corners showing: a corner to pull, the photo to drag or pinch, elsewhere to finish
+                    if (mode == PlaceMode.SIZING) {
+                        val r = photoRect()
+                        val near = r?.let { corners(it).any { (x, y) -> kotlin.math.hypot((e.x - x).toDouble(), (e.y - y).toDouble()) < 30 * density } } == true
+                        if (r == null || (!near && !r.contains(e.x, e.y))) { finish(); return true }
+                        live()
+                        pulling = near
+                        startSize = design.placeSize
+                        startDist = kotlin.math.hypot((e.x - r.centerX()).toDouble(), (e.y - r.centerY()).toDouble()).toFloat().coerceAtLeast(1f)
+                        downX = e.x; downY = e.y; downAt = android.os.SystemClock.uptimeMillis()
+                        lastX = e.x; lastY = e.y
+                        touching = true
+                        parent.requestDisallowInterceptTouchEvent(true)
+                        invalidate()
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (mode == PlaceMode.HOLD) {
+                        // moved before the long press: not one
+                        if (kotlin.math.hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) > slop) { removeCallbacks(pickUp); mode = PlaceMode.IDLE }
+                        return true
+                    }
+                    if (pinch.isInProgress || e.pointerCount > 1) return true
+                    if (!touching) { touching = true }
+                    if (mode == PlaceMode.SIZING && pulling) {
+                        val cx = design.placeX * width; val cy = design.placeY * height
+                        val dist = kotlin.math.hypot((e.x - cx).toDouble(), (e.y - cy).toDouble()).toFloat()
+                        design.placeSize = startSize * dist / startDist
+                    } else {
+                        design.placeX += (e.x - lastX) / width
+                        design.placeY += (e.y - lastY) / height
+                    }
+                    lastX = e.x; lastY = e.y
+                    keepOnSheet()
+                    live()
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> { touching = true }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    val stay = if (e.actionIndex == 0) 1 else 0
+                    lastX = e.getX(stay); lastY = e.getY(stay)
+                    pulling = false
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    removeCallbacks(pickUp)
+                    val now = android.os.SystemClock.uptimeMillis()
+                    val tap = e.actionMasked == MotionEvent.ACTION_UP && now - downAt < android.view.ViewConfiguration.getTapTimeout() * 2 &&
+                        kotlin.math.hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) < slop
+                    val double = tap && now - lastTapAt < android.view.ViewConfiguration.getDoubleTapTimeout() &&
+                        kotlin.math.hypot((e.x - lastTapX).toDouble(), (e.y - lastTapY).toDouble()) < 48 * density
+                    when (mode) {
+                        PlaceMode.HOLD -> {
+                            mode = PlaceMode.IDLE
+                            if (double) {
+                                // a double tap: the corners, to size it
+                                lastTapAt = 0L
+                                begin(); mode = PlaceMode.SIZING
+                                performHapticFeedback(android.view.HapticFeedbackConstants.CONTEXT_CLICK)
+                                invalidate()
+                            } else if (tap) { lastTapAt = now; lastTapX = e.x; lastTapY = e.y }
+                        }
+                        PlaceMode.MOVING -> finish()
+                        PlaceMode.SIZING -> {
+                            touching = false; pulling = false; bare = false
+                            if (double) finish()
+                            else {
+                                if (tap) { lastTapAt = now; lastTapX = e.x; lastTapY = e.y }
+                                keep()
+                                changed()
+                                invalidate()
+                            }
+                        }
+                        else -> {}
+                    }
+                }
+            }
+            return true
+        }
+
+        /** Set down: the corners away, the sheet laid out properly round it. */
+        private fun finish() {
+            removeCallbacks(pickUp)
+            mode = PlaceMode.IDLE; touching = false; pulling = false; lastTapAt = 0L; bare = false
+            changed(rebuild = true)
+            invalidate()
         }
     }
 
@@ -1136,5 +1436,9 @@ class FrameActivity : Activity() {
         const val TAKEN = "taken"
         const val PRIVATE = "private"
         const val DESCRIPTION = "description"
+        /** Opened after an import: no border, no layout to begin with (and on 还原); nothing kept. */
+        const val BLANK = "blank"
+        /** The import's other pictures, each opened in turn when this page closes. */
+        const val QUEUE = "queue"
     }
 }

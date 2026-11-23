@@ -30,7 +30,9 @@ object CrashReportSheet {
 
         body.addView(TextView(activity).apply {
             text = (if (report.fatal) "抱歉。" else "应用已自动恢复，但这些错误值得修好。") +
-                "复制这份报告发给开发者（GitHub Issues，或小红书 / 抖音私信），能帮我们在这台手机上修好它。只含机型、系统与出错位置，不含照片。"
+                (if (org.photoall.film.ReportSender.enabled)
+                    "把这份报告发给开发者，能帮我们在这台手机上修好它。只发送下面这份报告：机型、系统与出错位置，不含照片。"
+                else "复制这份报告发给开发者（GitHub Issues，或小红书 / 抖音私信），能帮我们在这台手机上修好它。只含机型、系统与出错位置，不含照片。")
             textSize = 14f
             setLineSpacing(0f, 1.25f)
             setTextColor(Style.TEXT_2)
@@ -86,18 +88,63 @@ object CrashReportSheet {
             Style.pressable(this)
             setOnClickListener { onClick(this) }
         }
+        fun copy() {
+            activity.getSystemService(ClipboardManager::class.java)
+                .setPrimaryClip(ClipData.newPlainText("Photo All 问题报告", report.text))
+            onCopied()
+        }
+        val sending = org.photoall.film.ReportSender.enabled
+        // what happened to the report, under the buttons
+        val outcome = TextView(activity).apply {
+            textSize = 12.5f
+            setLineSpacing(0f, 1.2f)
+            setTextColor(Style.TEXT_2)
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
         body.addView(LinearLayout(activity).apply {
             setPadding(0, dp(14), 0, dp(4))
             addView(action("忽略", Color.TRANSPARENT, Style.TEXT, Style.HAIRLINE) { sheet.dismiss() },
                 LinearLayout.LayoutParams(0, dp(50), 1f).apply { marginEnd = dp(6) })
-            addView(action("一键复制报告", Style.ACCENT, Style.ON_ACCENT, 0) { button ->
-                activity.getSystemService(ClipboardManager::class.java)
-                    .setPrimaryClip(ClipData.newPlainText("Photo All 问题报告", report.text))
+            if (sending) addView(action("发送给开发者", Style.ACCENT, Style.ON_ACCENT, 0) { button ->
+                if (button.tag == "sent") return@action
+                button.isEnabled = false
+                button.text = "发送中…"
+                Thread {
+                    val result = org.photoall.film.ReportSender.send(report.title, report.text, report.fatal)
+                    activity.runOnUiThread {
+                        outcome.visibility = View.VISIBLE
+                        result.onSuccess { id ->
+                            button.tag = "sent"
+                            button.isEnabled = true
+                            button.text = "已发送 ✓"
+                            outcome.text = "报告编号 $id。和开发者联系时报上这个编号就能找到它，谢谢。"
+                            onCopied()
+                        }.onFailure {
+                            button.isEnabled = true
+                            button.text = "再试一次"
+                            copy()
+                            outcome.text = "没发出去（${it.message ?: "网络不通"}），报告已复制，可以粘贴给开发者。"
+                        }
+                    }
+                }.start()
+            }, LinearLayout.LayoutParams(0, dp(50), 1.4f).apply { marginStart = dp(6) })
+            else addView(action("一键复制报告", Style.ACCENT, Style.ON_ACCENT, 0) { button ->
+                copy()
                 button.text = "已复制 ✓"
                 button.postDelayed({ button.text = "一键复制报告" }, 1600)
-                onCopied()
             }, LinearLayout.LayoutParams(0, dp(50), 1.4f).apply { marginStart = dp(6) })
         })
+        body.addView(outcome, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        // with sending, copying is still there, quieter: for GitHub, or a chat with the developer
+        if (sending) body.addView(TextView(activity).apply {
+            text = "复制报告"
+            textSize = 13f
+            setTextColor(Style.TEXT_2)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(10), 0, dp(6))
+            setOnClickListener { copy(); text = "已复制 ✓"; postDelayed({ text = "复制报告" }, 1600) }
+        }, LinearLayout.LayoutParams(-1, -2))
 
         sheet.setOnDismissListener { onClosed() }
         sheet.show()

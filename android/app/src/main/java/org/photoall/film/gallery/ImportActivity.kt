@@ -1,5 +1,6 @@
 package org.photoall.film.gallery
 
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.ImageDecoder
@@ -77,6 +78,15 @@ class ImportActivity : ComponentActivity() {
     private var edr = 1.5f
     private lateinit var tuneBox: LinearLayout
     private lateinit var tuneToggle: TextView
+    /** 测光: the develop's own exposure judgement (a RAW metered to mid-grey, a picture's scene restore exposure); off, the picture's own brightness. */
+    private var meter = true
+    private lateinit var meterChip: TextView
+    /** The pictures just developed, each to the border page in turn (see [FrameActivity.BLANK]). */
+    private val toFrame = java.util.Collections.synchronizedList(mutableListOf<Intent>())
+    private var framed = false
+    private lateinit var frameChip: TextView
+    private lateinit var colourChips: List<TextView>
+    private lateinit var scope: ScopeView
 
     private lateinit var preview: ImageView
     private lateinit var busy: TextView
@@ -155,12 +165,16 @@ class ImportActivity : ComponentActivity() {
         paper = store["paper"].toInt().coerceIn(0, FilmEngine.papers.lastIndex)
         lut = if (store.flag(Settings.LUT_ON)) store[Settings.LUT].toInt().coerceIn(0, LutLibrary.count - 1) else 0
         lutStrength = store[Settings.LUT_STRENGTH].takeIf { it > 0f } ?: 1f
-        temp = tunePrefs.getFloat("temp", 0f)
-        tint = tunePrefs.getFloat("tint", 0f)
+        meter = tunePrefs.getBoolean("meter", true)
+        framed = tunePrefs.getBoolean("frame", false)
+        // white balance belongs to one picture: each import starts neutral (it was kept, and a
+        // cold setting from an earlier photo turned the next ones cold without a word)
+        temp = 0f
+        tint = 0f
         restore = tunePrefs.getFloat("restore", 1f)
         edr = if (Edr.supported) tunePrefs.getFloat("edr", 1.5f) else 0f
-        // an HDR window: the preview's gain map is shown, not just its SDR base
-        if (Edr.supported) window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_HDR
+        // an HDR window while the preview has a gain map (Edr.fitWindow): its highlights shown,
+        // and the original (no gain map) not dimmed when held up for comparison
         for (setting in Settings.all) if (engineParam(setting)) initial[setting.key] = store[setting.key]
         onBackPressedDispatcher.addCallback(this, closeParams)
         build()
@@ -209,10 +223,16 @@ class ImportActivity : ComponentActivity() {
             setPadding(dp(14), 0, dp(14), 0)
             setOnClickListener { if (!developing) pickPictures() }
         }
+        // the histogram / waveform sits small in the title bar, off the picture
+        scope = ScopeView(this, compact = true).apply {
+            mode = ScopeView.Mode.entries.getOrElse(tunePrefs.getInt("scope", 0)) { ScopeView.Mode.HISTOGRAM }
+            onModeChanged = { m -> haptics.play(Haptics.Event.SEGMENT); tunePrefs.edit().putInt("scope", m.ordinal).apply() }
+        }
         val top = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(back, LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(scope, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(4) })
             addView(again, LinearLayout.LayoutParams(-2, dp(48)))
         }
         preview = ImageView(this).apply {
@@ -223,7 +243,7 @@ class ImportActivity : ComponentActivity() {
                     MotionEvent.ACTION_DOWN -> postDelayed(showOriginal, 180)
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         removeCallbacks(showOriginal)
-                        developedPreview?.let { setImageBitmap(it) }
+                        developedPreview?.let { setImageBitmap(it); Edr.fitWindow(window, it) }
                     }
                 }
                 true
@@ -260,7 +280,7 @@ class ImportActivity : ComponentActivity() {
             addView(groupScroll, LinearLayout.LayoutParams(-1, dp(36)).apply { topMargin = dp(2) })
         }
         val stage = FrameLayout(this).apply {
-            addView(preview, FrameLayout.LayoutParams(-1, -1).apply { bottomMargin = dp(120) })
+            addView(preview, FrameLayout.LayoutParams(-1, -1).apply { bottomMargin = dp(STRIP) })
             addView(busy, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(10) })
             addView(strip, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         }
@@ -346,6 +366,40 @@ class ImportActivity : ComponentActivity() {
                 addView(recipeLine, LinearLayout.LayoutParams(0, -2, 1f))
                 addView(tuneToggle, LinearLayout.LayoutParams(-2, dp(30)).apply { marginStart = dp(8) })
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            // one row: 胶片色彩 on the left, 测光 and 边框 on the right; the chips a little narrower so
+            // all of it fits a 360 dp screen
+            addView(LinearLayout(this@ImportActivity).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(label("胶片色彩").apply { maxLines = 1 }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(6) })
+                colourChips = listOf("校色" to 1f, "原色" to 0f).map { (name, value) ->
+                    chip(name) {
+                        if (values[Settings.BALANCE] != value) { haptics.play(Haptics.Event.SEGMENT); values[Settings.BALANCE] = value }
+                    }.also {
+                        it.setPadding(dp(10), 0, dp(10), 0)
+                        addView(it, LinearLayout.LayoutParams(-2, dp(28)).apply { marginEnd = dp(5) })
+                    }
+                }
+                addView(View(this@ImportActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                meterChip = chip("测光") {
+                    meter = !meter
+                    tunePrefs.edit().putBoolean("meter", meter).apply()
+                    haptics.play(Haptics.Event.SEGMENT)
+                    syncPanel(); schedulePreview()
+                }
+                meterChip.setPadding(dp(10), 0, dp(10), 0)
+                meterChip.maxLines = 1
+                addView(meterChip, LinearLayout.LayoutParams(-2, dp(28)))
+                // 边框: on, the border page follows the develop; off, straight back
+                frameChip = chip("边框") {
+                    framed = !framed
+                    tunePrefs.edit().putBoolean("frame", framed).apply()
+                    haptics.play(Haptics.Event.SEGMENT)
+                    syncPanel()
+                }
+                frameChip.setPadding(dp(10), 0, dp(10), 0)
+                frameChip.maxLines = 1
+                addView(frameChip, LinearLayout.LayoutParams(-2, dp(28)).apply { marginStart = dp(5) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
             addView(tuneBox, LinearLayout.LayoutParams(-1, -2))
             addView(LinearLayout(this@ImportActivity).apply {
                 gravity = Gravity.CENTER_VERTICAL
@@ -384,6 +438,25 @@ class ImportActivity : ComponentActivity() {
         pages.select(page, animate = false)
         fillPicker(animate = false)
         syncPanel()
+    }
+
+    /** A small rounded choice under the recipe line. */
+    private fun chip(text: String, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        textSize = 12f
+        typeface = Style.medium
+        gravity = Gravity.CENTER
+        setPadding(dp(12), 0, dp(12), 0)
+        Style.pressable(this)
+        setOnClickListener { onClick() }
+    }
+
+    private fun styleChip(v: TextView, on: Boolean) {
+        v.setTextColor(if (on) Style.ON_ACCENT else Style.TEXT_2)
+        v.background = GradientDrawable().apply {
+            cornerRadius = dp(14).toFloat()
+            if (on) setColor(Style.ACCENT) else { setColor(Style.SURFACE); setStroke(dp(1), Style.TEXT_3) }
+        }
     }
 
     /** 微调: four sliders under the recipe line, folded away until asked for. */
@@ -430,7 +503,7 @@ class ImportActivity : ComponentActivity() {
                     syncTune()
                 }
                 override fun onStartTrackingTouch(bar: SeekBar) {}
-                override fun onStopTrackingTouch(bar: SeekBar) { saveTune(); schedulePreview() }
+                override fun onStopTrackingTouch(bar: SeekBar) { saveTune(); syncPanel(); schedulePreview() }
             })
         }
         value.text = show(get())
@@ -447,10 +520,10 @@ class ImportActivity : ComponentActivity() {
         tuneToggle.text = (if (tuneBox.visibility == View.VISIBLE) "收起" else "微调") + (if (changed) " ·" else "")
     }
 
-    private fun saveTune() = tunePrefs.edit().putFloat("temp", temp).putFloat("tint", tint)
+    private fun saveTune() = tunePrefs.edit().remove("temp").remove("tint")
         .putFloat("restore", restore).putFloat("edr", edr).apply()
 
-    private val showOriginal = Runnable { source?.let { preview.setImageBitmap(it) } }
+    private val showOriginal = Runnable { source?.let { preview.setImageBitmap(it); Edr.fitWindow(window, it) } }
 
     private fun label(text: String) = TextView(this).apply {
         this.text = text
@@ -512,6 +585,7 @@ class ImportActivity : ComponentActivity() {
                 sourceDng = dng
                 developedPreview = null
                 preview.setImageBitmap(small)
+                Edr.fitWindow(window, small)
                 schedulePreview()
             }
         }
@@ -612,8 +686,18 @@ class ImportActivity : ComponentActivity() {
         val stock = FilmEngine.filmStocks[film]
         val paperName = FilmEngine.papers[paper]
         recipeLine.text = "配方：" + LookFamilies.recipeText(filmOn, printOn, CanisterView.displayName(stock),
-            LookFamilies.paperName(paperName), lut)
+            LookFamilies.paperName(paperName), lut) +
+            (if (temp != 0f) " · 色温 %+.0f".format(Locale.US, temp * 100) else "") +
+            (if (tint != 0f) " · 色调 %+.0f".format(Locale.US, tint * 100) else "")
         evValue.text = if (evThirds == 0) "±0" else "%+.1f".format(Locale.US, evThirds / 3f)
+        // 校色: each stock balanced to neutral (as a lab's printer would); 原色: its own colour; 手动 neither
+        val balance = values[Settings.BALANCE].roundToInt()
+        styleChip(colourChips[0], balance == 1)
+        styleChip(colourChips[1], balance == 0)
+        meterChip.text = if (meter) "测光 · 自动" else "测光 · 关"
+        styleChip(meterChip, meter)
+        frameChip.text = if (framed) "边框 · 开" else "边框 · 关"
+        styleChip(frameChip, framed)
         evDial.thirds = evThirds
         strengthRow.visibility = if (lut != 0) View.VISIBLE else View.GONE
         strength.progress = (lutStrength * 100).roundToInt()
@@ -636,9 +720,10 @@ class ImportActivity : ComponentActivity() {
 
     private data class Recipe(val filmOn: Boolean, val film: Int, val printOn: Boolean, val paper: Int,
                               val lut: Int, val strength: Float, val ev: Float,
-                              val temp: Float, val tint: Float, val restore: Float, val edr: Float)
+                              val temp: Float, val tint: Float, val restore: Float, val edr: Float,
+                              val meter: Boolean = true)
 
-    private fun recipe() = Recipe(filmOn, film, printOn, paper, lut, lutStrength, evThirds / 3f, temp, tint, restore, edr)
+    private fun recipe() = Recipe(filmOn, film, printOn, paper, lut, lutStrength, evThirds / 3f, temp, tint, restore, edr, meter)
 
     private fun params(r: Recipe): Map<String, Float> = values.filmParams().toMutableMap().apply {
         this["film"] = r.film.toFloat()
@@ -650,11 +735,24 @@ class ImportActivity : ComponentActivity() {
         this["stage restore"] = if (r.filmOn) r.restore else 0f
         this["stage temp"] = r.temp
         this["stage tint"] = r.tint
+        // a phone photo is a finished picture: without film it leaves as it came
+        this["stage display"] = 1f
+        // 测光 off: the picture's own brightness (no scene-restore auto exposure)
+        this["stage meter"] = if (r.meter) 1f else 0f
     }
+
+    /**
+     * 直出 with nothing on it (no film, no LUT, no exposure or colour change): the picture is
+     * not developed at all — shown as it is, and kept as the very file (a JPEG copied byte for
+     * byte; another format decoded at full size and saved as JPEG, untouched). For adding only
+     * a border. A RAW still needs developing, and does.
+     */
+    private fun straight(r: Recipe) = !r.filmOn && (r.lut == 0 || r.strength <= 0f) &&
+        r.ev == 0f && r.temp == 0f && r.tint == 0f
 
     /** Worker thread: [bitmap] through the recipe (a CCD camera LUT runs on the CPU after it). */
     private fun develop(bitmap: Bitmap, r: Recipe, longEdge: Int, iso: Int,
-                        dng: java.nio.ByteBuffer? = null): Pair<Bitmap, org.photoall.film.engine.Developed> {
+                        dng: java.nio.ByteBuffer? = null, file: String? = null): Pair<Bitmap, org.photoall.film.engine.Developed> {
         val digicam = LutLibrary.digicam(r.lut)?.takeIf { r.strength > 0f }
         fun prepared(): FilmEngine = engine().also { e ->
             if (digicam != null || r.lut == 0) e.setCreativeLut(null, LutLibrary.size, 0f)
@@ -664,7 +762,9 @@ class ImportActivity : ComponentActivity() {
         // spektrafilm exposes (its own meter), the slider on top; the highlights held by the
         // tone compression a camera RAW kept low for. Whatever goes wrong on the way falls
         // back to the picture's way (see rawDevelop).
-        val raw = dng?.let { rawDevelop(it, bitmap, r, longEdge, ::prepared) }
+        // without film (直出, or a LUT alone) a RAW is the phone's own rendering of it, as the
+        // album shows it (the system's decoder), not this engine's develop without film
+        val raw = if (r.filmOn) dng?.let { rawDevelop(it, bitmap, r, longEdge, ::prepared, file) } else null
         lastRawUsed = raw != null
         val developed = raw ?: prepared().develop(bitmap, params(r), DevelopOptions(maxLongEdge = longEdge, exposureEv = r.ev,
             seed = Random.nextInt(), displayP3 = false))
@@ -681,6 +781,14 @@ class ImportActivity : ComponentActivity() {
     @Volatile private var lastRawFallback: String? = null
 
     /**
+     * Per file, whether its RAW develop passed the check against the phone's own rendering
+     * ("" passed, else why not), decided by its first develop and kept: checked again at
+     * every slider move, a file near the line went back and forth between the two ways
+     * (a Xiaomi 14 Ultra: an exposure slide jumped from dark to bright and noisy). Worker thread.
+     */
+    private val rawVerdict = HashMap<String, String>()
+
+    /**
      * A phone's own RAW through the engine, guarded the way the camera's RAW had to be on
      * phones we do not have (docs/COMPATIBILITY.md): sealed for good after the app died in
      * one; refused when too large for the memory left; any engine error, and a result that
@@ -689,7 +797,7 @@ class ImportActivity : ComponentActivity() {
      * Each fallback is noted for the diagnostics and said once.
      */
     private fun rawDevelop(buffer: java.nio.ByteBuffer, reference: Bitmap, r: Recipe, longEdge: Int,
-                           prepared: () -> FilmEngine): org.photoall.film.engine.Developed? {
+                           prepared: () -> FilmEngine, file: String? = null): org.photoall.film.engine.Developed? {
         val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
         fun fallback(reason: String, e: Throwable? = null): org.photoall.film.engine.Developed? {
             lastRawFallback = reason
@@ -697,9 +805,18 @@ class ImportActivity : ComponentActivity() {
             return null
         }
         lastRawFallback = null
+        // decided already for this file: the picture's way again, said and noted the first time
+        file?.let { rawVerdict[it] }?.takeIf { it.isNotEmpty() }?.let { why -> lastRawFallback = why; return null }
+        // A RAW develop that took the app down seals RAW imports, but only for the build it
+        // happened on: an update may well have fixed it, so the next build tries once more
+        // (and seals again if it goes down too).
+        val build = runCatching { packageManager.getPackageInfo(packageName, 0).lastUpdateTime }.getOrDefault(0L)
         if (quirks.getBoolean("import_raw_inflight", false))
-            quirks.edit().remove("import_raw_inflight").putBoolean("import_raw_sealed", true).commit()
-        if (quirks.getBoolean("import_raw_sealed", false)) return fallback("上次按 RAW 冲洗时应用退出了，这台手机已停用 RAW 导入")
+            quirks.edit().remove("import_raw_inflight").putBoolean("import_raw_sealed", true)
+                .putLong("import_raw_sealed_build", build).commit()
+        if (quirks.getBoolean("import_raw_sealed", false) && quirks.getLong("import_raw_sealed_build", -1L) != build)
+            quirks.edit().remove("import_raw_sealed").remove("import_raw_sealed_build").commit()
+        if (quirks.getBoolean("import_raw_sealed", false)) return fallback("上次按 RAW 冲洗时应用退出了，这台手机已停用 RAW 导入（更新应用后会再试）")
         val bytes = buffer.capacity().toLong()
         if (bytes > 200_000_000L) return fallback("文件太大（${bytes / 1_048_576} MB）")
         val memory = android.app.ActivityManager.MemoryInfo().also {
@@ -710,17 +827,27 @@ class ImportActivity : ComponentActivity() {
         org.photoall.film.CrashReport.stage(this, "导入 RAW 冲洗（${bytes / 1_048_576} MB）")
         val developed = try {
             buffer.rewind()
-            prepared().developDng(listOf(buffer), params(r) + ("stage restore" to 0f), DevelopOptions(maxLongEdge = longEdge, matchKey = org.photoall.film.engine.REFERENCE_EXPOSURE,
+            // 测光 off: the RAW at its own exposure (and the file's baseline), not metered to mid-grey
+            prepared().developDng(listOf(buffer), params(r) + ("stage restore" to 0f), DevelopOptions(maxLongEdge = longEdge,
+                matchKey = if (r.meter) org.photoall.film.engine.REFERENCE_EXPOSURE else 0f,
                 exposureEv = r.ev, seed = Random.nextInt(), displayP3 = false, localTone = 0.6f,
                 chromaDenoise = store[Settings.CHROMA_NR], rawDenoise = store[Settings.RAW_DENOISE]))
         } catch (e: Throwable) {
             // a failed submission leaves the engine unusable: the picture's way gets a new one
             if (e.message?.contains("DNG") != true) { runCatching { engine?.close() }; engine = null }
+            // a linear DNG (Samsung Expert RAW, Apple ProRAW): told in plain words, not as a failure
+            val msg = e.message.orEmpty()
+            if (msg.contains("linear DNG")) return fallback(if (msg.contains("52546"))
+                "这是线性 DNG（如三星 Expert RAW，JPEG XL 压缩），引擎暂不能按 RAW 冲洗；已用它内置的全尺寸成片冲洗，效果不受影响"
+                else "这是线性 DNG（如三星 Expert RAW、苹果 ProRAW），引擎暂不能按 RAW 冲洗；已用它内置的全尺寸成片冲洗，效果不受影响", e)
             return fallback("引擎读不了这张 RAW：${e.message}", e)
         } finally {
             quirks.edit().remove("import_raw_inflight").commit()
         }
-        misread(developed.bitmap, reference)?.let { why ->
+        if (file != null && rawVerdict[file] == "") return developed
+        val why = misread(developed.bitmap, reference)
+        if (file != null) rawVerdict[file] = why ?: ""
+        if (why != null) {
             developed.bitmap.recycle()
             return fallback(why)
         }
@@ -760,12 +887,16 @@ class ImportActivity : ComponentActivity() {
         busy.text = "预览中…"
         busy.visibility = View.VISIBLE
         worker.later {
-            val result = runCatching { develop(src, r, PREVIEW_EDGE, 200, sourceDng).first }
+            val file = uris.getOrNull(current)?.toString()
+            val result = runCatching { if (straight(r)) src else develop(src, r, PREVIEW_EDGE, 200, sourceDng, file).first }
+            val measured = result.getOrNull()?.let { runCatching { ScopeView.measure(it) }.getOrNull() }
             runOnUiThread {
                 if (ticket != request) return@runOnUiThread
                 result.onSuccess {
                     developedPreview = it
                     preview.setImageBitmap(it)
+                    Edr.fitWindow(window, it)
+                    scope.show(measured)
                     busy.visibility = View.GONE
                     val why = lastRawFallback
                     if (sourceDng != null && why != null && why != saidFallback) {
@@ -787,6 +918,7 @@ class ImportActivity : ComponentActivity() {
         val quality = store[Settings.JPEG_QUALITY].toInt()
         val private = store.flag(Settings.PRIVATE_PHOTOS)
         val longEdge = store.longEdge
+        toFrame.clear()
         worker.later {
             var done = 0
             var failed = 0
@@ -802,7 +934,14 @@ class ImportActivity : ComponentActivity() {
                 haptics.play(if (failed == 0) Haptics.Event.DEVELOPED else Haptics.Event.ERROR)
                 busy.text = if (failed == 0) "已冲洗 $done 张，存进相册" else "冲洗 $done 张，$failed 张失败"
                 busy.visibility = View.VISIBLE
-                if (failed == 0) main.postDelayed({ if (!isFinishing) finish() }, 700)
+                // straight on to the border page, the pictures one after another
+                val frames = if (framed) ArrayList(toFrame) else ArrayList()
+                if (frames.isNotEmpty()) main.postDelayed({
+                    if (isFinishing) return@postDelayed
+                    startActivity(frames.first().putParcelableArrayListExtra(FrameActivity.QUEUE, ArrayList(frames.drop(1))))
+                    if (failed == 0) finish()
+                }, 500)
+                else if (failed == 0) main.postDelayed({ if (!isFinishing) finish() }, 700)
             }
         }
     }
@@ -810,20 +949,30 @@ class ImportActivity : ComponentActivity() {
     /** Worker thread: one picture, full size, into the album with its recipe and a log. */
     private fun developOne(uri: Uri, r: Recipe, quality: Int, private: Boolean, longEdge: Int) {
         val start = System.nanoTime()
-        val bitmap = decode(uri, longEdge) ?: error("读不出照片")
+        // 直出 with nothing on it: kept as it is (a RAW as the system renders it, see keepAsItIs)
+        if (straight(r)) return keepAsItIs(uri, r, quality, private, start)
+        // an import comes out at the original's own size (up to the engine's 原尺寸, 8192), not
+        // at the camera's 冲洗尺寸 (4096 by default, a 12 MP result); that setting is only the
+        // step-down when the memory left would not hold the original, and the step-down is told
+        val (edge, reduced) = importEdge(uri, longEdge)
+        if (reduced != null) runOnUiThread {
+            android.widget.Toast.makeText(this, reduced, android.widget.Toast.LENGTH_LONG).show()
+        }
+        val bitmap = decode(uri, edge) ?: error("读不出照片")
         val shot = ShotInfo.read(this, uri)
-        val (image, developed) = develop(bitmap, r, longEdge, shot?.iso ?: 200, readDng(uri))
+        val (image, developed) = develop(bitmap, r, maxOf(bitmap.width, bitmap.height), shot?.iso ?: 200, readDng(uri), uri.toString())
         if (image !== bitmap) bitmap.recycle()
         val stock = FilmEngine.filmStocks[r.film]
         val paperName = FilmEngine.papers[r.paper]
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val name = "FILM_${stamp}_${(if (r.filmOn) stock else "digital").replace(Regex("[^a-z0-9]+"), "-")}.jpg"
         val text = LookFamilies.recipeText(r.filmOn, r.printOn, stock, paperName, r.lut)
-        Photos.saveJpeg(this, image, name, quality, "$text · 导入", shot, private)
+        val saved = Photos.saveJpeg(this, image, name, quality, "$text · 导入", shot, private)
+        toFrame += frameIntent(saved, name, if (r.filmOn) stock else "", "$text · 导入", shot, private)
         val log = ShotLog()
         log.put("拍摄", "来源", "导入的照片")
         log.put("拍摄", "冲洗方式", if (lastRawUsed) "按 RAW" else lastRawFallback?.let { "按图片（$it）" } ?: "按图片")
-        log.put("拍摄", "原图尺寸", "${bitmap.width}x${bitmap.height}（冲洗长边上限 $longEdge）")
+        log.put("拍摄", "原图尺寸", "${bitmap.width}x${bitmap.height}（按原图尺寸冲洗，长边上限 $edge${reduced?.let { "；$it" } ?: ""}）")
         log.put("胶片配方", "配方", text)
         log.put("胶片配方", "曝光", "%+.2f EV".format(Locale.US, r.ev))
         if (r.lut != 0) log.put("胶片配方", "LUT 强度", "%.0f%%".format(Locale.US, r.strength * 100))
@@ -838,19 +987,77 @@ class ImportActivity : ComponentActivity() {
         image.recycle()
     }
 
-    /** The file as a DNG in native memory when it is one (a TIFF), else null. At most 400 MB. */
-    private fun readDng(uri: Uri): java.nio.ByteBuffer? = runCatching {
-        contentResolver.openInputStream(uri)?.use { input ->
-            val head = ByteArray(4)
-            if (input.read(head) != 4) return@use null
-            val tiff = (head[0] == 'I'.code.toByte() && head[1] == 'I'.code.toByte() && head[2] == 42.toByte() && head[3] == 0.toByte()) ||
-                (head[0] == 'M'.code.toByte() && head[1] == 'M'.code.toByte() && head[2] == 0.toByte() && head[3] == 42.toByte())
-            if (!tiff) return@use null
-            val rest = input.readBytes()
-            if (rest.size + 4 > 400_000_000) return@use null
-            java.nio.ByteBuffer.allocateDirect(rest.size + 4).apply { put(head); put(rest); flip() }
+    /**
+     * The long edge an import develops at: the original's (at most [IMPORT_MAX_EDGE], the
+     * engine's 原尺寸). When the memory left would not hold that develop, the camera's
+     * 冲洗尺寸 [fallback] instead, with the words saying so (null when not reduced).
+     */
+    private fun importEdge(uri: Uri, fallback: Int): Pair<Int, String?> {
+        val size = runCatching {
+            val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, o) }
+            if (o.outWidth > 0 && o.outHeight > 0) o.outWidth to o.outHeight else null
+        }.getOrNull() ?: runCatching {
+            // HEIC / DNG the bounds reader may not know: the decoder's header
+            var wh: Pair<Int, Int>? = null
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { d, info, _ ->
+                wh = info.size.width to info.size.height
+                d.setTargetSize(1, 1)
+            }.recycle()
+            wh
+        }.getOrNull() ?: return IMPORT_MAX_EDGE to null
+        val long = maxOf(size.first, size.second)
+        val edge = minOf(long, IMPORT_MAX_EDGE)
+        val k = edge.toDouble() / long
+        val pixels = (size.first * k) * (size.second * k)
+        // the decoded picture, the engine's copies and the result: ~6 RGBA copies, plus headroom
+        val need = (pixels * 4 * 6).toLong() + 300_000_000L
+        val memory = android.app.ActivityManager.MemoryInfo().also {
+            getSystemService(android.app.ActivityManager::class.java).getMemoryInfo(it)
         }
-    }.getOrNull()
+        if (edge > fallback && memory.availMem < need)
+            return fallback to "内存不足，这张按长边 $fallback 冲洗（原图长边 $long）"
+        return edge to null
+    }
+
+    /** The border page for a picture just saved: blank to begin with (no border, no layout). */
+    private fun frameIntent(uri: Uri, name: String, film: String, description: String, shot: ShotInfo?, private: Boolean) =
+        Intent(this, FrameActivity::class.java)
+            .putExtra(FrameActivity.URI, uri)
+            .putExtra(FrameActivity.NAME, name)
+            .putExtra(FrameActivity.FRAME, 1)
+            .putExtra(FrameActivity.FILM, film)
+            .putExtra(FrameActivity.TAKEN, shot?.takenMs ?: System.currentTimeMillis())
+            .putExtra(FrameActivity.PRIVATE, private)
+            .putExtra(FrameActivity.DESCRIPTION, description)
+            .putExtra(FrameActivity.BLANK, true)
+
+    /** 直出 with nothing on it: the picture into the album untouched (see [straight]). */
+    private fun keepAsItIs(uri: Uri, r: Recipe, quality: Int, private: Boolean, start: Long) {
+        val shot = ShotInfo.read(this, uri)
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val name = "FILM_${stamp}_straight.jpg"
+        val text = "直出 · 导入"
+        val mime = contentResolver.getType(uri) ?: ""
+        val copied = mime == "image/jpeg"
+        val saved = if (copied) Photos.saveCopy(this, uri, name, "image/jpeg", text, private)
+        else {
+            // not a JPEG (HEIC, PNG…): its pixels as they are, at full size, as a JPEG
+            val bitmap = decode(uri, 8192) ?: error("读不出照片")
+            Photos.saveJpeg(this, bitmap, name, quality, text, shot, private).also { bitmap.recycle() }
+        }
+        toFrame += frameIntent(saved, name, "", text, shot, private)
+        val log = ShotLog()
+        log.put("拍摄", "来源", "导入的照片")
+        log.put("拍摄", "冲洗方式", if (copied) "直出：原文件原样存入，未经任何处理" else "直出：原图像素原样存为 JPEG（原格式 ${mime.ifEmpty { "未知" }}）")
+        log.put("胶片配方", "配方", "直出（不用胶卷、LUT、相纸）")
+        log.put("冲洗结果", "文件", name)
+        log.put("冲洗结果", "用时", "%.2f 秒".format(Locale.US, (System.nanoTime() - start) / 1e9))
+        log.save(this, name)
+    }
+
+    /** The file as a DNG in native memory when it is one (a TIFF), else null. At most 400 MB. */
+    private fun readDng(uri: Uri): java.nio.ByteBuffer? = RawSource.read(contentResolver, uri)
 
     /** At most [edge] px on the long side, upright, 8-bit sRGB in memory the engine can read. */
     private fun decode(uri: Uri, edge: Int): Bitmap? = runCatching {
@@ -864,14 +1071,14 @@ class ImportActivity : ComponentActivity() {
 
     /** The settings the engine develops with, apart from the film and paper the strip picks. */
     private fun engineParam(setting: Setting) = setting.group.isNotEmpty() &&
-        (!setting.key.startsWith("app.") || setting.key == Settings.BALANCE) && setting.key != "film" && setting.key != "paper"
+        (!setting.key.startsWith("app.") || setting.key in setOf(Settings.BALANCE, Settings.PUSH, Settings.FORMAT)) && setting.key != "film" && setting.key != "paper"
 
     // ---- every parameter, in a panel of at most half the screen ----------------------------
 
     private fun showParams() {
         if (paramsPanel?.visibility == View.VISIBLE) return
         val panel = paramsPanel ?: SettingsPanel(this, values, onBench = null, onClose = { hideParams() },
-            title = "全部参数", only = ::engineParam, open = openSections).also {
+            title = "全部参数", only = ::engineParam, open = openSections, tabbed = true).also {
             paramsPanel = it
             it.elevation = dp(8).toFloat()
             root.addView(it, LinearLayout.LayoutParams(-1, 0))
@@ -902,7 +1109,7 @@ class ImportActivity : ComponentActivity() {
                 panel.visibility = View.GONE
                 mainPanel.visibility = View.VISIBLE
                 pickerStrip.visibility = View.VISIBLE
-                (preview.layoutParams as FrameLayout.LayoutParams).bottomMargin = dp(120)
+                (preview.layoutParams as FrameLayout.LayoutParams).bottomMargin = dp(STRIP)
                 preview.requestLayout()
                 thumbScroll.visibility = if (uris.size > 1) View.VISIBLE else View.GONE
                 syncPanel()
@@ -911,11 +1118,16 @@ class ImportActivity : ComponentActivity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
 
+    /** The look strip's height over the picture's foot: its fade, marker, cans and family tabs. */
+    private val STRIP = 18 + 4 + 2 + 88 + 2 + 36 + 6 - 24
+
     companion object {
         const val URIS = "uris"
         private const val MAX = 30
         private const val SIDE = 72 // dp either side of the exposure ruler and the strength bar
         private const val PREVIEW_EDGE = 1280
+        /** An import's largest long edge: the engine's 原尺寸 (the camera's largest 冲洗尺寸). */
+        private val IMPORT_MAX_EDGE = org.photoall.film.settings.Settings.longEdges.last()
         private const val DARK = 0xff121110.toInt()
         private const val LIGHT = 0xfff2f0ea.toInt()
     }

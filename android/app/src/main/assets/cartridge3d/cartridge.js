@@ -10,6 +10,8 @@
   const q = new URLSearchParams(location.search);
   // still mode: no page, no touch; the app asks for pictures of a cartridge (renderStill below)
   const STILL = q.get('mode') === 'still';
+  // paper=<id>: a paper's box (or a print film's can) instead of a cartridge (papermodel.js)
+  const PAPER = q.get('paper');
   let look = {
     name: q.get('name') || 'Kodak Portra 400',
     maker: (q.get('maker') || 'KODAK').toUpperCase(),
@@ -20,7 +22,7 @@
     ink: '#' + (q.get('ink') || '1c1a1a'),
   };
   if (STILL) for (const id of ['name', 'pull', 'hint']) document.getElementById(id).style.display = 'none';
-  else document.getElementById('name').innerHTML = look.name + '<small>135 · 36 EXP · ISO ' + look.iso + '</small>';
+  else document.getElementById('name').innerHTML = look.name + (PAPER ? '' : '<small>135 · 36 EXP · ISO ' + look.iso + '</small>');
   if (STILL) { document.body.style.background = 'transparent'; document.documentElement.style.background = 'transparent'; }
 
   // ------------------------------------------------------------------ renderer and scene
@@ -47,7 +49,15 @@
     const aspect = vw() / vh();
     return Math.max(34 / halfV, 40 / (halfV * aspect));
   }
-  let base = fitDistance();
+  function frameView() {
+    if (!document.body.classList.contains('withcard')) { camera.clearViewOffset(); return; }
+    const W = vw(), H = vh();
+    if (H >= W) camera.setViewOffset(W, H, 0, H * 0.24, W, H);
+    else camera.setViewOffset(W, H, W * 0.22, 0, W, H);
+  }
+  const CARD_ROOM = document.body.classList.contains('withcard') ? 1.12 : 1;
+  frameView();
+  let base = fitDistance() * CARD_ROOM;
   let distance = base;
   camera.position.set(0, 4, distance); // eye level: straight on, not from above
   camera.lookAt(0, 2, 0);
@@ -85,12 +95,24 @@
   scene.add(new THREE.HemisphereLight(0xfff6ea, 0x3a332c, 0.35));
 
   // ------------------------------------------------------------------ the cartridge itself (cartmodel.js)
-  const cart = CartridgeModel(THREE, renderer, look);
+  let cart, paperModel = null;
+  if (PAPER) {
+    // a box or can, brought to about a cartridge's size so the stage and the camera fit it the same way
+    paperModel = PaperModel(THREE, renderer, PAPER);
+    const k = 50 / paperModel.height;
+    const g = new THREE.Group();
+    paperModel.group.scale.setScalar(k);
+    g.add(paperModel.group);
+    cart = { group: g, R: paperModel.width * k / 2, L: paperModel.height * k, CAP: 0, FILM_MAX: 100,
+      film: new THREE.Object3D(), spool: new THREE.Object3D(), setLeader: (mm) => paperModel.open(Math.min(1, mm / 96)) };
+    document.getElementById('pull').textContent = paperModel.kind === 'can' ? '转开盒盖' : '打开盒子';
+    document.getElementById('hint').textContent = '单指旋转 · 双指缩放 · 双击' + (paperModel.kind === 'can' ? '转开盒盖' : '打开盒子');
+  } else cart = CartridgeModel(THREE, renderer, look);
   const model = cart.group;
   scene.add(model);
   const R = cart.R, L = cart.L, CAP = cart.CAP, FILM_MAX = cart.FILM_MAX;
   const film = cart.film, spool = cart.spool;
-  let filmOut = 24, filmTarget = 24;
+  let filmOut = PAPER ? 0 : 24, filmTarget = filmOut;
   function shapeFilm() { cart.setLeader(filmOut); }
   shapeFilm();
 
@@ -185,6 +207,12 @@
   document.getElementById('pull').addEventListener('click', () => { togglePull(); wake(); });
 
   function togglePull() {
+    if (PAPER) {
+      filmTarget = filmTarget < 50 ? 96 : 0;
+      const can = paperModel.kind === 'can';
+      document.getElementById('pull').textContent = filmTarget > 50 ? (can ? '合上盒盖' : '合上盒子') : (can ? '转开盒盖' : '打开盒子');
+      return;
+    }
     filmTarget = filmTarget < 50 ? FILM_MAX - 4 : 24;
     document.getElementById('pull').textContent = filmTarget > 50 ? '收回胶片' : '抽出胶片';
   }
@@ -219,7 +247,8 @@
   window.addEventListener('resize', () => {
     camera.aspect = vw() / vh(); camera.updateProjectionMatrix();
     const k = Number.isFinite(distance / base) && base > 0 ? distance / base : 1;
-    base = fitDistance(); distance = base * k;
+    base = fitDistance() * CARD_ROOM; distance = base * k;
+    frameView();
     renderer.setSize(vw(), vh()); wake();
   });
   let hintGone = false;

@@ -43,6 +43,13 @@ class ViewfinderOverlay(context: Context) : View(context) {
      */
     /** What lies round the picture (the screen's ground, or the well in landscape): a style's frame fills its corners with it. */
     var frameAround = 0xff0b0b0d.toInt()
+    /** 旁轴: the lens in use (35 mm equivalent), the metered time (auto), the meter's offset (manual). */
+    var rfFocal = 50
+        set(v) { if (field != v) { field = v; invalidate() } }
+    var rfSeconds: Double? = null
+        set(v) { if (field != v) { field = v; invalidate() } }
+    var rfMeter: Float? = null
+        set(v) { if (field != v) { field = v; invalidate() } }
     var cornerRadius = 0f
         set(value) { field = value; invalidate() }
     var cornerColor = 0xff0b0b0d.toInt()
@@ -128,9 +135,37 @@ class ViewfinderOverlay(context: Context) : View(context) {
         }
     }
 
+    /** 旁轴 through the eyepiece: nothing but the finder (no guides, readout or histogram). */
+    var eyepiece = false
+        set(v) { field = v; if (!v) eyeBody = null; invalidate() }
+    private var eyeBody: android.graphics.drawable.Drawable? = null
+
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
+        if (eyepiece && org.photoall.film.ui.Skin.rangefinder) {
+            // the body round the eyepiece: the same vulcanite as the screen round the picture, in its frame
+            val root = rootView
+            val at = IntArray(2); getLocationInWindow(at)
+            org.photoall.film.camera.Rangefinder.body = eyeBody ?: org.photoall.film.ui.Skin.Backdrop(density, w > h).also { eyeBody = it }
+            org.photoall.film.camera.Rangefinder.bodyOrigin = floatArrayOf(at[0].toFloat(), at[1].toFloat())
+            org.photoall.film.camera.Rangefinder.bodySize = floatArrayOf(root.width.toFloat(), root.height.toFloat())
+            org.photoall.film.camera.Rangefinder.eye = true
+            org.photoall.film.camera.Rangefinder.draw(canvas, w, h, density, rfFocal, rfSeconds, rfMeter)
+            org.photoall.film.camera.Rangefinder.eye = false
+            // the exposure, as the viewfinder shows it in the other themes: under the eyepiece,
+            // upright on the screen whichever way the finder is turned
+            if (info.isNotEmpty()) {
+                val rot = h > w
+                val rw = if (rot) h else w; val rh = if (rot) w else h
+                val ow = rw * 0.86f
+                val oh = minOf(rh * 0.84f, ow / 1.38f)
+                val rimBottom = h / 2 + (if (rot) ow else oh) / 2
+                val top = if (rimBottom + 34 * density < h) rimBottom + 10 * density else rimBottom - 36 * density
+                drawReadout(canvas, centerX = w / 2, topY = top)
+            }
+            return
+        }
         when (guides) {
             1 -> grid(canvas, w, h, 1f / 3, 2f / 3)
             2 -> grid(canvas, w, h, 0.382f, 0.618f)
@@ -145,7 +180,10 @@ class ViewfinderOverlay(context: Context) : View(context) {
                 canvas.drawLine(w / 2, h / 2 - arm, w / 2, h / 2 + arm, guidePaint)
             }
         }
-        if (info.isNotEmpty() && readoutAlpha > 0.01f) faded(canvas, readoutAlpha) { drawReadout(canvas) }
+        // 旁轴: the optical finder; its red display takes the readout's place
+        val rangefinder = org.photoall.film.ui.Skin.rangefinder
+        if (rangefinder) org.photoall.film.camera.Rangefinder.draw(canvas, w, h, density, rfFocal, rfSeconds, rfMeter)
+        if (!rangefinder && info.isNotEmpty() && readoutAlpha > 0.01f) faded(canvas, readoutAlpha) { drawReadout(canvas) }
         histogram?.let { h -> if (histogramAlpha > 0.01f) faded(canvas, histogramAlpha) { drawHistogram(canvas, h) } }
 
         val state = focus ?: return
@@ -187,7 +225,7 @@ class ViewfinderOverlay(context: Context) : View(context) {
      * The live readout as a glass pill: each part's name small and grey ("ISO", "胶片 ISO"),
      * its value in bold figures; "手动" as an amber tag.
      */
-    private fun drawReadout(canvas: Canvas) {
+    private fun drawReadout(canvas: Canvas, centerX: Float = -1f, topY: Float = -1f) {
         val parts = info.split(" · ").map { it.trim() }.filter { it.isNotEmpty() }
         val pad = 8 * density
         val gap = 10 * density
@@ -205,8 +243,8 @@ class ViewfinderOverlay(context: Context) : View(context) {
             width += valuePaint.measureText(p.second)
         }
         width += pad
-        val left = 10 * density
-        val top = 10 * density
+        val left = if (centerX >= 0f) centerX - width / 2 else 10 * density
+        val top = if (topY >= 0f) topY else 10 * density
         chipRect.set(left, top, left + width, top + 22 * density)
         chipPaint.color = 0x8c000000.toInt()
         canvas.drawRoundRect(chipRect, 11 * density, 11 * density, chipPaint)
@@ -307,6 +345,7 @@ class ViewfinderOverlay(context: Context) : View(context) {
     override fun dispatchDraw(canvas: Canvas) {
         super.dispatchDraw(canvas)
         drawFrost(canvas)
+        if (eyepiece && org.photoall.film.ui.Skin.rangefinder) return // the body runs on round the eyepiece, no edge
         if (org.photoall.film.ui.Skin.active) {
             // the style's own frame round the picture, in place of the plain corners
             org.photoall.film.ui.Skin.drawFinderFrame(canvas, width.toFloat(), height.toFloat(), density, frameAround)

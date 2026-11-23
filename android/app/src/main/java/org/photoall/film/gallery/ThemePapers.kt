@@ -50,11 +50,13 @@ object ThemePapers {
         val sheet get() = RectF(0f, 0f, w.toFloat(), h.toFloat())
     }
 
-    fun plan(t: Theme, pw: Int, ph: Int, maxLong: Int): Plan {
-        val h = min(maxLong, (max(pw, ph) * 1.45f).toInt()).coerceAtLeast(800)
-        val w = (h * 0.8f).toInt()
-        val u = w / 100f
-        val H = h / u
+    /** Where the user put the photo by hand: its centre and width as shares of the sheet. */
+    class Place(val x: Float, val y: Float, val size: Float)
+
+    fun plan(t: Theme, pw: Int, ph: Int, maxLong: Int, place: Place? = null): Plan {
+        // laid out in units first (the sheet 100 x 125); its size in pixels after, so the photo
+        // keeps its own resolution on it (it used to come out at about 0.6 of it)
+        val H = 125f
         val (region, ax, ay) = when (t) {
             Theme.SACRED -> Triple(RectF(25f, 47f, 75f, H * 0.7f), 0.5f, 0.5f)
             Theme.FATE -> Triple(RectF(8f, 16f, 70f, H * 0.66f), 0f, 0.3f)
@@ -63,10 +65,21 @@ object ThemePapers {
             Theme.FILM -> Triple(RectF(9f, 8f, 91f, H * 0.53f), 0.5f, 0f)
         }
         val k = min(region.width() / pw, region.height() / ph)
-        val pwU = pw * k
-        val phU = ph * k
-        val left = region.left + (region.width() - pwU) * ax
-        val top = region.top + (region.height() - phU) * ay
+        var pwU = pw * k
+        var phU = ph * k
+        var left = region.left + (region.width() - pwU) * ax
+        var top = region.top + (region.height() - phU) * ay
+        if (place != null) {
+            // placed by hand: as wide as asked (kept on the sheet), centred where it was let go
+            pwU = (place.size * 100f).coerceIn(15f, 100f)
+            phU = pwU * ph / pw
+            if (phU > H) { phU = H; pwU = phU * pw / ph }
+            left = (place.x * 100f - pwU / 2).coerceIn(0f, 100f - pwU)
+            top = (place.y * H - phU / 2).coerceIn(0f, H - phU)
+        }
+        val h = min(maxLong.toFloat(), pw / pwU * H).coerceAtLeast(800f).toInt()
+        val w = (h * 0.8f).toInt()
+        val u = w / 100f
         val photo = RectF(left * u, top * u, (left + pwU) * u, (top + phU) * u)
         fun r(l: Float, t2: Float, rr: Float, b: Float) = RectF(l * u, t2 * u, rr * u, b * u)
         val textTop = max(top + phU + 8f, H * 0.84f)
@@ -95,12 +108,12 @@ object ThemePapers {
         Theme.FILM -> 0xff2a2724.toInt()
     }
 
-    fun drawUnder(c: Canvas, t: Theme, p: Plan, seed: Int) {
+    fun drawUnder(c: Canvas, t: Theme, p: Plan, seed: Int, words: Boolean = true) {
         val rnd = Random(seed * 7349 + t.ordinal)
         when (t) {
             Theme.SACRED -> churchUnder(c, p, rnd)
             Theme.FATE -> orbitUnder(c, p, rnd)
-            Theme.ANIME -> skyUnder(c, p, rnd)
+            Theme.ANIME -> skyUnder(c, p, rnd, words)
             Theme.CAMERA -> opticalUnder(c, p, rnd)
             Theme.FILM -> studioUnder(c, p)
         }
@@ -568,99 +581,215 @@ object ThemePapers {
 
     private const val SKY_NAVY = 0xff1b2a4a.toInt()
 
-    private fun skyUnder(c: Canvas, p: Plan, rnd: Random) {
+    /**
+     * Summer in an anime's establishing shot: a deep sky in cel bands, the sun's flare running
+     * down it, a contrail, cumulonimbus lit warm on the sun's side, a hazy town on the horizon,
+     * a utility pole and its wires across the sky with sparrows on them. The photo is a print
+     * taped up on all that (the tape in [skyOver]), the words in a speech bubble.
+     */
+    private fun skyUnder(c: Canvas, p: Plan, rnd: Random, words: Boolean) {
         val u = p.u
         val P = p.photo
         val W = p.w.toFloat()
         val Hh = p.h.toFloat()
+        // the sky: deep at the top, pale at the horizon, in soft cel bands
         c.drawRect(p.sheet, paint().apply {
-            shader = LinearGradient(0f, 0f, 0f, Hh, intArrayOf(0xff2a5fd4.toInt(), 0xff4f97ec.toInt(), 0xff9fd3fb.toInt(), 0xffe6f5ff.toInt()),
-                floatArrayOf(0f, 0.35f, 0.72f, 1f), Shader.TileMode.CLAMP)
+            shader = LinearGradient(0f, 0f, 0f, Hh, intArrayOf(0xff1846c4.toInt(), 0xff2f74e2.toInt(), 0xff62a8f2.toInt(), 0xffa9dafb.toInt(), 0xffeaf7ff.toInt()),
+                floatArrayOf(0f, 0.28f, 0.55f, 0.8f, 1f), Shader.TileMode.CLAMP)
         })
-        // the sun beyond the top right, its flare: rays, a bloom, ghosts down across the sky
+        val band = paint()
+        for (k in 0 until 4) {
+            val y0 = Hh * (0.12f + k * 0.17f)
+            band.color = a(0.05f + 0.015f * k, 0xffffff)
+            c.drawRect(0f, y0, W, y0 + Hh * 0.09f, band)
+        }
+        // the sun beyond the top right: rays, a bloom
         val sx = W * 0.86f
         val sy = 7f * u
         val rayQ = paint()
-        for (k in 0 until 14) {
-            val ang = (95f + k * 9f + rnd.nextFloat() * 4f) * PI.toFloat() / 180f
-            val sp = (1.2f + rnd.nextFloat() * 1.6f) * PI.toFloat() / 180f
-            val far = 130f * u
-            rayQ.shader = RadialGradient(sx, sy, far, intArrayOf(a(0.35f, 0xffffff), a(0f, 0xffffff)), null, Shader.TileMode.CLAMP)
+        for (k in 0 until 16) {
+            val ang = (92f + k * 8f + rnd.nextFloat() * 4f) * PI.toFloat() / 180f
+            val sp = (1f + rnd.nextFloat() * 1.6f) * PI.toFloat() / 180f
+            val far = 140f * u
+            rayQ.shader = RadialGradient(sx, sy, far, intArrayOf(a(0.32f, 0xffffff), a(0f, 0xffffff)), null, Shader.TileMode.CLAMP)
             c.drawPath(Path().apply {
                 moveTo(sx, sy); lineTo(sx + cos(ang - sp) * far, sy + sin(ang - sp) * far); lineTo(sx + cos(ang + sp) * far, sy + sin(ang + sp) * far); close()
             }, rayQ)
         }
-        c.drawCircle(sx, sy, 22f * u, paint().apply {
-            shader = RadialGradient(sx, sy, 22f * u, intArrayOf(a(1f, 0xffffff), a(0.75f, 0xfffbe8), a(0f, 0xfff4d0)), floatArrayOf(0f, 0.18f, 1f), Shader.TileMode.CLAMP)
+        c.drawCircle(sx, sy, 26f * u, paint().apply {
+            shader = RadialGradient(sx, sy, 26f * u, intArrayOf(a(1f, 0xffffff), a(0.8f, 0xfffbe8), a(0.25f, 0xfff4d0), a(0f, 0xfff4d0)), floatArrayOf(0f, 0.14f, 0.45f, 1f), Shader.TileMode.CLAMP)
         })
-        for ((k, f) in listOf(0.32f, 0.55f, 0.7f, 0.9f).withIndex()) {
-            val gx = sx + (W * 0.2f - sx) * f
-            val gy = sy + (Hh * 0.75f - sy) * f
-            val gr = (1.6f + k * 1.2f) * u
+        // the flare running down the sky: a halo with coloured edges, then ghosts
+        val halo = paint().apply { style = Paint.Style.STROKE; strokeWidth = 0.9f * u }
+        for ((k, col) in listOf(0xff8a9e, 0xfff2a0, 0x9ef2ff).withIndex()) {
+            halo.color = a(0.18f, col)
+            c.drawCircle(sx, sy, (31f + k * 1.1f) * u, halo)
+        }
+        for ((k, f) in listOf(0.28f, 0.46f, 0.62f, 0.78f, 0.92f).withIndex()) {
+            val gx = sx + (W * 0.12f - sx) * f
+            val gy = sy + (Hh * 0.8f - sy) * f
+            val gr = (1.4f + k * 1.1f) * u
             val hex = Path()
             for (i in 0 until 6) {
-                val ang = i * PI.toFloat() / 3
+                val ang = i * PI.toFloat() / 3 + 0.3f
                 if (i == 0) hex.moveTo(gx + cos(ang) * gr, gy + sin(ang) * gr) else hex.lineTo(gx + cos(ang) * gr, gy + sin(ang) * gr)
             }
             hex.close()
-            c.drawPath(hex, paint().apply { color = a(0.16f, if (k % 2 == 0) 0xbff2ff else 0xffd6ec) })
+            c.drawPath(hex, paint().apply { color = a(0.14f, if (k % 2 == 0) 0xbff2ff else 0xffd6ec) })
+            c.drawPath(hex, paint().apply { style = Paint.Style.STROKE; strokeWidth = 0.15f * u; color = a(0.25f, 0xffffff) })
         }
-        // high wisps
-        val wisp = paint().apply { color = a(0.55f, 0xffffff) }
-        for (k in 0 until 6) {
-            val wy = (12f + k * 5.5f) * u
-            val wx = rnd.nextFloat() * W * 0.7f
-            c.drawOval(wx, wy, wx + (18f + rnd.nextFloat() * 22f) * u, wy + (0.8f + rnd.nextFloat()) * u, wisp)
-        }
-        // a few birds far off
-        val far = paint().apply { color = a(0.55f, SKY_NAVY) }
-        for ((bx, by, s) in listOf(Triple(W * 0.2f, 11f * u, 1f * u), Triple(W * 0.26f, 13.5f * u, 0.7f * u), Triple(W * 0.31f, 10f * u, 0.55f * u)))
-            swallow(c, bx, by, s, 8f, far)
-        // towering cumulus behind the photo's foot and along the bottom, cel-shaded
-        cumulus(c, W * 0.18f, P.bottom + 6f * u, 22f * u, rnd)
-        cumulus(c, W * 0.78f, P.bottom + 2f * u, 26f * u, rnd)
-        cumulus(c, W * 0.45f, Hh + 2f * u, 34f * u, rnd)
-        cumulus(c, W * 0.05f, Hh - 4f * u, 20f * u, rnd)
-        cumulus(c, W * 0.98f, Hh - 8f * u, 24f * u, rnd)
-        // the photo: a print with a white edge and a soft shadow on the sky
-        c.drawRect(P.left - 0.6f * u, P.top + 0.8f * u, P.right + 1.4f * u, P.bottom + 2.4f * u, paint().apply {
-            color = a(0.25f, 0x1b2a4a); maskFilter = android.graphics.BlurMaskFilter(1.6f * u, android.graphics.BlurMaskFilter.Blur.NORMAL)
+        // a contrail, high, with the plane a glint at its head
+        val cx0 = W * 0.02f; val cy0 = 30f * u; val cx1 = W * 0.62f; val cy1 = 17f * u
+        c.drawLine(cx0, cy0, cx1, cy1, paint().apply {
+            strokeWidth = 0.55f * u; strokeCap = Paint.Cap.ROUND
+            shader = LinearGradient(cx0, cy0, cx1, cy1, a(0f, 0xffffff), a(0.85f, 0xffffff), Shader.TileMode.CLAMP)
         })
-        c.drawRect(RectF(P).apply { inset(-1.2f * u, -1.2f * u) }, paint().apply { color = 0xffffffff.toInt() })
-        // the speech bubble for the words, its tail toward the photo
-        val b = RectF(p.text).apply { inset(-2.6f * u, -1.8f * u) }
-        val bubble = Path().apply {
-            addRoundRect(b, 3f * u, 3f * u, Path.Direction.CW)
-            moveTo(b.left + 8f * u, b.top + 0.2f * u); lineTo(b.left + 10f * u, b.top - 3.6f * u); lineTo(b.left + 12.5f * u, b.top + 0.2f * u); close()
+        c.drawLine(cx0, cy0 + 0.9f * u, cx1, cy1 + 0.9f * u, paint().apply {
+            strokeWidth = 0.35f * u; strokeCap = Paint.Cap.ROUND
+            shader = LinearGradient(cx0, cy0, cx1, cy1, a(0f, 0xffffff), a(0.55f, 0xffffff), Shader.TileMode.CLAMP)
+        })
+        spark(c, cx1 + 0.6f * u, cy1 - 0.1f * u, 0.9f * u, 0xffffffff.toInt())
+        // high wisps
+        val wisp = paint().apply { color = a(0.5f, 0xffffff) }
+        for (k in 0 until 5) {
+            val wy = (10f + k * 6f) * u
+            val wx = rnd.nextFloat() * W * 0.6f
+            c.drawOval(wx, wy, wx + (16f + rnd.nextFloat() * 22f) * u, wy + (0.7f + rnd.nextFloat()) * u, wisp)
         }
+        // cumulonimbus, far: low behind the town, rising at the sides, lit warm toward the sun
+        thunderhead(c, W * 0.1f, P.bottom + 7f * u, 17f * u, rnd, sx)
+        thunderhead(c, W * 0.84f, P.bottom + 5f * u, 20f * u, rnd, sx)
+        thunderhead(c, W * 0.45f, Hh - 4f * u, 16f * u, rnd, sx)
+        // the town on the horizon, in haze: blocks, a tower with its light, windows catching the sun
+        val ground = Hh - 9f * u
+        val town = paint().apply { color = 0xffb7d3f0.toInt() }
+        val lit = paint().apply { color = a(0.7f, 0xffffff) }
+        var x = -2f * u
+        while (x < W) {
+            val bw = (3f + rnd.nextFloat() * 6f) * u
+            val bh = (4f + rnd.nextFloat() * 10f) * u
+            c.drawRect(x, ground - bh, x + bw, Hh, town)
+            if (rnd.nextFloat() < 0.6f) {
+                var wy = ground - bh + 1.2f * u
+                while (wy < ground - 0.8f * u) { c.drawRect(x + 0.8f * u, wy, x + bw - 0.8f * u, wy + 0.25f * u, lit); wy += 1.6f * u }
+            }
+            x += bw + rnd.nextFloat() * 1.2f * u
+        }
+        val tx = W * 0.3f
+        c.drawRect(tx - 0.35f * u, ground - 24f * u, tx + 0.35f * u, ground, paint().apply { color = 0xffa9c6e6.toInt() })
+        c.drawLine(tx - 2.6f * u, ground - 12f * u, tx + 2.6f * u, ground - 12f * u, hair(u, 0xffa9c6e6.toInt(), 0.4f))
+        c.drawCircle(tx, ground - 24.3f * u, 0.55f * u, paint().apply { color = 0xffff6a5c.toInt() })
+        // a utility pole at the right, its wires across the sky, sparrows sitting on them
+        val px = W * 0.9f
+        val pole = paint().apply { color = 0xff20304e.toInt() }
+        c.drawRect(px - 0.7f * u, 14f * u, px + 0.7f * u, Hh, pole)
+        for ((k, ay) in listOf(18f, 23.5f).withIndex()) {
+            val arm = (if (k == 0) 7f else 5.5f) * u
+            c.drawRect(px - arm, ay * u, px + arm, ay * u + 0.7f * u, pole)
+            for (ix in listOf(-0.85f, -0.35f, 0.35f, 0.85f)) {
+                c.drawRoundRect(px + ix * arm - 0.35f * u, ay * u - 1.2f * u, px + ix * arm + 0.35f * u, ay * u, 0.2f * u, 0.2f * u, pole)
+            }
+        }
+        c.drawRect(px - 2f * u, 30f * u, px + 2f * u, 33f * u, pole) // a transformer
+        val wire = paint().apply { style = Paint.Style.STROKE; strokeWidth = 0.28f * u; color = 0xff20304e.toInt(); strokeCap = Paint.Cap.ROUND }
+        val wires = listOf(-0.85f to 18f, -0.35f to 18f, -0.85f to 23.5f, -0.35f to 23.5f)
+        for ((k, wpair) in wires.withIndex()) {
+            val (ix, ay) = wpair
+            val arm = (if (ay < 20f) 7f else 5.5f) * u
+            val wx0 = px + ix * arm; val wy0 = ay * u - 1.2f * u
+            val sag = (8f + k * 1.5f) * u
+            val endY = wy0 + (12f + k * 4f) * u
+            val path = Path().apply { moveTo(wx0, wy0); quadTo(W * 0.42f, (wy0 + endY) / 2 + sag, -2f * u, endY) }
+            c.drawPath(path, wire)
+            if (k == 1) {
+                // sparrows along this one
+                val pm = PathMeasure(path, false)
+                val pos = FloatArray(2)
+                for (f in listOf(0.22f, 0.27f, 0.58f)) {
+                    pm.getPosTan(pm.length * f, pos, null)
+                    sparrow(c, pos[0], pos[1], 1.1f * u, pole)
+                }
+            }
+        }
+        // the photo: a print with a white edge and a soft shadow on the sky
+        c.drawRect(P.left - 0.4f * u, P.top + 1f * u, P.right + 1.6f * u, P.bottom + 2.8f * u, paint().apply {
+            color = a(0.28f, 0x0e1a3a); maskFilter = android.graphics.BlurMaskFilter(1.8f * u, android.graphics.BlurMaskFilter.Blur.NORMAL)
+        })
+        c.drawRect(RectF(P).apply { inset(-1.4f * u, -1.4f * u) }, paint().apply { color = 0xfffffffd.toInt() })
+        // the speech bubble for the words (none without words): a halftone shadow, a double outline, its tail toward the photo
+        if (!words) return
+        val b = RectF(p.text).apply { inset(-2.8f * u, -2f * u) }
+        val tail = Path().apply { moveTo(b.left + 8f * u, b.top + 0.3f * u); lineTo(b.left + 10.5f * u, b.top - 4f * u); lineTo(b.left + 13f * u, b.top + 0.3f * u); close() }
+        val dots = paint().apply { color = a(0.35f, SKY_NAVY) }
+        c.save()
+        c.clipPath(Path().apply { addRoundRect(RectF(b).apply { offset(1.1f * u, 1.1f * u) }, 3.4f * u, 3.4f * u, Path.Direction.CW) })
+        var dy = b.top
+        var row = 0
+        while (dy < b.bottom + 2f * u) {
+            var dx = b.left + (row % 2) * 0.6f * u
+            while (dx < b.right + 2f * u) { c.drawCircle(dx, dy, 0.22f * u, dots); dx += 1.2f * u }
+            dy += 1.05f * u; row++
+        }
+        c.restore()
+        val bubble = Path().apply { addRoundRect(b, 3.4f * u, 3.4f * u, Path.Direction.CW); op(tail, Path.Op.UNION) }
         c.drawPath(bubble, paint().apply { color = 0xffffffff.toInt() })
-        c.drawRoundRect(b, 3f * u, 3f * u, hair(u, SKY_NAVY, 0.28f))
-        c.drawLine(b.left + 8.2f * u, b.top, b.left + 10f * u, b.top - 3.6f * u, hair(u, SKY_NAVY, 0.28f))
-        c.drawLine(b.left + 12.3f * u, b.top, b.left + 10f * u, b.top - 3.6f * u, hair(u, SKY_NAVY, 0.28f))
+        c.drawPath(bubble, hair(u, SKY_NAVY, 0.32f))
+        c.drawRoundRect(RectF(b).apply { inset(0.8f * u, 0.8f * u) }, 2.6f * u, 2.6f * u, hair(u, a(0.35f, SKY_NAVY), 0.12f))
     }
 
-    /** A cumulus heap: white puffs lit from above, their undersides in a cool shadow, crisp edged as a cel. */
-    private fun cumulus(c: Canvas, x: Float, y: Float, s: Float, rnd: Random) {
-        val puffs = (0 until 11).map {
+    /** A sparrow perched, from the side: a round body, a head, a tail cocked. */
+    private fun sparrow(c: Canvas, x: Float, y: Float, s: Float, q: Paint) {
+        c.drawOval(x - s * 0.7f, y - s * 1.05f, x + s * 0.55f, y - s * 0.1f, q)
+        c.drawCircle(x + s * 0.5f, y - s * 1.05f, s * 0.36f, q)
+        c.drawPath(Path().apply { moveTo(x - s * 0.55f, y - s * 0.5f); lineTo(x - s * 1.25f, y - s * 0.95f); lineTo(x - s * 1.05f, y - s * 0.35f); close() }, q)
+        c.drawPath(Path().apply { moveTo(x + s * 0.82f, y - s * 1.1f); lineTo(x + s * 1.15f, y - s * 0.98f); lineTo(x + s * 0.82f, y - s * 0.88f); close() }, q)
+    }
+
+    /**
+     * A cumulonimbus as an anime paints it: puffs in three flat tones (cool shadow, body,
+     * highlight), a warm rim on the side toward the sun at [sunX], crisp edges.
+     */
+    private fun thunderhead(c: Canvas, x: Float, y: Float, s: Float, rnd: Random, sunX: Float) {
+        val puffs = (0 until 16).map {
             val ang = PI.toFloat() * (1f + rnd.nextFloat())
-            val d = s * (0.2f + rnd.nextFloat() * 0.75f)
-            Triple(x + cos(ang) * d * 1.3f, y + sin(ang) * d * 0.7f, s * (0.28f + rnd.nextFloat() * 0.3f))
+            val d = s * (0.15f + rnd.nextFloat() * 0.85f)
+            Triple(x + cos(ang) * d * 1.25f, y + sin(ang) * d * 0.95f, s * (0.22f + rnd.nextFloat() * 0.3f))
         }
-        val shadow = paint().apply { color = 0xffc4d6ef.toInt() }
-        val body = paint().apply { color = 0xfffdfeff.toInt() }
-        val rim = paint().apply { color = 0xffe7f0fb.toInt() }
-        for ((px, py, r) in puffs) c.drawCircle(px, py + r * 0.22f, r, shadow)
-        for ((px, py, r) in puffs) c.drawCircle(px, py, r * 0.92f, rim)
-        for ((px, py, r) in puffs) c.drawCircle(px - r * 0.12f, py - r * 0.16f, r * 0.8f, body)
+        val toward = if (sunX > x) 1f else -1f
+        val deep = paint().apply { color = 0xffa9c0e2.toInt() }
+        val shadow = paint().apply { color = 0xffcadbf2.toInt() }
+        val body = paint().apply { color = 0xfff4f8ff.toInt() }
+        val white = paint().apply { color = 0xffffffff.toInt() }
+        val warm = paint().apply { color = 0xfffff1d8.toInt() }
+        for ((px, py, r) in puffs) c.drawCircle(px, py + r * 0.3f, r * 1.02f, deep)
+        for ((px, py, r) in puffs) c.drawCircle(px, py + r * 0.14f, r * 0.96f, shadow)
+        for ((px, py, r) in puffs) c.drawCircle(px - r * 0.06f, py - r * 0.06f, r * 0.86f, body)
+        for ((px, py, r) in puffs) c.drawCircle(px + toward * r * 0.22f, py - r * 0.24f, r * 0.52f, warm)
+        for ((px, py, r) in puffs) c.drawCircle(px + toward * r * 0.12f, py - r * 0.3f, r * 0.42f, white)
     }
 
     private fun skyOver(c: Canvas, p: Plan, rnd: Random, date: String) {
         val u = p.u
         val P = p.photo
         val core = core(p)
+        // the print taped up: washi tape across two corners, striped, its ends torn
+        washi(c, P.left + 1.5f * u, P.top + 0.5f * u, 11f * u, 3.2f * u, -38f, 0xffff9fbd.toInt(), rnd)
+        washi(c, P.right - 1.5f * u, P.top + 0.5f * u, 11f * u, 3.2f * u, 41f, 0xff8fd3ff.toInt(), rnd)
+        washi(c, P.right - 2f * u, P.bottom - 0.2f * u, 9f * u, 3f * u, -34f, 0xffffe08a.toInt(), rnd)
+        // a paper plane coming in from the left, its loop dashed behind it
+        val planeX = P.left - 4f * u; val planeY = P.top - 5f * u
+        if (planeY > 3f * u) {
+            c.drawPath(Path().apply {
+                moveTo(2f * u, planeY + 9f * u); cubicTo(8f * u, planeY + 14f * u, 3f * u, planeY + 2f * u, planeX - 3f * u, planeY + 1f * u)
+            }, paint().apply { style = Paint.Style.STROKE; strokeWidth = 0.25f * u; color = a(0.85f, 0xffffff); pathEffect = DashPathEffect(floatArrayOf(0.9f * u, 0.7f * u), 0f) })
+            paperPlane(c, planeX, planeY, 3.6f * u, -12f, u)
+        }
+        // star stickers at the photo's corners
+        sticker(c, P.left - 1.5f * u, P.bottom + 0.5f * u, 2.6f * u, -14f, 0xffffd23a.toInt(), u)
+        sticker(c, P.right + 1.6f * u, P.top + 7f * u, 1.8f * u, 18f, 0xffff8fb4.toInt(), u)
         // petals adrift, some across the photo's edges, never its middle
         val petal = paint()
-        repeat(34) {
+        repeat(26) {
             val x = rnd.nextFloat() * p.w
             val y = rnd.nextFloat() * p.h * 0.9f
             if (core.contains(x, y)) return@repeat
@@ -674,23 +803,87 @@ object ThemePapers {
                 cubicTo(-s * 0.8f, s * 0.6f, -s * 0.9f, -s * 0.9f, -s * 0.15f, -s * 0.92f)
                 lineTo(0f, -s * 0.62f); close()
             }
-            petal.shader = LinearGradient(0f, -s, 0f, s, 0xffffe0ea.toInt(), 0xffff9fbd.toInt(), Shader.TileMode.CLAMP)
+            petal.shader = LinearGradient(0f, -s, 0f, s, 0xffffe6ee.toInt(), 0xffff9fbd.toInt(), Shader.TileMode.CLAMP)
             c.drawPath(path, petal)
             c.restore()
         }
         // sparkles
-        for (k in 0 until 9) {
+        for (k in 0 until 11) {
             val x = rnd.nextFloat() * p.w
             val y = rnd.nextFloat() * p.h * 0.8f
             if (RectF(P).apply { inset(-1f * u, -1f * u) }.contains(x, y)) continue
-            val r = (0.6f + rnd.nextFloat() * 1.2f) * u
-            c.drawCircle(x, y, r * 2.2f, paint().apply { shader = RadialGradient(x, y, r * 2.2f, intArrayOf(a(0.6f, 0xffffff), 0), null, Shader.TileMode.CLAMP) })
+            val r = (0.6f + rnd.nextFloat() * 1.3f) * u
+            c.drawCircle(x, y, r * 2.4f, paint().apply { shader = RadialGradient(x, y, r * 2.4f, intArrayOf(a(0.6f, 0xffffff), 0), null, Shader.TileMode.CLAMP) })
             spark(c, x, y, r, 0xffffffff.toInt())
         }
-        // the date, small, as written on the back of a print
-        c.drawText(date, 9f * u, 9f * u, paint().apply {
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); textSize = 1.7f * u; color = 0xffffffff.toInt(); letterSpacing = 0.12f
+        // the date on a little tag, a sun drawn beside it
+        val tag = RectF(7f * u, 5.5f * u, 7f * u + 1.7f * u * 0.62f * date.length + 6.5f * u, 10.2f * u)
+        c.drawRoundRect(tag, 2.3f * u, 2.3f * u, paint().apply { color = a(0.9f, 0xffffff) })
+        c.drawRoundRect(tag, 2.3f * u, 2.3f * u, hair(u, SKY_NAVY, 0.2f))
+        val sunC = tag.left + 2.4f * u
+        c.drawCircle(sunC, tag.centerY(), 0.9f * u, paint().apply { color = 0xffffb13b.toInt() })
+        for (k in 0 until 8) {
+            val ang = k * PI.toFloat() / 4
+            c.drawLine(sunC + cos(ang) * 1.3f * u, tag.centerY() + sin(ang) * 1.3f * u, sunC + cos(ang) * 1.75f * u, tag.centerY() + sin(ang) * 1.75f * u,
+                hair(u, 0xffffb13b.toInt(), 0.18f))
+        }
+        c.drawText(date, tag.left + 4.6f * u, tag.centerY() + 0.6f * u, paint().apply {
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); textSize = 1.7f * u; color = SKY_NAVY; letterSpacing = 0.1f
         })
+    }
+
+    /** A strip of washi tape at (x, y), [len] long and [w] wide, turned [deg]: striped, torn at both ends. */
+    private fun washi(c: Canvas, x: Float, y: Float, len: Float, w: Float, deg: Float, color: Int, rnd: Random) {
+        c.save()
+        c.translate(x, y); c.rotate(deg)
+        val path = Path()
+        path.moveTo(-len / 2, -w / 2)
+        path.lineTo(len / 2, -w / 2)
+        var yy = -w / 2
+        while (yy < w / 2) { yy += w / 6; path.lineTo(len / 2 + (if (rnd.nextBoolean()) 0.35f else -0.35f) * w / 3, yy.coerceAtMost(w / 2)) }
+        path.lineTo(-len / 2, w / 2)
+        yy = w / 2
+        while (yy > -w / 2) { yy -= w / 6; path.lineTo(-len / 2 + (if (rnd.nextBoolean()) 0.35f else -0.35f) * w / 3, yy.coerceAtLeast(-w / 2)) }
+        path.close()
+        c.drawPath(path, paint().apply { this.color = a(0.78f, color) })
+        c.save(); c.clipPath(path)
+        val stripe = paint().apply { this.color = a(0.45f, 0xffffff); strokeWidth = w * 0.16f }
+        var sx = -len
+        while (sx < len) { c.drawLine(sx, -w, sx + w * 1.2f, w, stripe); sx += w * 0.55f }
+        c.restore()
+        c.drawPath(path, paint().apply { style = Paint.Style.STROKE; strokeWidth = w * 0.03f; this.color = a(0.25f, 0x000000) })
+        c.restore()
+    }
+
+    /** A paper plane, white with a navy line, nose toward the top right. */
+    private fun paperPlane(c: Canvas, x: Float, y: Float, s: Float, deg: Float, u: Float) {
+        c.save(); c.translate(x, y); c.rotate(deg)
+        val top = Path().apply { moveTo(s, 0f); lineTo(-s, -s * 0.55f); lineTo(-s * 0.45f, 0f); close() }
+        val under = Path().apply { moveTo(s, 0f); lineTo(-s * 0.45f, 0f); lineTo(-s * 0.8f, s * 0.42f); close() }
+        c.drawPath(under, paint().apply { color = 0xffd9e6f8.toInt() })
+        c.drawPath(top, paint().apply { color = 0xffffffff.toInt() })
+        val ink = hair(u, SKY_NAVY, 0.2f)
+        c.drawPath(top, ink); c.drawPath(under, ink)
+        c.restore()
+    }
+
+    /** A star sticker: a white die-cut edge, the star in [color], a navy outline. */
+    private fun sticker(c: Canvas, x: Float, y: Float, s: Float, deg: Float, color: Int, u: Float) {
+        c.save(); c.translate(x, y); c.rotate(deg)
+        fun star(r: Float) = Path().apply {
+            for (i in 0 until 10) {
+                val ang = (PI / 5 * i - PI / 2).toFloat()
+                val rr = if (i % 2 == 0) r else r * 0.46f
+                if (i == 0) moveTo(cos(ang) * rr, sin(ang) * rr) else lineTo(cos(ang) * rr, sin(ang) * rr)
+            }
+            close()
+        }
+        c.drawPath(star(s * 1.3f), paint().apply { this.color = a(0.25f, 0x0e1a3a); maskFilter = android.graphics.BlurMaskFilter(0.5f * u, android.graphics.BlurMaskFilter.Blur.NORMAL) })
+        c.drawPath(star(s * 1.25f), paint().apply { this.color = 0xffffffff.toInt(); strokeJoin = Paint.Join.ROUND })
+        c.drawPath(star(s), paint().apply { this.color = color })
+        c.drawPath(star(s), hair(u, SKY_NAVY, 0.18f))
+        c.drawCircle(-s * 0.22f, -s * 0.25f, s * 0.13f, paint().apply { this.color = a(0.8f, 0xffffff) })
+        c.restore()
     }
 
     // ============================================================ 飞鸟 · ORBITAL LETTER

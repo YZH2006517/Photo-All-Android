@@ -84,12 +84,21 @@ class FrameDesign {
     var cartX = 0.84f          // its centre across the sheet, 0..1
     var cartY = 0.93f          // where it stands (its foot) down the sheet, 0..1
     var cartSize = 0.26f       // its height, as a share of the sheet's short side
+    var placed = false         // theme sheets: the photo moved or resized by hand (long press in the preview)
+    var placeX = 0.5f          // its centre across the sheet, 0..1
+    var placeY = 0.4f          // its centre down the sheet, 0..1
+    var placeSize = 0.7f       // its width, as a share of the sheet's width
+    // film borders whose picture is another shape than the photo: where the crop sits on it
+    // (shares of the room left across / down, 0.5 the middle); this photo's only, not kept
+    var cropX = 0.5f
+    var cropY = 0.5f
 
     fun copy(): FrameDesign = fromJson(toJson())
 
     /** A theme's sheet with the words it is made for: the phone, the settings, the film. */
     fun theme(b: Border) {
         border = b
+        placed = false
         items.clear()
         items += listOf(Item.BRAND, Item.MODEL, Item.PARAMS, Item.FILM)
         inPhoto = false
@@ -113,6 +122,8 @@ class FrameDesign {
         put("ratio", ratio.name); put("photoScale", photoScale.toDouble()); put("photoAnchor", photoAnchor)
         put("autoPlace", autoPlace)
         put("cartridge", cartridge); put("cartX", cartX.toDouble()); put("cartY", cartY.toDouble()); put("cartSize", cartSize.toDouble())
+        put("placed", placed); put("placeX", placeX.toDouble()); put("placeY", placeY.toDouble()); put("placeSize", placeSize.toDouble())
+        put("cropX", cropX.toDouble()); put("cropY", cropY.toDouble())
     }
 
     companion object {
@@ -163,13 +174,29 @@ class FrameDesign {
             cartX = j.optDouble("cartX", cartX.toDouble()).toFloat()
             cartY = j.optDouble("cartY", cartY.toDouble()).toFloat()
             cartSize = j.optDouble("cartSize", cartSize.toDouble()).toFloat()
+            placed = j.optBoolean("placed", false)
+            placeX = j.optDouble("placeX", placeX.toDouble()).toFloat()
+            placeY = j.optDouble("placeY", placeY.toDouble()).toFloat()
+            placeSize = j.optDouble("placeSize", placeSize.toDouble()).toFloat()
+            cropX = j.optDouble("cropX", 0.5).toFloat()
+            cropY = j.optDouble("cropY", 0.5).toFloat()
         }
 
         private fun prefs(context: Context) = context.getSharedPreferences("frames", Context.MODE_PRIVATE)
 
+        /** Nothing on the photo: no border, no words, no logo, no stamp, no cartridge. */
+        fun blank(): FrameDesign = FrameDesign().apply {
+            border = Border.NONE
+            items.clear()
+            logo = Logo.NONE
+            stamp = Stamp.OFF
+            cartridge = false
+        }
+
+        /** The saved design; the crop always from the middle (it belongs to one photo). */
         fun load(context: Context): FrameDesign =
-            prefs(context).getString("design", null)?.let { runCatching { fromJson(JSONObject(it)) }.getOrNull() }
-                ?: presets[0].build(emptyList())
+            (prefs(context).getString("design", null)?.let { runCatching { fromJson(JSONObject(it)) }.getOrNull() }
+                ?: presets[0].build(emptyList())).apply { cropX = 0.5f; cropY = 0.5f }
 
         fun save(context: Context, design: FrameDesign) =
             prefs(context).edit().putString("design", design.toJson().toString()).apply()

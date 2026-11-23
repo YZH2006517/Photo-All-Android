@@ -117,6 +117,16 @@ class GalleryActivity : Activity() {
                 addView(title)
                 addView(subtitle)
             }, LinearLayout.LayoutParams(0, -2, 1f))
+            // the light table: this album's photos, roll by roll, under the same filter
+            addView(LightboxEntry(this@GalleryActivity).apply {
+                setOnClickListener {
+                    haptics.play(org.photoall.film.ui.Haptics.Event.TICK)
+                    startActivity(Intent(this@GalleryActivity, LightboxActivity::class.java)
+                        .putExtra(ViewerActivity.FAVORITES, favoritesOnly)
+                        .putExtra(ViewerActivity.FILM, film)
+                        .putExtra(ViewerActivity.PRIVATE, privateOnly))
+                }
+            }, LinearLayout.LayoutParams(dp(76), dp(34)).apply { marginEnd = dp(4) })
             addView(textButton("选择") { selecting = true; refreshSelection() }, LinearLayout.LayoutParams(dp(56), dp(48)))
         }
         selectTitle = TextView(this).apply {
@@ -133,7 +143,7 @@ class GalleryActivity : Activity() {
             )) addView(textButton(text, action), LinearLayout.LayoutParams(-2, dp(48)))
             visibility = View.GONE
         }
-        chips = LinearLayout(this).apply { setPadding(dp(16), dp(4), dp(16), dp(10)) }
+        chips = LinearLayout(this).apply { setPadding(dp(16), dp(4), dp(16), dp(10)); gravity = Gravity.CENTER_VERTICAL }
         restoreBanner = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(10), dp(8), dp(10))
@@ -326,7 +336,7 @@ class GalleryActivity : Activity() {
 
         chips.removeAllViews()
         fun add(text: String, on: Boolean, onClick: () -> Unit) =
-            chips.addView(chip(text, on, onClick), LinearLayout.LayoutParams(-2, dp(32)).apply { marginEnd = dp(6) })
+            chips.addView(chip(text, on, onClick), LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(6) })
         add("全部", !favoritesOnly && film == null && !privateOnly) { favoritesOnly = false; film = null; privateOnly = false; reload() }
         add("收藏", favoritesOnly) { favoritesOnly = !favoritesOnly; reload() }
         for (f in films) add(if (f == "直出") f else CanisterView.displayName(f), film == f) { film = if (film == f) null else f; applyFilter() }
@@ -646,6 +656,153 @@ class GalleryActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
+    /**
+     * The way to the light table: a small rounded tablet with its name, dressed quietly after the
+     * theme in use — a cartridge's yellow with its black band, a safelight's red, a print's white
+     * with crop marks, engraved brass, brushed silver; for the camera styles a gilt double rule
+     * (光), chrome on leatherette (经典), an inked sticker (漫), ink with an ultramarine stroke (风).
+     */
+    private class LightboxEntry(context: Context) : View(context) {
+        private val d = resources.displayMetrics.density
+        private val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        private val line = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { style = android.graphics.Paint.Style.STROKE }
+        private val label = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 14f * resources.displayMetrics.scaledDensity
+            textAlign = android.graphics.Paint.Align.CENTER; letterSpacing = 0.12f
+        }
+        private val r = android.graphics.RectF()
+        /** Which face: 0-4 the themes, 5.. the camera styles. */
+        private val face = if (org.photoall.film.ui.Skin.active) 4 + org.photoall.film.ui.Skin.kind else Style.themeIndex.coerceIn(0, 4)
+
+        init {
+            isClickable = true
+            contentDescription = "观片台"
+            Style.pressable(this)
+        }
+
+        private fun gradient(top: Int, mid: Int, bottom: Int) = android.graphics.LinearGradient(0f, r.top, 0f, r.bottom,
+            intArrayOf(top, mid, bottom), null, android.graphics.Shader.TileMode.CLAMP)
+
+        private fun text(c: android.graphics.Canvas, color: Int, face: Typeface, shift: Float = 0f, size: Float = 1f): Float {
+            label.typeface = face; label.color = color
+            label.textSize = 14f * resources.displayMetrics.scaledDensity * size
+            val fm = label.fontMetrics
+            val y = r.centerY() - (fm.ascent + fm.descent) / 2
+            c.drawText("观片台", r.centerX() + shift, y, label)
+            return y
+        }
+
+        override fun onDraw(c: android.graphics.Canvas) {
+            val w = width.toFloat(); val h = height.toFloat()
+            r.set(0f, 0f, w, h)
+            val rad = 9 * d
+            p.shader = null; line.shader = null
+            val bold = Typeface.create("sans-serif", Typeface.BOLD)
+            when (face) {
+                0 -> { // 暗盒: the cartridge's yellow, its black band at one end
+                    p.shader = gradient(0xfff0c45a.toInt(), 0xffe3b341.toInt(), 0xffc99a2e.toInt()); c.drawRoundRect(r, rad, rad, p); p.shader = null
+                    c.save(); c.clipPath(android.graphics.Path().apply { addRoundRect(r, rad, rad, android.graphics.Path.Direction.CW) })
+                    p.color = 0xff15120e.toInt(); c.drawRect(0f, 0f, 7 * d, h, p)
+                    p.color = 0xffc8321f.toInt(); c.drawRect(7 * d, 0f, 8.6f * d, h, p)
+                    c.restore()
+                    text(c, 0xff15120e.toInt(), bold, shift = 4 * d)
+                }
+                1 -> { // 暗房红灯: near black, a red rim, a red word, a lamp lit at the left
+                    p.color = 0xff1a0605.toInt(); c.drawRoundRect(r, rad, rad, p)
+                    line.color = 0xff8a1a12.toInt(); line.strokeWidth = 1 * d
+                    c.drawRoundRect(r.left + 0.5f * d, r.top + 0.5f * d, r.right - 0.5f * d, r.bottom - 0.5f * d, rad, rad, line)
+                    val lx = 10 * d
+                    p.shader = android.graphics.RadialGradient(lx, h / 2, 8 * d, intArrayOf(0x88ff3a22.toInt(), 0x00ff3a22), null, android.graphics.Shader.TileMode.CLAMP)
+                    c.drawCircle(lx, h / 2, 8 * d, p); p.shader = null
+                    p.color = 0xffff5a3c.toInt(); c.drawCircle(lx, h / 2, 2.6f * d, p)
+                    text(c, 0xffff6a4d.toInt(), bold, shift = 5 * d)
+                }
+                2 -> { // 相纸: a print's white, a fine ink edge, crop marks at the corners
+                    p.color = 0xfffbf8f1.toInt(); c.drawRoundRect(r, rad * 0.5f, rad * 0.5f, p)
+                    line.color = 0xff2a2724.toInt(); line.strokeWidth = 1 * d
+                    c.drawRoundRect(r.left + 0.5f * d, r.top + 0.5f * d, r.right - 0.5f * d, r.bottom - 0.5f * d, rad * 0.5f, rad * 0.5f, line)
+                    line.color = 0xff8a8170.toInt(); line.strokeWidth = 0.7f * d
+                    val m = 4 * d; val l = 4 * d
+                    for ((x, y, sx, sy) in listOf(floatArrayOf(m, m, 1f, 1f), floatArrayOf(w - m, m, -1f, 1f), floatArrayOf(m, h - m, 1f, -1f), floatArrayOf(w - m, h - m, -1f, -1f)).map { it.toList() }) {
+                        c.drawLine(x, y, x + sx * l, y, line); c.drawLine(x, y, x, y + sy * l, line)
+                    }
+                    text(c, 0xff2a2724.toInt(), Typeface.create(Typeface.SERIF, Typeface.BOLD))
+                }
+                3 -> { // 黄铜: brass, the word engraved (a light edge under its strokes)
+                    p.shader = gradient(0xffe2c27a.toInt(), 0xffb08a42.toInt(), 0xff7c5f28.toInt()); c.drawRoundRect(r, rad, rad, p); p.shader = null
+                    line.color = 0xff4a3818.toInt(); line.strokeWidth = 1 * d
+                    c.drawRoundRect(r.left + 0.5f * d, r.top + 0.5f * d, r.right - 0.5f * d, r.bottom - 0.5f * d, rad, rad, line)
+                    label.typeface = bold
+                    c.save(); c.translate(0f, 0.8f * d); text(c, 0x66fff2cc, bold); c.restore()
+                    text(c, 0xff2a1e0a.toInt(), bold)
+                }
+                4 -> { // 冷银: brushed silver, cold blue words
+                    p.shader = gradient(0xffeef2f5.toInt(), 0xffb4bbc3.toInt(), 0xff8a929b.toInt()); c.drawRoundRect(r, rad, rad, p); p.shader = null
+                    c.save(); c.clipPath(android.graphics.Path().apply { addRoundRect(r, rad, rad, android.graphics.Path.Direction.CW) })
+                    line.strokeWidth = 0.5f * d
+                    val rnd = java.util.Random(4)
+                    var y = 0f
+                    while (y < h) { line.color = if (rnd.nextBoolean()) 0x33ffffff else 0x14000000; c.drawLine(0f, y, w, y, line); y += 1.3f * d }
+                    c.restore()
+                    line.color = 0xff5b636c.toInt(); line.strokeWidth = 1 * d
+                    c.drawRoundRect(r.left + 0.5f * d, r.top + 0.5f * d, r.right - 0.5f * d, r.bottom - 0.5f * d, rad, rad, line)
+                    text(c, 0xff1d3c66.toInt(), bold)
+                }
+                5 -> { // 光: bone, a gilt double rule, a serif italic
+                    p.color = 0xffefebe1.toInt(); c.drawRoundRect(r, rad * 0.4f, rad * 0.4f, p)
+                    line.color = 0xffa88435.toInt(); line.strokeWidth = 1.2f * d
+                    c.drawRoundRect(r.left + 0.6f * d, r.top + 0.6f * d, r.right - 0.6f * d, r.bottom - 0.6f * d, rad * 0.4f, rad * 0.4f, line)
+                    line.strokeWidth = 0.6f * d
+                    c.drawRoundRect(r.left + 3 * d, r.top + 3 * d, r.right - 3 * d, r.bottom - 3 * d, rad * 0.2f, rad * 0.2f, line)
+                    text(c, 0xff161514.toInt(), Typeface.create(Typeface.SERIF, Typeface.BOLD_ITALIC))
+                }
+                6 -> { // 经典: leatherette in a satin chrome edge, the word light and narrow
+                    p.shader = gradient(0xffcfcec9.toInt(), 0xff6a6965.toInt(), 0xff3a3a38.toInt()); c.drawRoundRect(r, rad, rad, p); p.shader = null
+                    val i = 2 * d
+                    p.color = 0xff1b1b1c.toInt(); c.drawRoundRect(r.left + i, r.top + i, r.right - i, r.bottom - i, rad - i, rad - i, p)
+                    p.color = 0x22ffffff
+                    val rnd = java.util.Random(5)
+                    repeat(120) { c.drawCircle(i + rnd.nextFloat() * (w - 2 * i), i + rnd.nextFloat() * (h - 2 * i), 0.5f * d, p) }
+                    text(c, 0xffe4e1d8.toInt(), Typeface.create("sans-serif-condensed", Typeface.BOLD))
+                }
+                7 -> { // 漫: white, a heavy navy line with its shadow offset
+                    val o = 2.4f * d
+                    p.color = 0xff1b1464.toInt(); c.drawRoundRect(r.left + o, r.top + o, r.right, r.bottom, rad, rad, p)
+                    val f = android.graphics.RectF(r.left, r.top, r.right - o, r.bottom - o)
+                    p.color = 0xffffffff.toInt(); c.drawRoundRect(f, rad, rad, p)
+                    line.color = 0xff1b1464.toInt(); line.strokeWidth = 2 * d
+                    c.drawRoundRect(f.left + d, f.top + d, f.right - d, f.bottom - d, rad - d, rad - d, line)
+                    label.typeface = Typeface.create("sans-serif-black", Typeface.ITALIC); label.color = 0xff1b1464.toInt()
+                    label.textSize = 14f * resources.displayMetrics.scaledDensity
+                    val fm = label.fontMetrics
+                    c.drawText("观片台", f.centerX(), f.centerY() - (fm.ascent + fm.descent) / 2, label)
+                }
+                9 -> { // 旁轴: vulcanite in a satin chrome edge, a fine engraved word, the display's red dot
+                    p.shader = gradient(0xffe6e5e0.toInt(), 0xff8a8984.toInt(), 0xff4a4a47.toInt()); c.drawRoundRect(r, rad, rad, p); p.shader = null
+                    val i = 1.6f * d
+                    p.color = 0xff121212.toInt(); c.drawRoundRect(r.left + i, r.top + i, r.right - i, r.bottom - i, rad - i, rad - i, p)
+                    val rnd = java.util.Random(9)
+                    repeat(160) {
+                        val x = i + rnd.nextFloat() * (w - 2 * i); val y = i + rnd.nextFloat() * (h - 2 * i)
+                        p.color = 0x18ffffff; c.drawCircle(x, y, 0.6f * d, p)
+                    }
+                    text(c, 0xffeceae4.toInt(), Typeface.create("sans-serif-light", Typeface.NORMAL), shift = 3 * d)
+                    p.color = 0xffff2b1c.toInt()
+                    c.drawCircle(r.left + 10 * d, r.centerY(), 2.2f * d, p)
+                }
+                else -> { // 风: bone paper, a fine ink line, an ultramarine stroke under the word
+                    p.color = 0xffefede6.toInt(); c.drawRoundRect(r, rad, rad, p)
+                    line.color = 0xff121212.toInt(); line.strokeWidth = 1 * d
+                    c.drawRoundRect(r.left + 0.5f * d, r.top + 0.5f * d, r.right - 0.5f * d, r.bottom - 0.5f * d, rad, rad, line)
+                    val y = text(c, 0xff121212.toInt(), Typeface.create(Typeface.SERIF, Typeface.BOLD), size = 0.95f)
+                    val tw = label.measureText("观片台")
+                    p.color = 0xff1f2bd0.toInt()
+                    c.drawRoundRect(r.centerX() - tw * 0.32f, y + 4f * d, r.centerX() + tw * 0.32f, y + 5.5f * d, 0.8f * d, 0.8f * d, p)
+                }
+            }
+        }
+    }
+
     private fun textButton(text: String, onClick: () -> Unit) = Button(this).apply {
         this.text = text
         isAllCaps = false
@@ -664,6 +821,10 @@ class GalleryActivity : Activity() {
         textSize = 13f
         stateListAnimator = null
         Style.compact(this, 14f)
+        // as tall as its words need at any font size (a fixed 32 dp cut the bottom off on large type)
+        includeFontPadding = true
+        setPadding(paddingLeft, dp(5), paddingRight, dp(5))
+        minHeight = dp(32); minimumHeight = dp(32)
         Style.pressable(this)
         background = Style.surface(this@GalleryActivity, fill = if (on) Style.TEXT else Color.TRANSPARENT, radiusDp = 16f,
             stroke = if (on) 0 else Style.HAIRLINE)

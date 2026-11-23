@@ -158,12 +158,26 @@ object FrameDesigner {
 
     // ---- the picture as a whole --------------------------------------------------------------
 
-    fun render(source: Bitmap, d: FrameDesign, data: Data, maxLong: Int = 4096): Bitmap {
-        val sheet = renderSheet(source, d, data, maxLong)
+    /** [pictureOut]: where the photo's picture lies on a film border, as shares of the sheet. */
+    fun render(source: Bitmap, d: FrameDesign, data: Data, maxLong: Int = 4096, pictureOut: RectF? = null): Bitmap {
+        val sheet = renderSheet(source, d, data, maxLong, pictureOut)
         if (!d.cartridge) return sheet
         val out = if (sheet.isMutable) sheet else sheet.copy(Bitmap.Config.ARGB_8888, true).also { sheet.recycle() }
         drawCartridge(Canvas(out), out.width, out.height, d, data.filmKey)
         return out
+    }
+
+    /** The photo's own place on a theme sheet, when the user has set it. */
+    private fun place(d: FrameDesign) = if (d.placed) ThemePapers.Place(d.placeX, d.placeY, d.placeSize) else null
+
+    /**
+     * Where the photo lies on a theme sheet, as shares of the sheet (null for other borders):
+     * the preview uses it to know when a long press is on the photo.
+     */
+    fun themePhoto(pw: Int, ph: Int, d: FrameDesign): RectF? {
+        val t = d.border.theme ?: return null
+        val plan = ThemePapers.plan(t, pw, ph, 1400, place(d))
+        return RectF(plan.photo.left / plan.w, plan.photo.top / plan.h, plan.photo.right / plan.w, plan.photo.bottom / plan.h)
     }
 
     /** The cartridge on a sheet [w] x [h]: where the design puts it, as big as it says, straight on. */
@@ -175,8 +189,8 @@ object FrameDesigner {
         else org.photoall.film.ui.CartridgeSprites.drawWaiting(c, d.cartX * w, d.cartY * h, ch, name, leader = 0.35f)
     }
 
-    private fun renderSheet(source: Bitmap, d: FrameDesign, data: Data, maxLong: Int): Bitmap {
-        d.border.kind?.let { kind -> return renderFilm(source, kind, d, data, maxLong) }
+    private fun renderSheet(source: Bitmap, d: FrameDesign, data: Data, maxLong: Int, pictureOut: RectF? = null): Bitmap {
+        d.border.kind?.let { kind -> return renderFilm(source, kind, d, data, maxLong, pictureOut) }
         d.border.theme?.let { theme -> return renderTheme(source, theme, d, data, maxLong) }
         val k = min(1f, maxLong.toFloat() / max(source.width, source.height))
         val pw = source.width * k
@@ -236,12 +250,13 @@ object FrameDesigner {
      * paper's own field (clear of what the ornament keeps), and the stamp clear of both.
      */
     private fun renderTheme(source: Bitmap, t: ThemePapers.Theme, d: FrameDesign, data: Data, maxLong: Int): Bitmap {
-        val plan = ThemePapers.plan(t, source.width, source.height, maxLong)
+        val plan = ThemePapers.plan(t, source.width, source.height, maxLong, place(d))
         val out = Bitmap.createBitmap(plan.w, plan.h, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
         val photo = plan.photo
         val s = min(photo.width(), photo.height())
-        ThemePapers.drawUnder(c, t, plan, d.leakSeed)
+        val hasWords = !d.inPhoto && d.items.any { it != FrameDesign.Item.CAPTION || d.caption.isNotBlank() }
+        ThemePapers.drawUnder(c, t, plan, d.leakSeed, hasWords)
         c.drawBitmap(source, null, photo, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
         ThemePapers.drawOver(c, t, plan, d.leakSeed, data.date, data.frame, data.filmKey)
         val keep = plan.keep
@@ -272,11 +287,13 @@ object FrameDesigner {
     }
 
     /** Film edges come from [Frames]; over them only what goes on the picture. */
-    private fun renderFilm(source: Bitmap, kind: Frames.Kind, d: FrameDesign, data: Data, maxLong: Int): Bitmap {
+    private fun renderFilm(source: Bitmap, kind: Frames.Kind, d: FrameDesign, data: Data, maxLong: Int, pictureOut: RectF? = null): Bitmap {
         val picture = RectF()
         val base = Frames.render(source, kind, Frames.Options(edgeText = data.edgeName, frame = data.frame, date = null,
-            film = data.filmKey, fog = if (d.fog) 1f else 0f, leak = d.leak, seed = d.leakSeed * 101 + data.frame),
+            film = data.filmKey, fog = if (d.fog) 1f else 0f, leak = d.leak, seed = d.leakSeed * 101 + data.frame,
+            cropX = d.cropX, cropY = d.cropY),
             maxLong = maxLong, rotation = d.turn, imageOut = picture)
+        pictureOut?.set(picture.left / base.width, picture.top / base.height, picture.right / base.width, picture.bottom / base.height)
         val out = if (base.isMutable) base else base.copy(Bitmap.Config.ARGB_8888, true).also { base.recycle() }
         val c = Canvas(out)
         val all = RectF(0f, 0f, out.width.toFloat(), out.height.toFloat())

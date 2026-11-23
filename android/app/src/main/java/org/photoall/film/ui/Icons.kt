@@ -14,7 +14,8 @@ import android.graphics.drawable.Drawable
  * strokes on every phone.
  */
 class Icon(private val kind: Kind, color: Int, private val stroke: Float = 1.6f, private val filled: Boolean = false) : Drawable() {
-    enum class Kind { FLASH, FLASH_OFF, HISTOGRAM, TUNE, GRID, CHEVRON, BACK, FLIP, HEART, SHARE, INFO, TRASH, OPEN, CHECK, FRAME, ROTATE }
+    enum class Kind { FLASH, FLASH_OFF, HISTOGRAM, TUNE, GRID, CHEVRON, BACK, FLIP, HEART, SHARE, INFO, TRASH, OPEN, CHECK, FRAME, ROTATE,
+        LOUPE, CROSS, PLAY, PAUSE, LAMP, LIGHTBOX, SPREAD, GATHER, EDIT, MIRROR }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -112,12 +113,66 @@ class Icon(private val kind: Kind, color: Int, private val stroke: Float = 1.6f,
                 canvas.drawPath(path, paint)
                 canvas.drawLine(20f, 4f, 11f, 13f, paint)
             }
+            Kind.EDIT -> { // three upright sliders, their knobs at different heights
+                for ((x, k) in listOf(6f to 9f, 12f to 15.5f, 18f to 7.5f)) {
+                    canvas.drawLine(x, 3.5f, x, k - 2.4f, paint)
+                    canvas.drawCircle(x, k, 2.4f, paint)
+                    canvas.drawLine(x, k + 2.4f, x, 20.5f, paint)
+                }
+            }
+            Kind.MIRROR -> { // a dashed axis and a triangle either side of it, one of them solid
+                for (y in listOf(3f, 7f, 11f, 15f, 19f)) canvas.drawLine(12f, y, 12f, y + 2f, paint)
+                path.moveTo(9.5f, 6f); path.lineTo(9.5f, 18f); path.lineTo(3f, 18f); path.close()
+                canvas.drawPath(path, paint)
+                path.reset()
+                path.moveTo(14.5f, 6f); path.lineTo(14.5f, 18f); path.lineTo(21f, 18f); path.close()
+                paint.style = Paint.Style.FILL_AND_STROKE
+                canvas.drawPath(path, paint)
+                paint.style = Paint.Style.STROKE
+            }
             Kind.FRAME -> { // a film frame: border, picture, perforations either side
                 rect.set(3f, 3f, 21f, 21f); canvas.drawRoundRect(rect, 1.5f, 1.5f, paint)
                 rect.set(7f, 6f, 17f, 18f); canvas.drawRect(rect, paint)
                 for (y in listOf(6f, 10f, 14f, 18f)) {
                     canvas.drawLine(4.6f, y, 5.4f, y, paint)
                     canvas.drawLine(18.6f, y, 19.4f, y, paint)
+                }
+            }
+            Kind.LOUPE -> { // a hand lens: the glass, a highlight, the handle
+                canvas.drawCircle(10.5f, 10.5f, 6.5f, paint)
+                rect.set(6.6f, 6.6f, 14.4f, 14.4f); canvas.drawArc(rect, 200f, 60f, false, paint)
+                canvas.drawLine(15.3f, 15.3f, 20f, 20f, paint)
+            }
+            Kind.CROSS -> { canvas.drawLine(6f, 6f, 18f, 18f, paint); canvas.drawLine(18f, 6f, 6f, 18f, paint) }
+            Kind.PLAY -> {
+                path.moveTo(8f, 5f); path.lineTo(19f, 12f); path.lineTo(8f, 19f); path.close()
+                canvas.drawPath(path, paint)
+            }
+            Kind.PAUSE -> { canvas.drawLine(9f, 6f, 9f, 18f, paint); canvas.drawLine(15f, 6f, 15f, 18f, paint) }
+            Kind.LAMP -> { // a tube light: the tube, its glow, the switch below
+                rect.set(4f, 5f, 20f, 9f); canvas.drawRoundRect(rect, 2f, 2f, paint)
+                if (filled) for (x in listOf(7f, 12f, 17f)) canvas.drawLine(x, 12f, x, 14f, paint)
+                rect.set(9f, 16f, 15f, 20f); canvas.drawRoundRect(rect, 1.5f, 1.5f, paint)
+            }
+            Kind.LIGHTBOX -> { // a light table with two cut frames on it
+                rect.set(3f, 4f, 21f, 17f); canvas.drawRoundRect(rect, 1.5f, 1.5f, paint)
+                rect.set(6f, 7f, 11f, 13.5f); canvas.drawRect(rect, paint)
+                rect.set(13f, 7.5f, 18f, 14f); canvas.drawRect(rect, paint)
+                canvas.drawLine(8f, 20f, 16f, 20f, paint)
+            }
+            Kind.SPREAD -> for ((x, y) in listOf(4f to 5f, 10.5f to 5f, 17f to 5f, 4f to 13.5f, 10.5f to 13.5f, 17f to 13.5f)) {
+                rect.set(x, y, x + 3.5f, y + 5.5f)
+                canvas.drawRect(rect, paint)
+            }
+            Kind.GATHER -> {
+                // a little stack in the middle, four arrows coming in to it
+                rect.set(9f, 9.5f, 15f, 14.5f); canvas.drawRect(rect, paint)
+                for ((sx, sy) in listOf(-1f to -1f, 1f to -1f, -1f to 1f, 1f to 1f)) {
+                    val tx = 12f + sx * 4.6f; val ty = 12f + sy * 4.4f   // the tip, near the stack
+                    val ox = 12f + sx * 9.5f; val oy = 12f + sy * 9f     // the tail, out at the corner
+                    canvas.drawLine(ox, oy, tx, ty, paint)
+                    canvas.drawLine(tx, ty, tx + sx * 3f, ty, paint)
+                    canvas.drawLine(tx, ty, tx, ty + sy * 3f, paint)
                 }
             }
             Kind.CHECK -> {

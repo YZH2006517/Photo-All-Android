@@ -24,11 +24,16 @@ class Cartridge3DActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         Style.apply(this)
         super.onCreate(savedInstanceState)
+        val paper = intent.getStringExtra(EXTRA_PAPER)
         val name = intent.getStringExtra(EXTRA_FILM) ?: "kodak portra 400"
         val look = FilmLabel.of(name)
         fun hex(c: Int) = String.format("%06x", c and 0xffffff)
+        // the stock's own name (the detail card's key), and for a paper its box instead of a cartridge
+        val pretty = if (paper != null) paper.replace(Regex("""\s*\((positive|b/w)\)"""), "").split(' ')
+            .joinToString(" ") { w -> if (w == "ii") "II" else w.replaceFirstChar(Char::uppercase) } else FilmLabel.pretty(name)
         val url = Uri.parse("file:///android_asset/cartridge3d/index.html").buildUpon()
-            .appendQueryParameter("name", FilmLabel.pretty(name))
+            .apply { if (paper != null) appendQueryParameter("paper", paper) else appendQueryParameter("id", name) }
+            .appendQueryParameter("name", pretty)
             .appendQueryParameter("maker", look.maker)
             .appendQueryParameter("title", look.title)
             .appendQueryParameter("iso", look.iso)
@@ -56,7 +61,7 @@ class Cartridge3DActivity : Activity() {
             setBackgroundColor(Color.rgb(20, 19, 17))
             addView(view, FrameLayout.LayoutParams(-1, -1))
             val d = resources.displayMetrics.density
-            addView(close, FrameLayout.LayoutParams((48 * d).toInt(), (48 * d).toInt(), android.view.Gravity.END or android.view.Gravity.TOP))
+            addView(close, FrameLayout.LayoutParams((48 * d).toInt(), (48 * d).toInt(), android.view.Gravity.START or android.view.Gravity.TOP))
             setOnApplyWindowInsetsListener { v, insets ->
                 val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
                 (close.layoutParams as FrameLayout.LayoutParams).setMargins(0, bars.top + (8 * d).toInt(), bars.right + (8 * d).toInt(), 0)
@@ -75,5 +80,7 @@ class Cartridge3DActivity : Activity() {
 
     companion object {
         const val EXTRA_FILM = "film"
+        /** A paper's name: its box (or a print film's can) and its card instead of a cartridge. */
+        const val EXTRA_PAPER = "paper"
     }
 }

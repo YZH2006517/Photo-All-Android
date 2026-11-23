@@ -46,6 +46,9 @@ constexpr Field kFields[] = {
     FLOAT("size", grain_size),     FLOAT("uniform", grain_uniformity),
     FLOAT("scan ill", scan_ill),   FLOAT("scne ill", scene_ill),
     FLOAT("tint", scene_tint),     FLOAT("film ill", film_ill),
+    FLOAT("grain amt", grain_amount),
+    FLOAT("p gamma r", gamma_p_r), FLOAT("p gamma g", gamma_p_g), FLOAT("p gamma b", gamma_p_b),
+    FLOAT("uv cut", uv_cut),       FLOAT("ir cut", ir_cut),
 };
 #undef FLOAT
 #undef INT
@@ -54,6 +57,8 @@ constexpr Field kFields[] = {
 
 bool set_param(FilmParams &params, std::string_view name, float value)
 {
+  // the frame's long edge in millimetres (the block keeps micrometres; 0 = filmsim's own)
+  if(name == "frame mm") { params.frame_um = value > 0.0f ? std::clamp(value, 10.0f, 250.0f) * 1000.0f : 0.0f; return true; }
   constexpr std::string_view strength = "strength ";
   if(name.substr(0, strength.size()) == strength && name.size() == strength.size() + 1)
   {
@@ -82,6 +87,20 @@ bool set_stage(Stages &stages, std::string_view name, float value)
   else if(name == "stage temp") stages.temp = std::clamp(value, -1.0f, 1.0f);
   else if(name == "stage tint") stages.tint = std::clamp(value, -1.0f, 1.0f);
   else if(name == "stage match lift") stages.match_lift = value != 0.0f;
+  else if(name == "stage display") stages.display = value != 0.0f;
+  else if(name == "stage meter") stages.meter = value != 0.0f;
+  else if(name == "stage diffusion") stages.diffusion = std::clamp(static_cast<int>(value + 0.5f), 0, 4);
+  else if(name == "stage diff amt") stages.diff_amount = std::clamp(value, 0.0f, 1.0f);
+  else if(name == "stage diff size") stages.diff_size = std::clamp(value, 0.1f, 5.0f);
+  else if(name == "stage diff warm") stages.diff_warm = std::clamp(value, -1.0f, 1.0f);
+  else if(name == "stage gamut") stages.gamut = value != 0.0f;
+  else if(name == "stage negative") stages.negative = value != 0.0f;
+  else if(name == "stage grain blur") stages.grain_blur = std::clamp(value, 0.0f, 3.0f);
+  else if(name == "stage scan blur") stages.scan_blur = std::clamp(value, 0.0f, 10.0f);
+  else if(name == "stage scan sharp") stages.scan_sharp = std::clamp(value, 0.0f, 4.0f);
+  else if(name == "stage scan radius") stages.scan_radius = std::clamp(value, 0.3f, 10.0f);
+  else if(name == "stage black") stages.black = std::clamp(value, 0.0f, 0.3f);
+  else if(name == "stage white") stages.white = std::clamp(value, 0.5f, 2.0f);
   else return false;
   return true;
 }
@@ -97,8 +116,14 @@ FilmParams resolve_auto_balance(const FilmParams &params)
   // with the reference film's neutral filter pack, so each keeps its own colour.
   const int film = out.filter_c == kBalanceReference ? kReferenceFilm : out.film;
   const bool positive = out.process == kProcessScanNegative;
-  const float *v = positive ? pos_wb[film] : wb[film][out.paper];
-  (positive ? out.ev_film : out.ev_paper) += v[0];
+  if(positive)
+  { // a slide is scanned as it is, under the viewing lamp with no filter pack (as the
+    // reference spektrafilm does; filmsim's fitted pos_wb pack turned cyans blue)
+    out.filter_c = out.filter_m = out.filter_y = 0.0f;
+    return out;
+  }
+  const float *v = wb[film][out.paper];
+  out.ev_paper += v[0];
   out.filter_c = v[1];
   out.filter_m = v[2];
   out.filter_y = v[3];

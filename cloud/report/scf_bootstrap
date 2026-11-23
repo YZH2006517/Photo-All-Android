@@ -1,0 +1,6 @@
+#!/bin/bash
+for p in /var/lang/python310/bin/python3.10 /var/lang/python39/bin/python3.9 /var/lang/python311/bin/python3.11 /var/lang/python312/bin/python3.12 /var/lang/python313/bin/python3.13 python3; do
+  if command -v "$p" >/dev/null 2>&1; then exec "$p" app.py; fi
+done
+echo "no python found" >&2
+exit 1

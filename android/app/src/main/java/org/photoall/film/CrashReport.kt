@@ -296,7 +296,9 @@ object CrashReport {
     private fun exitText(context: Context, e: ApplicationExitInfo): String {
         val why = when (e.reason) {
             ApplicationExitInfo.REASON_CRASH_NATIVE -> "原生崩溃（GPU 引擎或相机驱动）"
-            ApplicationExitInfo.REASON_LOW_MEMORY -> "内存不足被系统结束"
+            // vivo's own cleaner reports its kills as low memory: often a stuck screen swiped away
+            ApplicationExitInfo.REASON_LOW_MEMORY -> if (e.description?.contains("cleaner") == true)
+                "被系统清理结束（多半是卡住后被划掉）" else "内存不足被系统结束"
             ApplicationExitInfo.REASON_ANR -> "无响应（ANR）"
             else -> "闪退"
         }
