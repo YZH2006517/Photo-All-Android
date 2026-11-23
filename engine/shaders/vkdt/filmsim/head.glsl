@@ -71,6 +71,13 @@ layout(std140, set = 0, binding = 1) uniform params_t
   float scene_tint;
   float film_ill;
   int   input_colour;
+  float frame_um;      // added: the frame's long edge (0 = FILMSIM_FRAME_WIDTH_UM)
+  float grain_amount;  // added: the grain's strength (1 = filmsim's)
+  float gamma_p_r;     // added: the print's contrast per dye layer
+  float gamma_p_g;
+  float gamma_p_b;
+  float uv_cut;        // added: the camera's UV-cut filter (0 none .. 1 full), as the reference's
+  float ir_cut;        // added: the camera's IR-cut filter (0 none .. 1 full)
 } params;
 const int s_paper_offset = 22; // first paper in data list/lut; == len(film_stocks) in mklut-profiles.py
 

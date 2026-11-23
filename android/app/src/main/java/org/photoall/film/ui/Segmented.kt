@@ -26,6 +26,11 @@ class Segmented(context: Context, private val options: List<String>) : View(cont
     var onBlocked: (Int) -> Unit = {}
     var trackColor = Style.BG
     var indicatorColor = Style.SURFACE_2
+    /** A capsule (round ends) instead of rounded corners; the thumb lifted with a soft shadow. */
+    var pill = false
+    /** The words' colours, chosen and not (null: the theme's). */
+    var onText: Int? = null
+    var offText: Int? = null
 
     private val density = resources.displayMetrics.density
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -54,8 +59,9 @@ class Segmented(context: Context, private val options: List<String>) : View(cont
             return
         }
         animator = ValueAnimator.ofFloat(position, selected.toFloat()).apply {
-            duration = 220
-            interpolator = DecelerateInterpolator(2f)
+            // a pill's thumb slides over like a drop, a touch past and back
+            duration = if (pill) 380 else 220
+            interpolator = if (pill) android.view.animation.OvershootInterpolator(1.15f) else DecelerateInterpolator(2f)
             addUpdateListener { position = it.animatedValue as Float; invalidate() }
             start()
         }
@@ -70,14 +76,26 @@ class Segmented(context: Context, private val options: List<String>) : View(cont
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
-        val r = 11 * density
+        val r = if (pill) h / 2 else 11 * density
         fill.color = trackColor
         rect.set(0f, 0f, w, h)
         canvas.drawRoundRect(rect, r, r, fill)
         val cell = (w - 2 * pad) / options.size
         fill.color = indicatorColor
         rect.set(pad + position * cell, pad, pad + (position + 1) * cell, h - pad)
+        if (pill) fill.setShadowLayer(4f * density, 0f, 1.5f * density, 0x33000000)
         canvas.drawRoundRect(rect, r - pad, r - pad, fill)
+        fill.clearShadowLayer()
+        if (pill) {
+            // glass: a bright rim along the thumb's top, fading down
+            fill.style = Paint.Style.STROKE
+            fill.strokeWidth = 1f * density
+            fill.shader = android.graphics.LinearGradient(0f, rect.top, 0f, rect.bottom,
+                intArrayOf(0x80ffffff.toInt(), 0x14ffffff, 0x33ffffff), floatArrayOf(0f, 0.6f, 1f), android.graphics.Shader.TileMode.CLAMP)
+            canvas.drawRoundRect(rect, r - pad, r - pad, fill)
+            fill.shader = null
+            fill.style = Paint.Style.FILL
+        }
         val base = 14 * resources.displayMetrics.scaledDensity
         for ((i, label) in options.withIndex()) {
             text.textSize = base
@@ -88,7 +106,7 @@ class Segmented(context: Context, private val options: List<String>) : View(cont
             val near = (1f - kotlin.math.abs(position - i)).coerceIn(0f, 1f)
             text.color = when {
                 !enabled(i) -> Style.TEXT_3
-                else -> blend(Style.TEXT_2, Style.TEXT, near)
+                else -> blend(offText ?: Style.TEXT_2, onText ?: Style.TEXT, near)
             }
             text.typeface = if (i == selected) Style.medium else Style.regular
             val fm = text.fontMetrics

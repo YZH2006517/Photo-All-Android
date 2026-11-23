@@ -10,3 +10,5 @@ add_library(filmjni SHARED film_jni.cpp digicam.cpp)
 # per-pixel work (digicam, bitmap copies): optimised in debug builds too
 target_compile_options(filmjni PRIVATE -O3)
 target_link_libraries(filmjni PRIVATE filmengine_core android jnigraphics log)
+# LibRaw's unused parts (demosaic, colour, writers) dropped at link time
+target_link_options(filmjni PRIVATE -Wl,--gc-sections)

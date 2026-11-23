@@ -79,6 +79,7 @@ import org.photoall.film.ui.Sheet
 import org.photoall.film.ui.Style
 import org.photoall.film.settings.Settings
 import org.photoall.film.settings.SettingsStore
+import org.photoall.film.settings.Presets
 import java.io.File
 import org.photoall.film.gallery.ShotInfo
 import org.photoall.film.gallery.later
@@ -146,6 +147,188 @@ class CameraActivity : ComponentActivity() {
     private val pickerBack = object : androidx.activity.OnBackPressedCallback(false) {
         override fun handleOnBackPressed() = closePicker()
     }
+    private val eyeBack = object : androidx.activity.OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() = setEyepiece(false)
+    }
+
+    // ===== 旁轴 through the eyepiece ==============================================================
+
+    /** The long press on the viewfinder: the controls gone, the screen black, the finder large, as to the eye. */
+    private var eyepiece = false
+    private val hiddenForEye = mutableListOf<Pair<View, Int>>()
+
+    private fun setEyepiece(on: Boolean) {
+        if (on == eyepiece) return
+        eyepiece = on
+        haptics.play(Haptics.Event.LOCKED)
+        if (on) {
+            showEyepiece()
+            if (getSharedPreferences("coach", MODE_PRIVATE).getBoolean("eyepiece_told", false).not()) {
+                getSharedPreferences("coach", MODE_PRIVATE).edit().putBoolean("eyepiece_told", true).apply()
+                android.widget.Toast.makeText(this, "目镜：轻点拍摄，双击对焦，双指变焦；长按或返回键退出", android.widget.Toast.LENGTH_LONG).show()
+            }
+        } else {
+            stopEyeMotion()
+            android.view.Choreographer.getInstance().removeFrameCallback(eyeFrame)
+            Rangefinder.releaseEye()
+            restoreEyeHidden()
+            overlay.eyepiece = false
+            viewfinder.imageShift = floatArrayOf(0f, 0f)
+            viewfinder.imageScale = 1f
+            eyeBack.isEnabled = false
+            window.insetsController?.show(android.view.WindowInsets.Type.systemBars())
+            attachLayout()
+        }
+    }
+
+    private fun restoreEyeHidden() {
+        for ((v, vis) in hiddenForEye) v.visibility = vis
+        hiddenForEye.clear()
+    }
+
+    /** The eyepiece layout: black, the finder as large as the screen lets it be. */
+    private fun showEyepiece() {
+        restoreEyeHidden()
+        val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        val slot = ViewfinderFrame(this).also { it.landscape = landscape }
+        stage.show(slot, FrameLayout(this).apply {
+            // the camera's back all round, veiled as the overlay veils it (near the eye, not in focus)
+            background = android.graphics.drawable.LayerDrawable(arrayOf(
+                org.photoall.film.ui.Skin.Backdrop(resources.displayMetrics.density, landscape),
+                android.graphics.drawable.ColorDrawable(0x8a000000.toInt())))
+            addView(slot, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+        })
+        startEyeMotion()
+        android.view.Choreographer.getInstance().removeFrameCallback(eyeFrame)
+        android.view.Choreographer.getInstance().postFrameCallback(eyeFrame)
+        for (i in 0 until viewfinderFrame.childCount) {
+            val v = viewfinderFrame.getChildAt(i)
+            if (v === viewfinder || v === overlay || v === curtain || v === shotFx) continue
+            if (v.visibility == View.VISIBLE) { hiddenForEye += v to v.visibility; v.visibility = View.INVISIBLE }
+        }
+        overlay.eyepiece = true
+        eyeBack.isEnabled = true
+        window.insetsController?.let {
+            it.hide(android.view.WindowInsets.Type.systemBars())
+            it.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    // ----- the eye behind the eyepiece: the phone's turning, as the eye's offset, springing back
+
+    private val eyeSensors by lazy { getSystemService(android.hardware.SensorManager::class.java) }
+    private var eyeAngleX = 0f // radians the camera has turned about the screen's vertical, decaying
+    private var eyeAngleY = 0f // and about its horizontal
+    private var eyeLastNs = 0L
+    private var eyeX = 0f
+    private var eyeY = 0f
+    private val eyeMotion = object : android.hardware.SensorEventListener {
+        override fun onSensorChanged(e: android.hardware.SensorEvent) {
+            val ns = e.timestamp
+            val dt = if (eyeLastNs == 0L) 0f else ((ns - eyeLastNs) / 1e9f).coerceIn(0f, 0.1f)
+            eyeLastNs = ns
+            // the device's rates into the screen's axes (the display may be turned)
+            val rx = e.values[0]; val ry = e.values[1]
+            val (up, right) = when (display?.rotation ?: android.view.Surface.ROTATION_0) {
+                android.view.Surface.ROTATION_90 -> -rx to ry
+                android.view.Surface.ROTATION_270 -> rx to -ry
+                android.view.Surface.ROTATION_180 -> -ry to -rx
+                else -> ry to rx
+            }
+            // turned right (about the vertical, clockwise from above), the eyepiece moves left of
+            // the eye; tipped up, it moves down. The eye follows back to the axis within a second.
+            // a gyroscope's resting bias (a few hundredths of a radian a second) is no turn
+            fun still(v: Float) = if (abs(v) < 0.03f) 0f else v - 0.03f * kotlin.math.sign(v)
+            val leak = kotlin.math.exp(-dt / 0.45f)
+            eyeAngleX = (eyeAngleX + still(up) * dt) * leak
+            eyeAngleY = (eyeAngleY + still(right) * dt) * leak
+        }
+        override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+    }
+
+    private fun startEyeMotion() {
+        eyeLastNs = 0L; eyeAngleX = 0f; eyeAngleY = 0f
+        if (org.photoall.film.ui.Skin.calm) return
+        eyeSensors.getDefaultSensor(android.hardware.Sensor.TYPE_GYROSCOPE)?.let {
+            eyeSensors.registerListener(eyeMotion, it, android.hardware.SensorManager.SENSOR_DELAY_GAME)
+        }
+    }
+
+    private fun stopEyeMotion() {
+        eyeSensors.unregisterListener(eyeMotion)
+        eyeAngleX = 0f; eyeAngleY = 0f; eyeX = 0f; eyeY = 0f
+        Rangefinder.eyeX = 0f; Rangefinder.eyeY = 0f
+    }
+
+    /** Through the eyepiece the eye follows the phone at the screen's own rate (not the skin's 25 a second). */
+    private val eyeFrame = object : android.view.Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!eyepiece) return
+            updateEye()
+            android.view.Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    /** Each frame through the eyepiece: the eye's offset, the far image moved with it. */
+    private fun updateEye() {
+        if (!eyepiece) return
+        // about 6° of turn takes the eye to the edge of its play; the gravity's tilt adds a little
+        // and an eye is never quite still: a slow small drift
+        val t = org.photoall.film.ui.Skin.time
+        val drift = if (org.photoall.film.ui.Skin.calm) 0f else 1f
+        val tx = (eyeAngleX * 9f + drift * 0.04f * kotlin.math.sin(t * 0.7f)).coerceIn(-1f, 1f)
+        val ty = (eyeAngleY * 9f + drift * 0.03f * kotlin.math.sin(t * 0.53f + 1f)).coerceIn(-1f, 1f)
+        eyeX += (tx - eyeX) * 0.5f
+        eyeY += (ty - eyeY) * 0.5f
+        Rangefinder.eyeX = eyeX; Rangefinder.eyeY = eyeY
+        val w = viewfinder.width.toFloat(); val h = viewfinder.height.toFloat()
+        val short = minOf(w, h)
+        // the image as the overlay draws it (Rangefinder.drawLevel), turned with the finder when upright
+        val ix = eyeX * Rangefinder.IMAGE_SHIFT * short
+        val iy = eyeY * Rangefinder.IMAGE_SHIFT * short
+        viewfinder.imageShift = if (h > w) floatArrayOf(-iy, ix) else floatArrayOf(ix, iy)
+        viewfinder.imageScale = Rangefinder.IMAGE_SCALE
+        overlay.invalidate()
+    }
+
+    /** The lens's focus where the patch looks: the subject as the last focus found it (diopters). */
+    private var rfSubject: Float? = null
+    private var rfGhost = 0f
+
+    /**
+     * 旁轴: the patch's second image. A rangefinder's two images stand apart by how far the lens
+     * is focused from the subject: here, the lens's focus now against where the autofocus last
+     * found the subject. While it hunts they swing apart and come together as it settles; with
+     * manual focus they part as the ring turns away and meet where it was sharp.
+     */
+    private fun updatePatch() {
+        val w = viewfinder.width.toFloat(); val h = viewfinder.height.toFloat()
+        if (!org.photoall.film.ui.Skin.rangefinder || w <= 0f || h <= 0f) {
+            viewfinder.patch = floatArrayOf(0f, 0f, 0f, 0f)
+            return
+        }
+        val short = minOf(w, h)
+        val upright = h > w // the finder turned with the camera (see Rangefinder.draw)
+        val pw = short * (if (upright) Rangefinder.PATCH_SHORT else Rangefinder.PATCH_LONG)
+        val ph = short * (if (upright) Rangefinder.PATCH_LONG else Rangefinder.PATCH_SHORT)
+        val inset = short * 0.008f // inside the patch's soft edge
+        val k = if (eyepiece) Rangefinder.IMAGE_SCALE else 1f
+        val sh = if (eyepiece) viewfinder.imageShift else floatArrayOf(0f, 0f)
+        val cxp = w / 2 + sh[0]; val cyp = h / 2 + sh[1]
+        viewfinder.patch = floatArrayOf(cxp - (pw / 2 - inset) * k, cyp - (ph / 2 - inset) * k, cxp + (pw / 2 - inset) * k, cyp + (ph / 2 - inset) * k)
+        val c = exposure
+        val f = c?.lensFocus
+        val state = c?.afState ?: -1
+        val found = state == android.hardware.camera2.CameraMetadata.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+            state == android.hardware.camera2.CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED
+        if (f != null && found) rfSubject = f
+        val subject = rfSubject
+        val target = if (f == null || subject == null) 0f else ((f - subject) * 0.5f).coerceIn(-0.7f, 0.7f)
+        rfGhost += (target - rfGhost) * (if (found) 0.18f else 0.35f)
+        if (abs(rfGhost) < 0.002f) rfGhost = 0f
+        val along = rfGhost * short * Rangefinder.PATCH_LONG * (if (eyepiece) Rangefinder.IMAGE_SCALE else 1f)
+        viewfinder.patchGhost = if (upright) floatArrayOf(0f, along) else floatArrayOf(along, 0f)
+    }
     private lateinit var controls: LinearLayout
     private lateinit var viewfinderFrame: ViewfinderFrame
     // Top bar: flash, HDR, the frame counter, histogram, settings.
@@ -184,6 +367,7 @@ class CameraActivity : ComponentActivity() {
     private lateinit var evLabel: TextView
     private lateinit var zoomLabel: TextView
     private lateinit var lensRow: LinearLayout
+    private lateinit var zoomBar: ZoomBar
     private lateinit var facingButton: ImageView
     private lateinit var peakButton: Button
     private lateinit var distanceLabel: TextView
@@ -230,7 +414,10 @@ class CameraActivity : ComponentActivity() {
     private var lensExpected: String? = null
     private val toldLens = mutableSetOf<String>()
 
-    private fun rawWanted() = store.flag(Settings.RAW) && !lensJpeg
+    // 直出 or a LUT alone: the phone's own JPEG (its rendering, what its camera app gives),
+    // not a RAW developed without film; a RAW to keep still asks for the RAW
+    private fun rawWanted() = store.flag(Settings.RAW) && !lensJpeg &&
+        (store.flag(Settings.FILM_ON) || store.flag(Settings.KEEP_RAW))
     private var pendingZoom: Float? = null // applied once a lens switch has bound
     private val analysisThread = Executors.newSingleThreadExecutor()
     private var exposure: FilmExposure? = null
@@ -292,6 +479,8 @@ class CameraActivity : ComponentActivity() {
                 if (!org.photoall.film.ui.Skin.calm) org.photoall.film.ui.Skin.time = (android.os.SystemClock.uptimeMillis() - start) / 1000f
                 if (::stage.isInitialized) stage.body?.background?.invalidateSelf()
                 shutter.background?.invalidateSelf()
+                if (!filmBodyActive() && org.photoall.film.ui.Skin.rangefinder) updateLightMeter() // the finder's display, upright too
+                if (org.photoall.film.ui.Skin.rangefinder) { if (!eyepiece) updateEye(); updatePatch() }
                 if (filmBodyActive()) {
                     updateLightMeter()
                     for (v in listOf(lensBarrel, rewindCrank, cartridge, speedDial, frameCounter, windLever)) v.invalidate()
@@ -333,6 +522,9 @@ class CameraActivity : ComponentActivity() {
         intent.removeExtra("skin")
         org.photoall.film.ui.Style.apply(this)
         super.onCreate(savedInstanceState)
+        // the first open after an install or an update: what this version brought, once
+        if (savedInstanceState == null && !org.photoall.film.settings.WhatsNewActivity.seen(this))
+            window.decorView.post { org.photoall.film.settings.WhatsNewActivity.open(this) }
         // 60 Hz is plenty for a viewfinder that runs at the camera's 30: a 120 Hz panel kept
         // at full rate the whole time the camera is open costs heat (Xiaomi 18 Pro)
         window.attributes = window.attributes.also { it.preferredRefreshRate = 60f }
@@ -356,8 +548,11 @@ class CameraActivity : ComponentActivity() {
         haptics = Haptics(window.decorView) { store[Settings.HAPTICS].toInt() }
         viewfinder = FilmViewfinder(this).apply {
             onPinch = { factor -> zoomBy(factor) }
-            onTap = { x, y -> if (flashDock != null) closeFlashModes() else if (pickerOpen) closePicker() else focusAt(x, y) }
+            onPinchEnd = { settleZoomLens() }
+            // through the eyepiece a tap is the release (the controls are gone); focus by a double tap
+            onTap = { x, y -> if (eyepiece) shutter.performClick() else if (flashDock != null) closeFlashModes() else if (pickerOpen) closePicker() else focusAt(x, y) }
             onDoubleTap = { x, y -> focusAt(x, y, lock = true) }
+            onLongPress = { if (org.photoall.film.ui.Skin.rangefinder) setEyepiece(!eyepiece) }
         }
         overlay = ViewfinderOverlay(this)
 
@@ -375,7 +570,39 @@ class CameraActivity : ComponentActivity() {
         zoomLabel = label(14f).apply { gravity = Gravity.CENTER; minWidth = dp(48) }
         distanceLabel = label(13f).apply { gravity = Gravity.CENTER; minWidth = dp(64) }
         // The lenses sit on the viewfinder's lower edge, as round focal-length buttons.
-        lensRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        // a slide along them (rather than a tap) turns them into the zoom ruler
+        lensRow = object : LinearLayout(this) {
+            private var downX = 0f
+            private var downY = 0f
+            private var sliding = false
+            private val slop = android.view.ViewConfiguration.get(this@CameraActivity).scaledTouchSlop
+            override fun onInterceptTouchEvent(e: android.view.MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> { downX = e.rawX; downY = e.rawY; sliding = false }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        val dx = e.rawX - downX
+                        if (abs(dx) > slop && abs(dx) > abs(e.rawY - downY) && beginZoomBar()) {
+                            sliding = true
+                            parent?.requestDisallowInterceptTouchEvent(true)
+                            downX = e.rawX // the ruler starts where the slide is recognised: no jump
+                            return true
+                        }
+                    }
+                }
+                return false
+            }
+            @android.annotation.SuppressLint("ClickableViewAccessibility")
+            override fun onTouchEvent(e: android.view.MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    // a touch in the gaps between the buttons stays the viewfinder's (focus), as before
+                    android.view.MotionEvent.ACTION_DOWN -> return false
+                    android.view.MotionEvent.ACTION_MOVE -> if (sliding) slideZoomBar(e.rawX - downX)
+                    android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> { if (sliding) endZoomBar(); sliding = false }
+                }
+                return true
+            }
+        }.apply { gravity = Gravity.CENTER_VERTICAL }
+        zoomBar = ZoomBar(this).apply { visibility = View.GONE; alpha = 0f }
         facingButton = ImageView(this).apply {
             contentDescription = "切换前后镜头"
             setImageDrawable(Icon(Icon.Kind.FLIP, 0xfff2f0ea.toInt(), 1.8f))
@@ -385,6 +612,10 @@ class CameraActivity : ComponentActivity() {
             setOnClickListener { flipFacing() }
         }
         flashIcon = iconButton("闪光") { showFlashModes(flashIcon) }
+        studioEntry = org.photoall.film.ui.StudioEntry(this).apply {
+            setOnClickListener { haptics.play(Haptics.Event.SEGMENT); showStudio() }
+            setOnTouchListener(presetPeekTouch)
+        }
         histogramIcon = iconButton("直方图") {
             store[Settings.HISTOGRAM] = if (store.flag(Settings.HISTOGRAM)) 0f else 1f
             haptics.play(Haptics.Event.SEGMENT)
@@ -548,6 +779,7 @@ class CameraActivity : ComponentActivity() {
         }
         onBackPressedDispatcher.addCallback(this, pickerBack)
         onBackPressedDispatcher.addCallback(this, flashBack)
+        onBackPressedDispatcher.addCallback(this, eyeBack)
         // Landscape body: violet roller = exposure, amber roller = the look, a lens well, an HDR switch.
         val (eLight, eMid, eDark) = Toy.exposureRoller()
         val (lLight, lMid, lDark) = Toy.lookRoller()
@@ -640,6 +872,7 @@ class CameraActivity : ComponentActivity() {
             }
         }
         evDial = RulerDial(this).apply {
+            onHold = { toggleShutterHigh() }
             onStep = { changeEv(it) }
             onReset = { changeEv(-(evStops * 3).roundToInt()) }
         }
@@ -652,6 +885,7 @@ class CameraActivity : ComponentActivity() {
             visibility = View.GONE
         }
         manualDial = RulerDial(this).apply {
+            onHold = { toggleShutterHigh() }
             onStep = { stepManual(it) }
             onReset = {
                 // double tap: back to the settings' defaults (ISO 200, 1/125)
@@ -695,6 +929,7 @@ class CameraActivity : ComponentActivity() {
             addView(shotFx, FrameLayout.LayoutParams(-1, -1)) // the style's flash of a shot, over the curtain
             addView(this@CameraActivity.overlay, FrameLayout.LayoutParams(-1, -1)) // not View.overlay
             addView(lensRow, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(10) })
+            addView(zoomBar, FrameLayout.LayoutParams(-1, dp(56 + ZoomBar.READOUT.toInt()), Gravity.BOTTOM).apply { bottomMargin = dp(6); marginStart = dp(14); marginEnd = dp(14) })
             addView(facingButton, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.BOTTOM or Gravity.END).apply {
                 bottomMargin = dp(12); marginEnd = dp(12)
             })
@@ -733,6 +968,15 @@ class CameraActivity : ComponentActivity() {
         if (heavyStarted || isFinishing || isDestroyed) return
         heavyStarted = true
         status.text = "正在启动胶片引擎…"
+        // HDR+ was on when it was retired: said once
+        getSharedPreferences("film-settings", MODE_PRIVATE).let { f ->
+            if (f.getBoolean(SettingsStore.HDR_RETIRED_NOTICE, false)) {
+                f.edit().remove(SettingsStore.HDR_RETIRED_NOTICE).apply()
+                val text = "HDR+ 多帧合成已停用，现在每次拍单张；RAW 与其他功能不受影响"
+                android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_LONG).show()
+                org.photoall.film.CrashReport.event(text)
+            }
+        }
         // the system was updated: what was learnt about this phone was cleared (PhotoAllApp)
         getSharedPreferences("camera_quirks", MODE_PRIVATE).let { q ->
             if (q.getBoolean("quirks_reset_notice", false)) {
@@ -772,6 +1016,7 @@ class CameraActivity : ComponentActivity() {
         fillTopBar(landscape)
         fillControls(landscape)
         if (provider != null) buildZoomButtons() // lens button widths follow the orientation
+        if (eyepiece) restoreEyeHidden()
         (controls.parent as? android.view.ViewGroup)?.removeView(controls)
         (topBar.parent as? android.view.ViewGroup)?.removeView(topBar)
         viewfinderFrame.landscape = landscape
@@ -827,15 +1072,41 @@ class CameraActivity : ComponentActivity() {
                 // viewfinder and controls together under the top bar; spare height goes
                 // below them, toward the shutter
                 finderHost.removeView(slot)
-                addView(FinderColumn(this@CameraActivity, slot, controls).apply {
-                    onSpare = { spare, finder -> pinDial(spare, finder) }
-                }, LinearLayout.LayoutParams(-1, 0, 1f))
-                addView(gridRow(
+                val shutterRow = gridRow(
                     cell(thumbnail, 1f, dp(52)),
                     cell(shutter, 1f, dp(80)),
                     cell(quickButton, 1f, dp(52)),
                     height = dp(96),
-                ).apply { setPadding(dp(20), 0, dp(20), dp(4)) })
+                ).apply { setPadding(dp(20), 0, dp(20), dp(4)) }
+                // the shutter's ring is never cut by a narrow cell (a large display size leaves a
+                // third of the width under its 80 dp)
+                shutterRow.clipChildren = false
+                for (i in 0 until shutterRow.childCount) (shutterRow.getChildAt(i) as? android.view.ViewGroup)?.apply { clipChildren = false; clipToPadding = false }
+                val high = shutterHigh()
+                if (high) {
+                    // inside the controls, which keep their own margins: no second pair
+                    shutterRow.setPadding(0, 0, 0, dp(4))
+                    controls.clipChildren = false
+                    // the shutter, the album and the settings where the exposure bar was (in
+                    // reach of a thumb); the exposure bar at the foot of the screen
+                    // no animation: a row removed with one keeps its parent until it ends
+                    val transition = controls.layoutTransition
+                    controls.layoutTransition = null
+                    val at = controls.indexOfChild(dialRow).takeIf { it >= 0 } ?: controls.childCount
+                    for (v in listOf(dialRow, manualRow)) controls.removeView(v)
+                    controls.addView(shutterRow, at.coerceAtMost(controls.childCount), LinearLayout.LayoutParams(-1, dp(96)).apply { topMargin = dp(4) })
+                    controls.layoutTransition = transition
+                }
+                addView(FinderColumn(this@CameraActivity, slot, controls).apply {
+                    onSpare = { spare, finder -> pinDial(spare, finder) }
+                }, LinearLayout.LayoutParams(-1, 0, 1f))
+                if (high) addView(LinearLayout(this@CameraActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(16), 0, dp(16), dp(10))
+                    addView(dialRow, LinearLayout.LayoutParams(-1, -2))
+                    addView(manualRow, LinearLayout.LayoutParams(-1, -2))
+                })
+                else addView(shutterRow)
             }
             setOnApplyWindowInsetsListener { view, insets ->
                 // Keep clear of the navigation bar and the camera cutout; the status bar is hidden.
@@ -913,6 +1184,8 @@ class CameraActivity : ComponentActivity() {
             val album = socket(thumbnail, keySize, 16f).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
             val sheet = socket(quickButton, keySize).apply { layoutParams = LinearLayout.LayoutParams(sock, sock) }
             col.addView(row(settings, flash))
+            (studioEntry.parent as? android.view.ViewGroup)?.removeView(studioEntry)
+            col.addView(studioEntry, LinearLayout.LayoutParams(dp(126), keySize).apply { topMargin = dp(8); gravity = Gravity.START })
             (recButton.parent as? android.view.ViewGroup)?.removeView(recButton)
             col.addView(recButton, LinearLayout.LayoutParams(-1, dp(30)).apply { topMargin = dp(8) })
             col.addView(row(am), LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) })
@@ -1604,6 +1877,8 @@ class CameraActivity : ComponentActivity() {
         topBar.removeAllViews()
         val icon = dp(if (landscape) 40 else 48)
         topBar.addView(flashIcon, LinearLayout.LayoutParams(icon, icon))
+        (studioEntry.parent as? android.view.ViewGroup)?.removeView(studioEntry)
+        topBar.addView(studioEntry, LinearLayout.LayoutParams(dp(if (landscape) 84 else 96), icon).apply { marginStart = dp(4) })
         (recButton.parent as? android.view.ViewGroup)?.removeView(recButton)
         if (!landscape) topBar.addView(recButton, LinearLayout.LayoutParams(-2, dp(28)).apply { marginStart = dp(6) })
         topBar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
@@ -1678,6 +1953,9 @@ class CameraActivity : ComponentActivity() {
     }
 
     /** An icon in a 48dp touch target, with a ripple. */
+    /** The way into the studio, beside the flash key (StudioEntry). */
+    private lateinit var studioEntry: org.photoall.film.ui.StudioEntry
+
     private fun iconButton(description: String, onClick: () -> Unit) = ImageView(this).apply {
         contentDescription = description
         setPadding(dp(13), dp(13), dp(13), dp(13))
@@ -2005,6 +2283,7 @@ class CameraActivity : ComponentActivity() {
         if (lookPage != 1) { lookPage = 1; updateLabels() }
         val c = org.photoall.film.ui.Coach(this, coachSteps(), onAdvance = { haptics.play(Haptics.Event.SEGMENT) }) { _ ->
             coach = null
+            coachFlashDemo = false
             getSharedPreferences("coach", MODE_PRIVATE).edit().putBoolean("camera", true).apply()
         }
         coach = c
@@ -2017,6 +2296,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     private var coachPage = -1
+    /** The tour's flash step is showing: the modes may be picked, the light never comes on. */
+    private var coachFlashDemo = false
     private var coachLutWas: Pair<Float, Float>? = null
 
     /** The tour's LUT step: the strip turns to the LUT page with a look on, so the ring is out. */
@@ -2073,6 +2354,10 @@ class CameraActivity : ComponentActivity() {
                 "此刻快门化作旋钮。\n顺时针渐浓，逆时针渐淡，画面边转边变。",
                 target = { shutter }, waitFor = "lut_strength", gesture = org.photoall.film.ui.Coach.Gesture.CIRCLE, pad = 10f,
                 dwell = 900, onEnter = { coachShowLut() }, onLeave = { coachRestoreLut(); closePicker() }),
+            step("滑动焦距，拉出变焦尺",
+                "下沿的圆钮是各颗镜头的焦距，点一下切换。\n按住它们左右滑动，便拉出一条变焦尺：往左更长，往右更广，经过镜头时轻轻一震。",
+                target = { lensRow.takeIf { it.isShown } ?: zoomBar.takeIf { it.isShown } }, waitFor = "zoom_bar",
+                gesture = org.photoall.film.ui.Coach.Gesture.SWIPE, pad = 8f, dwell = 1600),
             step("拨动刻度",
                 "零点居中，一格三分之一档；\n正数更亮，负数更暗，双击归零。",
                 target = { dialRow.takeIf { it.isShown } ?: evButton }, waitFor = "ev", gesture = org.photoall.film.ui.Coach.Gesture.DRAG,
@@ -2080,8 +2365,14 @@ class CameraActivity : ComponentActivity() {
             step("择一种光",
                 "轻点闪电，四种光贴边浮现，光只在快门落下的一瞬亮起。\n此处只作演示，选哪一种都不会真的闪。",
                 target = { flashDock ?: flashIcon }, waitFor = "flash_close", gesture = org.photoall.film.ui.Coach.Gesture.TAP, pad = 2f,
-                // a tour in a quiet room must not end in a flash: whatever was tried, it goes back off
-                onLeave = { closeFlashModes(); if (store[Settings.FLASH] != 0f) store[Settings.FLASH] = 0f }),
+                // a tour in a quiet room must not end in a flash: nothing lights while it is shown,
+                // and whatever was tried goes back off
+                onEnter = { coachFlashDemo = true },
+                onLeave = { closeFlashModes(); coachFlashDemo = false; if (store[Settings.FLASH] != 0f) store[Settings.FLASH] = 0f else applyCameraOptions() }),
+            step("工具：预设与更多",
+                "闪光旁的「工具」里有预设、观片台与胶卷架。\n把喜欢的胶卷、相纸与风格存成预设；之后长按「工具」，滑到预设上松开，即刻换上。试着长按一下。",
+                target = { studioEntry.takeIf { it.isShown } }, waitFor = "tools", gesture = org.photoall.film.ui.Coach.Gesture.HOLD,
+                pad = 2f, dwell = 1200),
             step("横过来，换一台相机",
                 "把手机横过来，取景框左下角会浮起一片发光的扇形。\n轻点它，便是一台带拨轮与刻度的机身。",
                 target = { rotateButton.takeIf { it.alpha > 0.5f } }, waitFor = "turn", gesture = org.photoall.film.ui.Coach.Gesture.TAP,
@@ -2093,13 +2384,13 @@ class CameraActivity : ComponentActivity() {
                 "咔嚓一声，底片便在后台显影，\n数秒之后，左下角见分晓。",
                 target = { shutter }, waitFor = "shot", gesture = org.photoall.film.ui.Coach.Gesture.TAP),
             step("余下的，在参数里",
-                "第一栏是完整的使用指南。\n放大机滤色默认「自动中性」；想留住胶卷本来的底色，改为「保留胶片本色」。",
+                "第一栏是使用指南，按板块分好，第二个板块就是常见问题。\n放大机滤色默认「自动中性」；想留住胶卷本来的底色，改为「保留胶片本色」。",
                 target = { settingsIcon }, waitFor = "settings", gesture = org.photoall.film.ui.Coach.Gesture.TAP, button = "下一步", pad = 2f),
             step("写在最后",
                 "数码仿胶，终究只是模仿。它学得来颗粒与色彩，却给不了三十六张的克制、等待冲洗的那几天，和取回底片时对着灯光辨认往事的惊喜。\n\n若有机会，去买一台真正的胶片相机吧。你对胶片懂得越多，在这里便越能尝出趣味。",
                 button = "下一张"),
             step("点一颗星",
-                "Photo All 开源免费，每一行代码都在 GitHub。若它曾让你会心一笑，点一颗 Star，便是最温柔的支持。\n\n新版本与新玩法，会发在小红书与抖音的作品和群聊里，欢迎关注。\n\ngithub.com/YZH2006517/Photo-All-Android",
+                "Photo All 免费使用，源码公开在 GitHub。若它曾让你会心一笑，点一颗 Star，便是最温柔的支持。\n\n新版本与新玩法，会发在小红书与抖音的作品和群聊里，欢迎关注。\n\ngithub.com/YZH2006517/Photo-All-Android",
                 button = "前往点 Star", action = { openGithub() }),
         )
     }
@@ -2367,6 +2658,110 @@ class CameraActivity : ComponentActivity() {
     private var lutSheet: Sheet? = null
 
     /** A .cube file picked: read and resampled off the main thread, then put in use. */
+    /** A sound of one's own for the shutter, picked from the phone. */
+    private val pickShutterSound = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val why = ShutterSound.importCustom(this, uri)
+        if (why != null) { android.widget.Toast.makeText(this, why, android.widget.Toast.LENGTH_LONG).show(); return@registerForActivityResult }
+        ShutterSound.play(this, ShutterSound.Kind.CUSTOM)
+        status.text = "快门声：${ShutterSound.customName(this) ?: "自定义"}"
+        soundSheetRefresh?.invoke()
+    }
+    private var soundSheetRefresh: (() -> Unit)? = null
+
+    /**
+     * The shutter's sound: each choice a row (tap to choose it and hear it), the user's own sound
+     * last, and the volume. Silence is not offered where the law wants every shot heard.
+     */
+    private fun showShutterSounds() {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, 0, dp(8)) }
+        fun render() {
+            root.removeAllViews()
+            val chosen = ShutterSound.kind(this)
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 16f, stroke = Style.HAIRLINE)
+            }
+            for ((i, k) in ShutterSound.Kind.values().withIndex()) {
+                val custom = k == ShutterSound.Kind.CUSTOM
+                val name = if (custom) ShutterSound.customName(this) else null
+                if (box.childCount > 0) box.addView(Style.hairline(this), LinearLayout.LayoutParams(-1, 1).apply { marginStart = dp(16) })
+                box.addView(LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    minimumHeight = dp(56)
+                    setPadding(dp(16), dp(8), dp(12), dp(8))
+                    Style.pressable(this)
+                    // the mark of the one in use
+                    addView(View(this@CameraActivity).apply {
+                        background = android.graphics.drawable.GradientDrawable().apply {
+                            shape = android.graphics.drawable.GradientDrawable.OVAL
+                            if (k == chosen) { setColor(Style.ACCENT) } else setStroke((1.5f * resources.displayMetrics.density).toInt(), Style.TEXT_3)
+                        }
+                    }, LinearLayout.LayoutParams(dp(14), dp(14)).apply { marginEnd = dp(14) })
+                    addView(LinearLayout(this@CameraActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(TextView(this@CameraActivity).apply {
+                            text = k.label; textSize = 15f; setTextColor(if (k == chosen) Style.ACCENT else Style.TEXT); typeface = Style.medium
+                        })
+                        addView(TextView(this@CameraActivity).apply {
+                            text = if (custom) (name ?: "选择手机里的一段音频（5 秒以内）") else k.about
+                            textSize = 12f; setTextColor(Style.TEXT_2); maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+                            setPadding(0, dp(2), 0, 0)
+                        })
+                    }, LinearLayout.LayoutParams(0, -2, 1f))
+                    if (custom && name != null) addView(TextView(this@CameraActivity).apply {
+                        text = "更换"; textSize = 13f; setTextColor(Style.ACCENT); typeface = Style.medium
+                        setPadding(dp(10), dp(8), dp(4), dp(8))
+                        setOnClickListener { pickShutterSound.launch(arrayOf("audio/*")) }
+                    })
+                    if (k != ShutterSound.Kind.OFF && !(custom && name == null)) addView(TextView(this@CameraActivity).apply {
+                        text = "▶"; textSize = 13f; setTextColor(Style.TEXT_2); gravity = Gravity.CENTER
+                        contentDescription = "试听"
+                        background = Style.surface(this@CameraActivity, fill = Style.SURFACE_2, radiusDp = 16f)
+                        setOnClickListener { ShutterSound.play(this@CameraActivity, k) }
+                    }, LinearLayout.LayoutParams(dp(32), dp(32)).apply { marginStart = dp(8) })
+                    setOnClickListener {
+                        if (custom && name == null) { pickShutterSound.launch(arrayOf("audio/*")); return@setOnClickListener }
+                        ShutterSound.setKind(this@CameraActivity, k)
+                        haptics.play(Haptics.Event.SEGMENT)
+                        ShutterSound.play(this@CameraActivity, k)
+                        render()
+                    }
+                })
+            }
+            root.addView(box, LinearLayout.LayoutParams(-1, -2))
+            // the volume
+            root.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), dp(10), dp(12), dp(10))
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 16f, stroke = Style.HAIRLINE)
+                addView(TextView(this@CameraActivity).apply { text = "音量"; textSize = 15f; setTextColor(Style.TEXT); typeface = Style.medium },
+                    LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(12) })
+                addView(SeekBar(this@CameraActivity).apply {
+                    max = 100
+                    progress = (ShutterSound.volume(this@CameraActivity) * 100).toInt()
+                    progressTintList = android.content.res.ColorStateList.valueOf(Style.ACCENT)
+                    thumbTintList = android.content.res.ColorStateList.valueOf(Style.ACCENT)
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(bar: SeekBar?, value: Int, fromUser: Boolean) {
+                            if (fromUser) ShutterSound.setVolume(this@CameraActivity, value / 100f)
+                        }
+                        override fun onStartTrackingTouch(bar: SeekBar?) {}
+                        override fun onStopTrackingTouch(bar: SeekBar?) {
+                            ShutterSound.play(this@CameraActivity, ShutterSound.kind(this@CameraActivity).let { if (it == ShutterSound.Kind.OFF) ShutterSound.Kind.SYSTEM else it })
+                        }
+                    })
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        }
+        render()
+        soundSheetRefresh = { render() }
+        org.photoall.film.ui.Sheet(this, "快门声", root, dimmed = false).apply {
+            setOnDismissListener { soundSheetRefresh = null }
+            show()
+        }
+    }
+
     private val importLut = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@registerForActivityResult
         val name = runCatching {
@@ -2419,6 +2814,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onResume() {
+        if (eyepiece) startEyeMotion()
+        runCatching { ShutterSound.prepare(this) }
         org.photoall.film.ui.CartridgeSprites.attach(this) // the 3D cartridges are drawn in this screen's window
         super.onResume()
         // back from a portrait-only screen: return to the layout the user had
@@ -2496,6 +2893,7 @@ class CameraActivity : ComponentActivity() {
 
     override fun onPause() {
         closeFlashModes()
+        if (eyepiece) stopEyeMotion() // the gyroscope only while the screen is shown
         zsl?.let {
             it.close()
             zsl = null
@@ -2552,6 +2950,11 @@ class CameraActivity : ComponentActivity() {
                 main.removeCallbacks(rebake)
                 main.postDelayed(rebake, 120)
             }
+        }
+        // film on / off: RAW or the phone's own JPEG, the plain curve or the phone's own
+        if (key == Settings.FILM_ON) {
+            if (store.flag(Settings.RAW) && rawWanted() != rawCapture) bindCamera()
+            else exposure?.let { it.systemTone = !store.flag(Settings.FILM_ON); applyCameraOptions() }
         }
         if (key.isEmpty()) { // reset all
             bindCamera()
@@ -2631,7 +3034,15 @@ class CameraActivity : ComponentActivity() {
                     options += LensOption(camera, z, snapRatio(z * scale), runCatching { Camera2CameraInfo.from(lens).cameraId }.getOrNull())
                 }
                 options += LensOption(camera, 1f, snapRatio(scale))
-            } else options += LensOption(camera, 1f, snapRatio(equivalentMm(camera) / reference))
+            } else {
+                val ratio = snapRatio(equivalentMm(camera) / reference)
+                if (camera !== main && lensDeadIds().contains(Camera2CameraInfo.from(camera).cameraId)) {
+                    // a lens this phone would not open: the same focal length by the main camera's zoom
+                    val range = main.zoomState.value
+                    val z = range?.let { ratio.coerceIn(it.minZoomRatio, it.maxZoomRatio) } ?: continue
+                    if (Math.abs(z / ratio - 1f) < 0.1f) options += LensOption(main, z, ratio)
+                } else options += LensOption(camera, 1f, ratio)
+            }
         }
         // One button per magnification; prefer the logical camera (zooms smoothly between lenses).
         val unique = options.sortedBy { it.ratio }.fold(mutableListOf<LensOption>()) { acc, o ->
@@ -2696,6 +3107,9 @@ class CameraActivity : ComponentActivity() {
     }
 
     private var zslBusyTries = 0
+    /** The zero-lag session is letting go of the camera; a bind follows it. */
+    private var zslClosing = false
+    private var zslReleasedAt = 0L
 
     private var flipping = false
 
@@ -3075,6 +3489,45 @@ class CameraActivity : ComponentActivity() {
         checkOpened(bound, id, 0)
     }
 
+    /** Lenses that would not open: for this run, and those that failed twice (kept). */
+    private val lensDeadNow = mutableSetOf<String>()
+    private fun lensDeadIds(): Set<String> {
+        val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+        return lensDeadNow + quirks.all.keys.filter { it.startsWith("lens_dead_") }.map { it.removePrefix("lens_dead_") }
+    }
+
+    /**
+     * A lens other than the main camera that does not open (a vivo telephoto, picked from the
+     * buttons, left the picture frozen): its focal length is taken by the main camera's zoom
+     * instead, at once and said. Once is kept for this run; a second time, for good.
+     */
+    private fun lensWontOpen(id: String): Boolean {
+        val provider = provider ?: return false
+        val main = mainCamera(lenses(provider)) ?: return false
+        val mainId = Camera2CameraInfo.from(main).cameraId
+        if (id == mainId || id in lensDeadNow) return false
+        val option = lensButtons.map { it.first }
+            .firstOrNull { Camera2CameraInfo.from(it.camera).cameraId == id && it.physicalId == null } ?: return false
+        lensDeadNow += id
+        val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
+        val fails = quirks.getInt("lens_fail_$id", 0) + 1
+        quirks.edit().putInt("lens_fail_$id", fails).apply {
+            if (fails >= 2) putBoolean("lens_dead_$id", true)
+        }.apply()
+        val mm = focalOf(option.ratio)
+        trail("镜头 $id（${mm}mm）打不开：改用主摄变焦")
+        org.photoall.film.CrashReport.note(this, "镜头打不开，改用主摄变焦（镜头 $id，${mm}mm，第 $fails 次）",
+            IllegalStateException(trailText()))
+        degraded("这台手机的 ${mm}mm 镜头打不开，已自动改用主摄变焦拍这个焦段")
+        val range = main.zoomState.value
+        lensId = mainId
+        pendingZoom = range?.let { option.ratio.coerceIn(it.minZoomRatio, it.maxZoomRatio) } ?: 1f
+        reopenTries = 0
+        buildZoomButtons()
+        bindCamera()
+        return true
+    }
+
     private fun checkOpened(bound: androidx.camera.core.Camera, id: String, waited: Int) {
         main.postDelayed({
             // a screen in the background has its camera closed on purpose: nothing to check
@@ -3082,10 +3535,14 @@ class CameraActivity : ComponentActivity() {
                 !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return@postDelayed
             val now = bound.cameraInfo.cameraState.value
             val state = describe(now)
-            if (now?.type == CameraState.Type.OPENING && now.error == null && waited < 2) {
+            // a lens other than the main camera gets less time: a frozen picture after a tap is
+            // what the user sees meanwhile, and the main camera's zoom can stand in for it
+            val other = provider?.let { p -> mainCamera(lenses(p))?.let { Camera2CameraInfo.from(it).cameraId != id } } == true
+            if (now?.type == CameraState.Type.OPENING && now.error == null && waited < (if (other) 1 else 2)) {
                 trail("相机 $id 还在打开，再等 4 秒")
                 return@postDelayed checkOpened(bound, id, waited + 1)
             }
+            if (other && lensWontOpen(id)) return@postDelayed
             if (reopenTries++ < 3) {
                 org.photoall.film.CrashReport.note(this, "相机绑定后 ${4 * (waited + 1)} 秒没打开（$state），重新连接",
                     IllegalStateException(trailText()))
@@ -3102,6 +3559,8 @@ class CameraActivity : ComponentActivity() {
                 if (id != ours || zsl != null || isFinishing ||
                     !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) return@post
                 if (cameraOpen() || SystemClock.uptimeMillis() - boundAt < 1500) return@post
+                // our own zero-lag session letting go of it, with the next bind already on its way
+                if (zslClosing || SystemClock.uptimeMillis() - zslReleasedAt < 1500) return@post
                 Log.i(TAG, "camera $id available again while ours is ${describe(camera?.cameraInfo?.cameraState?.value)}: rebind")
                 org.photoall.film.CrashReport.stage(this@CameraActivity, "相机 $id 重新可用，重新连接")
                 bindCamera()
@@ -3141,6 +3600,28 @@ class CameraActivity : ComponentActivity() {
             val provider = future.get().also { provider = it }
             val info = pickCamera(provider) ?: run { if (lensWaits == 0) status.text = "没有可用的相机"; return@addListener }
             lensWaits = 0
+            // The zero-lag session goes first, as before (released before any camera opens), but
+            // the screen does not wait for it: binding goes on once it has let go, at most 1.5 s.
+            zsl?.let { old ->
+                zsl = null
+                zslClosing = true
+                var went = false
+                val go = Runnable {
+                    if (went) return@Runnable
+                    went = true
+                    zslClosing = false
+                    zslReleasedAt = SystemClock.uptimeMillis()
+                    if (isFinishing || isDestroyed) return@Runnable
+                    // the screen went away meanwhile: opened again when it comes back
+                    if (!lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) { zslPaused = true; return@Runnable }
+                    bindCameraNow()
+                }
+                old.closeThen { main.post(go) }
+                main.postDelayed(go, 1500)
+                return@addListener
+            }
+            // another bind while the last session is still closing: the one queued will do
+            if (zslClosing) return@addListener
             val fourThree = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY).build()
             // Stills: the largest 4:3 size up to ~26 MP. Many phones (Xiaomi, vivo, OPPO
@@ -3175,6 +3656,7 @@ class CameraActivity : ComponentActivity() {
                 // a lens whose driver died at opening: only the settings it lists, and the plain ones
                 controller.strict = q.getBoolean("strict_requests_${chars.cameraId}", false)
                 controller.plain = controller.strict || q.getBoolean("raw_plain_${chars.cameraId}", false)
+                controller.systemTone = !store.flag(Settings.FILM_ON)
             }
             boundInfo = info
             lastBoundId = chars.cameraId
@@ -3377,9 +3859,33 @@ class CameraActivity : ComponentActivity() {
         return Exposure(ns, iso)
     }
 
+    // ----- the shutter up: a long hold on the exposure bar swaps the two rows ---------------
+
+    private val layoutPrefs by lazy { getSharedPreferences("camera_layout", MODE_PRIVATE) }
+    private fun shutterHigh() = layoutPrefs.getBoolean("shutter_high", false)
+
+    /**
+     * Upright, the shutter sat at the very foot of the screen, out of easy reach for some
+     * hands: three seconds' hold on the exposure bar puts the shutter row where the bar was
+     * and the bar at the foot; another hold puts them back. Kept.
+     */
+    private fun toggleShutterHigh() {
+        if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) return
+        val now = !shutterHigh()
+        layoutPrefs.edit().putBoolean("shutter_high", now).apply()
+        haptics.play(Haptics.Event.LOCKED)
+        android.widget.Toast.makeText(this,
+            if (now) "快门已上移，曝光条在最下面；再长按曝光条 3 秒换回" else "快门已回到最下面",
+            android.widget.Toast.LENGTH_SHORT).show()
+        attachLayout()
+        updateLabels()
+    }
+
     /** Live readout from the phone's 3A (every few frames). */
     private fun showLive(e: Exposure) {
         if (store.flag(Settings.MANUAL)) return // updateLabels shows the fixed values
+        overlay.rfSeconds = e.timeNs / 1e9
+        overlay.rfMeter = null
         val film = exposure?.let { it.filmRules && it.filmIso > 0 } == true
         overlay.info = "ISO %d · %s".format(e.iso, Settings.secondsLabel(e.timeNs / 1e9)) +
             if (film) " · 胶片 ISO ${exposure?.filmIso}" else ""
@@ -3400,7 +3906,8 @@ class CameraActivity : ComponentActivity() {
         controller.metering = store[Settings.METERING].toInt()
         controller.highlightProtect = store.flag(Settings.HIGHLIGHT)
         controller.antibanding = store[Settings.FLICKER].toInt()
-        controller.evStops = evStops
+        controller.evStops = sensorEv()
+        syncFinderEv()
         controller.filmIso = if (store.flag(Settings.FILM_ISO)) Settings.filmIso(filmName()) else 0
         controller.manual = if (store.flag(Settings.MANUAL)) manualExposure(chars) else null
         controller.fixedKelvin = Settings.whiteBalanceKelvin(wb, filmName())
@@ -3415,7 +3922,8 @@ class CameraActivity : ComponentActivity() {
             else -> CaptureRequest.CONTROL_AWB_MODE_AUTO
         }
         controller.focusDiopters = manualFocusDiopters()
-        controller.steadyLight = if (flashMode() == Settings.FLASH_STEADY) store[Settings.FLASH_FILL] else null
+        // in the tour's flash step the modes are only shown: the fill light stays dark
+        controller.steadyLight = if (flashMode() == Settings.FLASH_STEADY && !coachFlashDemo) store[Settings.FLASH_FILL] else null
         controller.push()
         updateLabels()
     }
@@ -3430,8 +3938,9 @@ class CameraActivity : ComponentActivity() {
         lensRow.removeAllViews()
         lensButtons.clear()
         val provider = provider ?: return
-        options = lensOptions(provider)
         referenceMm = mainCamera(lenses(provider))?.let { equivalentMm(it) } ?: 0f
+        // the phone's lenses, the user's own focal lengths among them, less the ones unticked (焦段)
+        options = runCatching { shownOptions(lensOptions(provider)) }.getOrElse { lensOptions(provider) }
         for (option in options) {
             val b = LensButton(this).apply { setOnClickListener { selectLens(option) } }
             // small enough to leave the picture alone, still a fair touch target with the gaps
@@ -3442,11 +3951,343 @@ class CameraActivity : ComponentActivity() {
         updateZoom()
     }
 
+    // ===== focal lengths: the phone's lenses, the user's own, which show =========================
+
+    /** How far [o]'s camera can zoom, as a magnification of the main lens. */
+    private fun reachOf(o: LensOption): Float {
+        val max = o.camera.zoomState.value?.maxZoomRatio ?: o.zoom
+        return max * o.ratio / o.zoom
+    }
+
+    /**
+     * The format a focal length shoots: RAW only from the main camera at 1x with RAW on (and the
+     * phone giving it); every other focal length JPEG.
+     */
+    private fun formatOf(o: LensOption, main: CameraInfo?): String {
+        if (!store.flag(Settings.RAW)) return "JPEG"
+        if (o.camera !== main || o.physicalId != null || abs(o.zoom - 1f) >= 0.05f) return "JPEG"
+        val id = Camera2CameraInfo.from(o.camera).cameraId
+        if (getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_unusable_$id", false)) return "JPEG"
+        // bound on it now: what the camera really gives
+        val bound = zsl?.cameraId ?: camera?.let { Camera2CameraInfo.from(it.cameraInfo).cameraId }
+        if (bound == id && !lensJpeg) return if (rawCapture) "RAW" else "JPEG"
+        return "RAW"
+    }
+
+    /** What a detected lens is, in a word. */
+    private fun lensKind(o: LensOption, main: CameraInfo?): String = when {
+        o.ratio < 0.85f -> "超广角"
+        o.camera === main && o.physicalId == null && abs(o.zoom - 1f) < 0.05f -> "主摄"
+        o.camera === main && o.physicalId == null -> "主摄变焦"
+        o.ratio > 1.4f -> "长焦"
+        else -> "镜头"
+    }
+
+    /**
+     * The user's focal lengths as lens options: each by the nearest lens at or below it, zoomed
+     * (a 50 by the main camera at 2.1x, an 85 by a 3x telephoto at 1.2x). One out of this phone's
+     * reach (another phone's list, a damaged pref) is skipped, never clamped onto a wrong button.
+     */
+    private fun customOptions(detected: List<LensOption>): List<Pair<Int, LensOption?>> {
+        if (referenceMm <= 0f) return emptyList()
+        return FocalLengths.custom(this).map { mm ->
+            val r = mm / referenceMm
+            val base = detected.filter { it.ratio <= r * 1.001f && reachOf(it) >= r * 0.999f }.maxByOrNull { it.ratio }
+            mm to base?.let { b -> LensOption(b.camera, b.zoom * r / b.ratio, r) }
+        }
+    }
+
+    /** The row under the viewfinder: detected lenses and the user's own, less the hidden; never empty. */
+    private fun shownOptions(detected: List<LensOption>): List<LensOption> {
+        if (front || detected.isEmpty()) return detected
+        val all = detected.toMutableList()
+        for ((_, o) in customOptions(detected)) {
+            if (o == null || all.any { abs(it.ratio / o.ratio - 1f) < FocalLengths.SAME }) continue
+            all += o
+        }
+        val hidden = FocalLengths.hidden(this)
+        val shown = all.filter { focalOf(it.ratio) !in hidden }.sortedBy { it.ratio }
+        if (shown.isNotEmpty()) return shown
+        // everything hidden (a damaged pref): the main camera at least
+        val provider = provider ?: return detected
+        val main = mainCamera(lenses(provider))
+        return listOfNotNull(detected.firstOrNull { it.camera === main && abs(it.zoom - 1f) < 0.05f } ?: detected.firstOrNull())
+    }
+
+    /**
+     * 焦段: the lenses this phone has, ticked to show under the viewfinder; the user's own focal
+     * lengths, added by typing (checked: a number, within the phone's reach, not one already
+     * there, at most eight) or from the usual ones; each ticked, or taken off.
+     */
+    private fun showFocalLengths() {
+        val provider = provider ?: return
+        if (front) {
+            android.widget.Toast.makeText(this, "先切换到后置镜头，再设置焦段", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, 0, dp(12)) }
+        val main = mainCamera(lenses(provider))
+        var draft = ""
+        var error: String? = null
+
+        fun apply() { buildZoomButtons() }
+
+        fun render() {
+            root.removeAllViews()
+            val detected = lensOptions(provider)
+            if (detected.isEmpty() || referenceMm <= 0f) {
+                root.addView(TextView(this).apply {
+                    text = "读不出这台手机的镜头焦距，暂时不能设置。"; textSize = 14f; setTextColor(Style.TEXT_2)
+                })
+                return
+            }
+            val hidden = FocalLengths.hidden(this).toMutableSet()
+            val custom = customOptions(detected)
+            val lo = detected.minOf { focalOf(it.ratio) }
+            val hi = (referenceMm * detected.maxOf { reachOf(it) }).roundToInt().coerceAtMost(1000)
+            // ticked: what the row really shows (a damaged pref that hid everything still shows the main)
+            val visible = shownOptions(detected).map { focalOf(it.ratio) }.toSet()
+            val shownCount = visible.size
+
+            fun caption(t: String) = TextView(this).apply {
+                text = t; textSize = 13f; setTextColor(Style.TEXT_2); typeface = Style.medium
+                setPadding(dp(4), dp(14), 0, dp(8))
+            }
+            fun box() = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 16f, stroke = Style.HAIRLINE)
+            }
+            /** A focal length's row: its tick, the number, what makes it, and (the user's own) a delete. */
+            fun row(box: LinearLayout, mm: Int, detail: String, reachable: Boolean, format: String?, onDelete: (() -> Unit)?) {
+                if (box.childCount > 0) box.addView(Style.hairline(this), LinearLayout.LayoutParams(-1, 1).apply { marginStart = dp(16) })
+                val on = reachable && mm in visible
+                box.addView(LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    minimumHeight = dp(54)
+                    setPadding(dp(16), dp(6), dp(8), dp(6))
+                    Style.pressable(this)
+                    addView(TextView(this@CameraActivity).apply {
+                        text = if (on) "✓" else ""
+                        gravity = Gravity.CENTER; textSize = 13f; typeface = Style.medium
+                        setTextColor(Style.ON_ACCENT)
+                        background = android.graphics.drawable.GradientDrawable().apply {
+                            cornerRadius = dp(6).toFloat()
+                            if (on) setColor(Style.ACCENT) else setStroke(dp(1).coerceAtLeast(1) + 1, Style.TEXT_3)
+                        }
+                    }, LinearLayout.LayoutParams(dp(22), dp(22)).apply { marginEnd = dp(14) })
+                    addView(TextView(this@CameraActivity).apply {
+                        text = "$mm"; textSize = 18f; typeface = Style.medium
+                        setTextColor(if (reachable) Style.TEXT else Style.TEXT_3)
+                        Style.numeric(this)
+                    }, LinearLayout.LayoutParams(dp(52), -2))
+                    addView(TextView(this@CameraActivity).apply {
+                        text = detail; textSize = 12.5f; setTextColor(Style.TEXT_2)
+                    }, LinearLayout.LayoutParams(0, -2, 1f))
+                    // the format this focal length shoots
+                    if (format != null) addView(TextView(this@CameraActivity).apply {
+                        text = format; textSize = 10.5f; typeface = Style.medium; gravity = Gravity.CENTER
+                        letterSpacing = 0.06f
+                        val raw = format == "RAW"
+                        setTextColor(if (raw) Style.ON_ACCENT else Style.TEXT_2)
+                        background = android.graphics.drawable.GradientDrawable().apply {
+                            cornerRadius = dp(6).toFloat()
+                            if (raw) setColor(Style.ACCENT) else setStroke(dp(1), Style.TEXT_3)
+                        }
+                        setPadding(dp(7), dp(2), dp(7), dp(2))
+                    }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8); marginEnd = if (onDelete == null) dp(8) else 0 })
+                    if (onDelete != null) addView(TextView(this@CameraActivity).apply {
+                        text = "✕"; textSize = 14f; setTextColor(Style.TEXT_2); gravity = Gravity.CENTER
+                        contentDescription = "删除 $mm mm"
+                        setOnClickListener { onDelete() }
+                    }, LinearLayout.LayoutParams(dp(40), dp(40)))
+                    setOnClickListener {
+                        if (!reachable) return@setOnClickListener
+                        if (on) {
+                            if (shownCount <= 1) {
+                                error = "至少留一个焦段在取景框下方"
+                                return@setOnClickListener render()
+                            }
+                            hidden += mm
+                        } else hidden -= mm
+                        error = null
+                        FocalLengths.setHidden(this@CameraActivity, hidden)
+                        haptics.play(Haptics.Event.SEGMENT)
+                        apply(); render()
+                    }
+                })
+            }
+
+            root.addView(TextView(this).apply {
+                text = "勾选的焦段会显示在取景框下方。自定义的焦段用离它最近、比它广的镜头变焦得到。右边标着每个焦段拍出来是 RAW 还是 JPEG：RAW 只来自主摄 1 倍。"
+                textSize = 13f; setTextColor(Style.TEXT_2); setLineSpacing(0f, 1.2f)
+                setPadding(dp(4), 0, dp(4), 0)
+            })
+
+            root.addView(caption("这台手机的镜头"))
+            val lensBox = box()
+            for (o in detected) {
+                val z = if (abs(o.zoom - 1f) < 0.05f) "" else " · ${zoomText(o.zoom)}"
+                row(lensBox, focalOf(o.ratio), lensKind(o, main) + z, true, formatOf(o, main), null)
+            }
+            root.addView(lensBox, LinearLayout.LayoutParams(-1, -2))
+
+            root.addView(caption("自定义焦段"))
+            if (custom.isNotEmpty()) {
+                val customBox = box()
+                for ((mm, o) in custom) {
+                    val base = o?.let { opt -> detected.filter { it.camera === opt.camera && it.ratio <= opt.ratio * 1.001f }.maxByOrNull { it.ratio } }
+                    val detail = when {
+                        o == null -> "这台手机拍不到这个焦段"
+                        detected.any { it !== o && abs(it.ratio / o.ratio - 1f) < FocalLengths.SAME } -> "和手机自带的镜头重合"
+                        else -> (base?.let { lensKind(it, main) } ?: "变焦") + " · 变焦到 ${zoomText(o.zoom)}"
+                    }
+                    row(customBox, mm, detail, o != null, o?.let { formatOf(it, main) }, onDelete = {
+                        FocalLengths.setCustom(this, FocalLengths.custom(this).filter { it != mm })
+                        error = null
+                        haptics.play(Haptics.Event.SEGMENT)
+                        apply(); render()
+                    })
+                }
+                root.addView(customBox, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+            }
+
+            // typing one in
+            fun add(text: String) {
+                val taken = detected.map { focalOf(it.ratio) } + FocalLengths.custom(this)
+                val result = FocalLengths.check(text, lo, hi, taken, FocalLengths.custom(this).size)
+                val mm = result.mm
+                if (mm == null) { error = result.error; draft = text; haptics.play(Haptics.Event.LIMIT); return render() }
+                FocalLengths.setCustom(this, FocalLengths.custom(this) + mm)
+                FocalLengths.setHidden(this, FocalLengths.hidden(this) - mm)
+                error = null; draft = ""
+                haptics.play(Haptics.Event.SEGMENT)
+                apply(); render()
+            }
+            val field = android.widget.EditText(this).apply {
+                setText(draft)
+                setSelection(draft.length)
+                hint = "如 50"
+                textSize = 16f
+                setTextColor(Style.TEXT); setHintTextColor(Style.TEXT_3)
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                filters = arrayOf(android.text.InputFilter.LengthFilter(4))
+                isSingleLine = true
+                imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 12f, stroke = Style.HAIRLINE)
+                setPadding(dp(14), 0, dp(14), 0)
+                setOnEditorActionListener { v, _, _ -> add(v.text.toString()); true }
+                // after a refusal the field keeps the finger's place: focus and keyboard stay
+                if (error != null) post {
+                    requestFocus()
+                    getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                        ?.showSoftInput(this, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
+            root.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(field, LinearLayout.LayoutParams(0, dp(46), 1f))
+                addView(TextView(this@CameraActivity).apply {
+                    text = "mm"; textSize = 14f; setTextColor(Style.TEXT_2); setPadding(dp(10), 0, dp(10), 0)
+                })
+                addView(TextView(this@CameraActivity).apply {
+                    text = "添加"; textSize = 14f; typeface = Style.medium; gravity = Gravity.CENTER
+                    setTextColor(Style.ON_ACCENT)
+                    background = Style.surface(this@CameraActivity, fill = Style.ACCENT, radiusDp = 12f)
+                    Style.pressable(this)
+                    setOnClickListener { add(field.text.toString()) }
+                }, LinearLayout.LayoutParams(dp(72), dp(46)))
+            }, LinearLayout.LayoutParams(-1, -2))
+            root.addView(TextView(this).apply {
+                text = error ?: "可以填 $lo–$hi mm，最多 ${FocalLengths.MAX_CUSTOM} 个"
+                textSize = 12.5f
+                setTextColor(if (error != null) 0xffe5534b.toInt() else Style.TEXT_3)
+                setPadding(dp(4), dp(8), 0, 0)
+            })
+            // the usual ones, one tap each
+            val taken = detected.map { focalOf(it.ratio) } + FocalLengths.custom(this)
+            val usual = listOf(28, 35, 40, 50, 58, 75, 85, 105, 135).filter { mm -> mm in lo..hi && taken.none { FocalLengths.same(it, mm) } }
+            if (usual.isNotEmpty() && FocalLengths.custom(this).size < FocalLengths.MAX_CUSTOM) {
+                root.addView(android.widget.HorizontalScrollView(this).apply {
+                    isHorizontalScrollBarEnabled = false
+                    addView(LinearLayout(this@CameraActivity).apply {
+                        for (mm in usual) addView(TextView(this@CameraActivity).apply {
+                            text = "+ $mm"; textSize = 13f; setTextColor(Style.TEXT); gravity = Gravity.CENTER
+                            Style.numeric(this)
+                            background = Style.surface(this@CameraActivity, fill = Style.SURFACE_2, radiusDp = 16f)
+                            setPadding(dp(14), 0, dp(14), 0)
+                            Style.pressable(this)
+                            setOnClickListener { add("$mm") }
+                        }, LinearLayout.LayoutParams(-2, dp(34)).apply { marginEnd = dp(8) })
+                    })
+                }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+            }
+        }
+        render()
+        org.photoall.film.ui.Sheet(this, "焦段", android.widget.ScrollView(this).apply { addView(root) }, fixedHeight = 0.78f).show()
+    }
+
     /** A magnification of the main lens as a 35 mm focal length (0.6x of 23 mm is 14). */
     private fun focalOf(ratio: Float) = if (referenceMm > 0f) (referenceMm * ratio).roundToInt() else (ratio * 24).roundToInt()
 
+    /** The tapped lens lights at once; the camera's own report (updateZoom) follows. */
+    private fun markLens(option: LensOption) {
+        for ((o, b) in lensButtons) b.show(focalOf(o.ratio), o === option)
+        lensWell.show(lensButtons.map { focalOf(it.first.ratio).toString() },
+            lensButtons.indexOfFirst { it.first === option }.coerceAtLeast(0), focalOf(option.ratio).toString())
+    }
+
+    /**
+     * A lens switch that opens the camera again: the picture frosts over (a still of it), and
+     * clears with the first frame of the new lens, instead of freezing and jumping. Without a
+     * still (PixelCopy unanswered) the bind goes ahead as before.
+     */
+    private fun rebindForLens() {
+        if (flipping || turning || overlay.frost != null) { bindCamera(); return }
+        var done = false
+        var revealed = false
+        fun reveal() {
+            if (revealed) return
+            revealed = true
+            viewfinder.onSessionFrame = null
+            android.animation.ValueAnimator.ofFloat(overlay.frostAlpha, 0f).apply {
+                duration = 260
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener { overlay.frostAlpha = it.animatedValue as Float }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        if (!flipping && !turning) { overlay.frost = null; overlay.frostAlpha = 0f }
+                    }
+                })
+                start()
+            }
+        }
+        fun go(still: android.graphics.Bitmap?) {
+            if (done) return
+            done = true
+            val frost = runCatching { still?.let { frosted(it) } }.getOrNull()
+            if (frost != null) {
+                overlay.frost = frost
+                overlay.frostAlpha = 1f
+                viewfinder.onSessionFrame = { main.postDelayed({ reveal() }, 60) }
+                main.postDelayed({ reveal() }, 3000) // a lens slow to come: uncovered all the same
+            }
+            bindCamera()
+        }
+        val vw = viewfinder.width
+        val vh = viewfinder.height
+        if (vw <= 0 || vh <= 0) return go(null)
+        val still = android.graphics.Bitmap.createBitmap(maxOf(1, vw / 4), maxOf(1, vh / 4), android.graphics.Bitmap.Config.ARGB_8888)
+        main.postDelayed({ go(null) }, 120)
+        runCatching {
+            android.view.PixelCopy.request(viewfinder, still, { result ->
+                go(if (result == android.view.PixelCopy.SUCCESS) still else null)
+            }, main)
+        }.onFailure { go(null) }
+    }
+
     private fun selectLens(option: LensOption) {
         haptics.play(Haptics.Event.SEGMENT)
+        markLens(option)
         // RAW from the lens itself, not the main sensor cropped: pin it (or unpin) and bind again
         // another lens than the main camera: JPEG (see lensJpeg); a change of format binds again
         val jpeg = !onMain(option)
@@ -3459,7 +4300,7 @@ class CameraActivity : ComponentActivity() {
             lensJpeg = jpeg
             lensId = Camera2CameraInfo.from(option.camera).cameraId
             pendingZoom = option.zoom
-            bindCamera()
+            rebindForLens()
             return
         }
         lensJpeg = jpeg
@@ -3471,7 +4312,7 @@ class CameraActivity : ComponentActivity() {
             } else {
                 lensId = id
                 pendingZoom = option.zoom
-                bindCamera()
+                rebindForLens()
             }
             return
         }
@@ -3481,13 +4322,107 @@ class CameraActivity : ComponentActivity() {
         else {
             lensId = id
             pendingZoom = option.zoom
-            bindCamera()
+            rebindForLens()
         }
+    }
+
+    /** The bound camera's zoom now and its range: from the session's camera, or CameraX's. */
+    private fun zoomNow(): Triple<Float, Float, Float>? {
+        zsl?.let { session ->
+            // Android 11+ only (CONTROL_ZOOM_RATIO); before it the session does not zoom
+            val range = if (android.os.Build.VERSION.SDK_INT >= 30) session.characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
+            return Triple(session.zoom, range?.lower ?: 1f, range?.upper ?: 1f)
+        }
+        val state = camera?.cameraInfo?.zoomState?.value ?: return null
+        return Triple(state.zoomRatio, state.minZoomRatio, state.maxZoomRatio)
+    }
+
+    private fun zoomTo(z: Float) {
+        zsl?.let { session -> session.zoomTo(z); updateZoom(); return }
+        camera?.cameraControl?.setZoomRatio(z)
+    }
+
+    private var zoomBarFrom = 1f
+    private var zoomBarStop = -1
+    private val hideZoomBar = Runnable {
+        zoomBar.animate().alpha(0f).setDuration(180).withEndAction { zoomBar.visibility = View.GONE }.start()
+        for (v in listOf(lensRow, facingButton)) { v.visibility = View.VISIBLE; v.animate().alpha(1f).setDuration(220).start() }
+    }
+
+    /** The lens buttons give way to the ruler; false when there is nothing to zoom. */
+    private fun beginZoomBar(): Boolean {
+        if (pickerOpen) return false
+        val (z, lo, hi) = zoomNow() ?: return false
+        if (hi <= lo * 1.01f) return false
+        val id = zsl?.cameraId ?: camera?.let { Camera2CameraInfo.from(it.cameraInfo).cameraId } ?: return false
+        val mine = lensButtons.map { it.first }.filter { Camera2CameraInfo.from(it.camera).cameraId == id }
+        // millimetres per unit of this camera's zoom: its lenses' ratios over their zooms
+        val scale = mine.firstOrNull()?.let { it.ratio / it.zoom } ?: 1f
+        val mmPerZoom = if (referenceMm > 0f) referenceMm * scale else 24f * scale
+        main.removeCallbacks(hideZoomBar)
+        zoomBar.animate().cancel()
+        zoomBar.lo = lo
+        // past the longest lens, a doubling more is enough on the ruler
+        zoomBar.hi = minOf(hi, maxOf((mine.maxOfOrNull { it.zoom } ?: 1f) * 2f, lo * 4f))
+        zoomBar.stops = mine.map { it.zoom to focalOf(it.ratio) }
+        zoomBar.mmPerZoom = mmPerZoom
+        zoomBar.zoom = z
+        zoomBarFrom = zoomBar.zoom
+        zoomBarStop = -1
+        zoomBar.visibility = View.VISIBLE
+        zoomBar.animate().alpha(1f).setDuration(140).start()
+        coach?.event("zoom_bar")
+        for (v in listOf(lensRow, facingButton)) v.animate().alpha(0f).setDuration(120).withEndAction { v.visibility = View.INVISIBLE }.start()
+        haptics.play(Haptics.Event.SEGMENT)
+        return true
+    }
+
+    /** The finger [dx] pixels from where the slide began: the zoom follows, a tick at each lens. */
+    private fun slideZoomBar(dx: Float) {
+        val z = zoomBar.dragged(zoomBarFrom, dx)
+        val near = zoomBar.stops.indexOfFirst { abs(it.first / z - 1f) < 0.02f }
+        if (near >= 0 && near != zoomBarStop) haptics.play(Haptics.Event.TICK)
+        zoomBarStop = near
+        zoomBar.zoom = z
+        zoomTo(z)
+    }
+
+    private fun endZoomBar() {
+        main.removeCallbacks(hideZoomBar)
+        main.postDelayed(hideZoomBar, 1500)
+        settleZoomLens()
+    }
+
+    /**
+     * After the ruler or a pinch, on the main camera: zoomed to a telephoto's reach (or wider
+     * than the main lens) the shot goes over to JPEG, as the focal-length buttons do, so the
+     * phone itself can switch to the lens for it; back near 1x, RAW again. Before this the
+     * RAW session stayed on the main sensor and only cropped it, whatever the zoom.
+     * Done when the fingers lift (a change of format binds the camera again, about a second).
+     */
+    private fun settleZoomLens() {
+        if (front || !store.flag(Settings.RAW)) return
+        val (z, _, _) = zoomNow() ?: return
+        val provider = provider ?: return
+        val mainCam = mainCamera(lenses(provider)) ?: return
+        val mainId = Camera2CameraInfo.from(mainCam).cameraId
+        val id = zsl?.cameraId ?: camera?.let { Camera2CameraInfo.from(it.cameraInfo).cameraId } ?: return
+        if (id != mainId) return // another lens: JPEG already, by its button
+        val jpeg = z >= TELE_FROM || z <= 0.9f
+        if (jpeg == lensJpeg) return
+        if (jpeg && toldLens.add("jpeg"))
+            android.widget.Toast.makeText(this, "RAW 只用主摄（1 倍）拍；变焦到其他焦段拍 JPEG，由手机自己切换镜头", android.widget.Toast.LENGTH_LONG).show()
+        lensJpeg = jpeg
+        lensExpected = null
+        lensId = id
+        pendingZoom = z
+        rebindForLens()
     }
 
     private fun zoomBy(factor: Float) {
         zsl?.let { session ->
-            val range = session.characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            // Android 11+ only (CONTROL_ZOOM_RATIO); before it the session does not zoom
+            val range = if (android.os.Build.VERSION.SDK_INT >= 30) session.characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
             val lo = range?.lower ?: 1f
             val hi = range?.upper ?: 1f
             session.zoomTo((session.zoom * factor).coerceIn(lo, hi))
@@ -3510,6 +4445,7 @@ class CameraActivity : ComponentActivity() {
         val active = mine.lastOrNull { it.first.zoom <= zoom * 1.01f } ?: mine.firstOrNull()
         val scale = active?.let { it.first.ratio / it.first.zoom } ?: 1f
         zoomLabel.text = zoomText(zoom * scale)
+        overlay.rfFocal = focalOf(zoom * scale)
         // the lens in use shows where the zoom really is (pinching between lenses)
         for ((option, b) in lensButtons) {
             val inUse = option === active?.first
@@ -3617,9 +4553,34 @@ class CameraActivity : ComponentActivity() {
         })
         if (thirds != wanted) return
         evStops = thirds / 3.0
-        controller.evStops = evStops
+        controller.evStops = sensorEv()
         controller.push()
+        syncFinderEv()
+        if (evOnFilm() && evStops != 0.0 && !layoutPrefs.getBoolean("ev_film_told", false)) {
+            layoutPrefs.edit().putBoolean("ev_film_told", true).apply()
+            android.widget.Toast.makeText(this, "拍 RAW 时，EV 调的是胶片曝光：冲洗时加减，高光不会因此被切掉",
+                android.widget.Toast.LENGTH_LONG).show()
+        }
         updateLabels()
+    }
+
+    /**
+     * Where the EV dial acts. A RAW is developed at the reference's own exposure (its meter
+     * brings every frame to mid-grey), which undid a compensation given to the sensor and kept
+     * only its harm (a frame pushed brighter had its highlights clipped, and came out no
+     * brighter): for a RAW, the dial is the film's exposure, added in the develop, the sensor
+     * left as metered. A JPEG, already a finished picture, keeps it on the sensor. Manual
+     * exposure has its own rule (manualKept).
+     */
+    private fun evOnFilm() = rawCapture && !store.flag(Settings.MANUAL)
+    private fun sensorEv() = if (evOnFilm()) 0.0 else evStops
+    /** The EV the develop adds for the dial, at the shot. */
+    private fun filmEv() = if (evOnFilm()) evStops.toFloat() else 0f
+
+    /** The viewfinder shows what the photo will be: its own setting, plus the dial when it acts on the film. */
+    private fun syncFinderEv() {
+        viewfinder.exposure = store[Settings.FINDER_EV]
+        viewfinder.filmEv = filmEv()
     }
 
     private fun updateLabels() {
@@ -3645,8 +4606,10 @@ class CameraActivity : ComponentActivity() {
         evLabel.text = if (manual) "手动" else if (evStops == 0.0) "±0.0" else "%+.1f".format(evStops)
         evLabel.setTextColor(if (manual || evStops != 0.0) Style.ACCENT else Style.TEXT)
         evDial.thirds = (evStops * 3).roundToInt()
-        dialRow.visibility = if (!manual && (evOpen || dialPinned)) View.VISIBLE else View.GONE
-        manualRow.visibility = if (manual && (evOpen || dialPinned)) View.VISIBLE else View.GONE
+        // with the shutter moved up, the bar at the foot is always there
+        val always = shutterHigh() && resources.configuration.orientation != android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        dialRow.visibility = if (!manual && (evOpen || dialPinned || always)) View.VISIBLE else View.GONE
+        manualRow.visibility = if (manual && (evOpen || dialPinned || always)) View.VISIBLE else View.GONE
         showBody(manual, store.flag(Settings.HDR))
         if (manual) showManual()
         val flashMode = flashMode()
@@ -3779,6 +4742,7 @@ class CameraActivity : ComponentActivity() {
         }
         if (pickerOpen) closePicker()
         coach?.event("shot")
+        ShutterSound.shot(this)
         zsl?.let { return takeZsl(it) }
         val capture = capture ?: return
         if (capturing) {
@@ -3816,6 +4780,8 @@ class CameraActivity : ComponentActivity() {
         // steady fill light, already lit in the viewfinder, so the shot is an ordinary one;
         // 3 mixes an ambient frame and one lit by the flash LED, both held 1.5 stops under.
         val flashMode = flashMode()
+        val manualEv = manualKept(controller, flashMode != 0, hdr = store.flag(Settings.HDR) && rawCapture)
+        val dialEv = filmEv()
         val singleFlash = flashMode == 1
         // Manual exposure turns the phone's AE off, and its flash pulse only fires through AE
         // (a pre-flash to meter it): with manual, the flash LED lights at full strength for
@@ -3932,7 +4898,7 @@ class CameraActivity : ComponentActivity() {
                 else -> controller?.stillMetadata(still) ?: Triple(null, 0f, 0f)
             }
             val developOptions = options.copy(
-                exposureEv = rawEv,
+                exposureEv = rawEv + manualEv + dialEv,
                 // the reference spektrafilm's exposure (its centre-weighted meter, its print):
                 // matching the viewfinder's brightness instead lifted every frame half a stop
                 // and flattened the film's shadows into the phone's own look
@@ -3959,7 +4925,8 @@ class CameraActivity : ComponentActivity() {
             }
             val dev = "冲洗参数（传给引擎）"
             log.put(dev, "曝光补偿 (RAW EV)", "%+.2f EV".format(Locale.US, developOptions.exposureEv))
-            log.put(dev, "曝光方式", "原版（中央重点测光）")
+            if (dialEv != 0f) log.put(dev, "EV 刻度（胶片曝光）", "%+.1f EV（冲洗时加减，传感器按测光）".format(Locale.US, dialEv))
+            log.put(dev, "曝光方式", if (manualEv != 0f) "原版测光，保留手动曝光 %+.2f EV".format(Locale.US, manualEv) else "原版（中央重点测光）")
             log.put(dev, "白平衡中性点", developOptions.neutral ?: "用 DNG 自带")
             log.put(dev, "噪声模型 (s o)", if (developOptions.noiseScale > 0) "%.4g %.4g".format(Locale.US, developOptions.noiseScale, developOptions.noiseOffset) else "用 DNG 自带")
             log.put(dev, "RAW 降噪 / 彩色降噪", "%.2f / %.2f".format(Locale.US, developOptions.rawDenoise, developOptions.chromaDenoise))
@@ -4004,6 +4971,7 @@ class CameraActivity : ComponentActivity() {
                             steadyLight -> "RAW · 补光"
                             else -> "RAW"
                         }
+                        handTuneShot { files[developed].copyTo(it, overwrite = true) }
                         finish(stamp, recipe, quality, kind, shot, log) {
                             try {
                                 engine().developDng(files.map { it.path },
@@ -4088,6 +5056,8 @@ class CameraActivity : ComponentActivity() {
         val longStops = store[Settings.HDR_LONG].toDouble()
         val long = if (hdr && longStops >= 0.1 && ring != null && controller != null) controller.longExposure(ring, longStops) else null
         val key = meter?.key ?: 0f // as the viewfinder showed it
+        val manualEv = manualKept(controller, false, hdr)
+        val dialEv = filmEv()
         val focal35 = boundInfo?.let { (equivalentMm(it) * session.zoom).roundToInt().takeIf { mm -> mm > 0 } }
         val log = ShotLog()
         log.put("拍摄", "时间", stamp)
@@ -4132,7 +5102,7 @@ class CameraActivity : ComponentActivity() {
                 log.put("每帧（拍摄计划）", "帧 $i", (if (i == shot.dngs.size - 1 && shot.long) "长曝光 " else "连拍 ") +
                     "曝光量 %.0f".format(Locale.US, shot.exposures[i] / 1e6) + if (i == 0) "（参考帧，最接近按快门的一帧）" else "")
             val developOptions = options.copy(
-                exposureEv = rawEv,
+                exposureEv = rawEv + manualEv + dialEv,
                 matchKey = REFERENCE_EXPOSURE, // see takePhoto
                 localTone = if (hdr) store[Settings.HDR_TONE] else 0f,
                 chromaDenoise = store[Settings.CHROMA_NR],
@@ -4141,7 +5111,8 @@ class CameraActivity : ComponentActivity() {
             )
             val dev = "冲洗参数（传给引擎）"
             log.put(dev, "曝光补偿 (RAW EV)", "%+.2f EV".format(Locale.US, developOptions.exposureEv))
-            log.put(dev, "曝光方式", "原版（中央重点测光）")
+            if (dialEv != 0f) log.put(dev, "EV 刻度（胶片曝光）", "%+.1f EV（冲洗时加减，传感器按测光）".format(Locale.US, dialEv))
+            log.put(dev, "曝光方式", if (manualEv != 0f) "原版测光，保留手动曝光 %+.2f EV".format(Locale.US, manualEv) else "原版（中央重点测光）")
             log.put(dev, "RAW 降噪 / 彩色降噪", "%.2f / %.2f".format(Locale.US, developOptions.rawDenoise, developOptions.chromaDenoise))
             log.put(dev, "HDR 影调压缩", developOptions.localTone)
             engineThread.later {
@@ -4156,6 +5127,7 @@ class CameraActivity : ComponentActivity() {
                     model = android.os.Build.MODEL,
                     takenMs = System.currentTimeMillis(),
                 )
+                handTuneShot { shot.dngs[0].save(it) }
                 if (store.flag(Settings.KEEP_RAW)) runCatching {
                     val file = File(cacheDir, "FILM_$stamp.dng")
                     shot.dngs[0].save(file)
@@ -4336,8 +5308,10 @@ class CameraActivity : ComponentActivity() {
         if (index == torchFrame) {
             // The LED needs a couple of frames to light fully at the held exposure; without
             // one (the LED as the flash, auto exposure) the meter gets time to settle on it.
+            val before = meter?.key ?: 0f
             controller.lightTorch(true)
-            main.postDelayed(shoot, if (target != null) 200 + 2 * target.timeNs / 1_000_000 else 600L)
+            main.postDelayed({ awaitTorch(before, SystemClock.uptimeMillis(), shoot) },
+                if (target != null) 200 + 2 * target.timeNs / 1_000_000 else 600L)
             return
         }
         if (target == null) return shoot()
@@ -4345,6 +5319,33 @@ class CameraActivity : ComponentActivity() {
         // A few frames at the new exposure: the time it takes to land plus margin.
         val deadline = SystemClock.uptimeMillis() + 400 + 4 * target.timeNs / 1_000_000
         awaitExposure(controller, target, deadline, shoot)
+    }
+
+    /**
+     * The flash frame waits for the LED's light in the viewfinder. On most phones it is up
+     * within the usual couple of frames: the frame is taken at once, as before. Some take
+     * longer (a Xiaomi 14 Ultra: the overpowering flash's frame came out dark and blue, the
+     * LED not yet lit): waited for, up to 1.2 s, then a moment to settle. A flash that never
+     * brightens the picture (the scene too far) is shot all the same, and said.
+     */
+    private fun awaitTorch(before: Float, started: Long, shoot: () -> Unit) {
+        val now = meter?.key ?: 0f
+        val waited = SystemClock.uptimeMillis() - started
+        if (before <= 0f || now >= before * 1.15f) {
+            if (waited < 20) shoot()
+            else {
+                trail("闪光灯晚亮 $waited ms，等它亮了再拍")
+                main.postDelayed(shoot, 120)
+            }
+            return
+        }
+        if (waited >= 1200) {
+            trail("闪光灯 1.2 秒内没让画面变亮（太远或没亮）：照常拍")
+            status.text = "闪光没有照亮画面（太远或没亮），这张可能偏暗"
+            shoot()
+            return
+        }
+        main.postDelayed({ awaitTorch(before, started, shoot) }, 40)
     }
 
     private fun awaitExposure(controller: FilmExposure, target: Exposure, deadline: Long, then: () -> Unit) {
@@ -4383,6 +5384,503 @@ class CameraActivity : ComponentActivity() {
      * further in to clear it. A choice slides the accent plate there and the strip folds
      * back into the button; a tap on the picture, back, or a few idle seconds fold it too.
      */
+    /**
+     * The studio: the tools that are more than the camera (the light table, the film shelf), the
+     * Photo All series and who made it. New features come in here too.
+     */
+    private fun showStudio() {
+        coach?.event("tools")
+        val version = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: ""
+        val panel = org.photoall.film.ui.StudioPanel.build(this, version,
+            onPresets = { studioSheet?.dismiss(); showPresets() },
+            onEngine = { studioSheet?.dismiss(); tuneBench.launch(Intent(this, org.photoall.film.gallery.TuneActivity::class.java)) },
+            onShutterSound = { studioSheet?.dismiss(); showShutterSounds() },
+            onFocal = { studioSheet?.dismiss(); showFocalLengths() },
+            onLightbox = { startActivity(Intent(this, org.photoall.film.gallery.LightboxActivity::class.java)) },
+            onShelf = { startActivity(Intent(this, org.photoall.film.ui.ShelfActivity::class.java)) },
+            open = { url -> runCatching { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))) } })
+        studioSheet = org.photoall.film.ui.Sheet(this, "工具", android.widget.ScrollView(this).apply { addView(panel) }, fixedHeight = 0.82f)
+        studioSheet?.show()
+    }
+    private var studioSheet: org.photoall.film.ui.Sheet? = null
+
+    /**
+     * 调参台: opened from the tools; asked from there for a RAW of the main camera, the next
+     * RAW shot is copied for it and the bench opens again on it (the shot is kept as usual).
+     */
+    @Volatile private var tuneShot = false
+    private val tuneBench = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode != org.photoall.film.gallery.TuneActivity.RESULT_SHOOT) return@registerForActivityResult
+        if (!rawCapture) {
+            android.widget.Toast.makeText(this, "调参台要用 RAW：先在设置里打开「RAW（DNG）拍摄」，或从相册选一张", android.widget.Toast.LENGTH_LONG).show()
+            return@registerForActivityResult
+        }
+        tuneShot = true
+        android.widget.Toast.makeText(this, "拍一张 RAW，拍完自动回到调参台", android.widget.Toast.LENGTH_LONG).show()
+    }
+
+    /** Worker thread: a copy of [dng] for the bench, which then opens on it. */
+    private fun handTuneShot(save: (File) -> Unit) {
+        if (!tuneShot) return
+        tuneShot = false
+        runCatching {
+            val file = File(cacheDir, "tune_source.dng")
+            save(file)
+            main.post {
+                tuneBench.launch(Intent(this, org.photoall.film.gallery.TuneActivity::class.java)
+                    .putExtra(org.photoall.film.gallery.TuneActivity.EXTRA_DNG, file.path))
+            }
+        }.onFailure { org.photoall.film.CrashReport.note(this, "调参台取 RAW 失败", it) }
+    }
+
+    /** A preset in a line: of the parts it holds, film, paper, LUT and the exposure. */
+    private fun presetSummary(v: Map<String, Float>): String {
+        fun value(key: String) = v[key] ?: store[key]
+        fun on(key: String) = value(key) >= 0.5f
+        fun idx(key: String, size: Int) = value(key).toInt().coerceIn(0, maxOf(0, size - 1))
+        val parts = mutableListOf<String>()
+        if ("film" in v || Settings.FILM_ON in v)
+            parts += if (on(Settings.FILM_ON)) CanisterView.displayName(FilmEngine.filmStocks[idx("film", FilmEngine.filmStocks.size)]) else "直出"
+        if ("paper" in v || Settings.PRINT_ON in v)
+            parts += if (on(Settings.PRINT_ON)) paperName(FilmEngine.papers[idx("paper", FilmEngine.papers.size)]) else "直接扫描"
+        if (Settings.LUT in v || Settings.LUT_ON in v) {
+            val lut = idx(Settings.LUT, LutLibrary.count)
+            parts += if (on(Settings.LUT_ON) && lut != 0) LutLibrary.name(lut) + " " + (value(Settings.LUT_STRENGTH) * 100).roundToInt() + "%" else "无 LUT"
+        }
+        if (Settings.MANUAL in v)
+            parts += if (on(Settings.MANUAL)) "手动 ISO ${Settings.iso(value(Settings.ISO))} · ${Settings.shutterLabel(value(Settings.SHUTTER))}" else "自动曝光"
+        return parts.joinToString(" · ").ifEmpty { Presets.Part.values().filter { p -> v.keys.any { Presets.partOf(it) == p } }.joinToString("、") { it.label } }
+    }
+
+    /**
+     * Long press on the tools capsule: the presets float up beside it; without lifting the
+     * finger, slide onto one and let go to put it on (or onto 「管理预设」 to open the page).
+     * Let go anywhere else and nothing changes. A plain tap still opens the tools.
+     */
+    private val presetPeekTouch = object : View.OnTouchListener {
+        private var downX = 0f
+        private var downY = 0f
+        private var peek: FrameLayout? = null
+        private var rows: List<Pair<View, () -> Unit>> = emptyList()
+        private var hovered: View? = null
+        private var longPressed = false
+        private val slop by lazy { android.view.ViewConfiguration.get(this@CameraActivity).scaledTouchSlop }
+        private var anchor: View? = null
+        private val longPress = Runnable { anchor?.let { open(it) } }
+
+        @android.annotation.SuppressLint("ClickableViewAccessibility")
+        override fun onTouch(v: View, e: android.view.MotionEvent): Boolean {
+            when (e.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX; downY = e.rawY; longPressed = false; anchor = v
+                    v.isPressed = true
+                    main.postDelayed(longPress, android.view.ViewConfiguration.getLongPressTimeout().toLong())
+                }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    if (longPressed) hover(e.rawX, e.rawY)
+                    else if (Math.hypot((e.rawX - downX).toDouble(), (e.rawY - downY).toDouble()) > slop * 2) {
+                        // a drag that is not a long press: no tap either, as before
+                        main.removeCallbacks(longPress); v.isPressed = false
+                    }
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    main.removeCallbacks(longPress)
+                    val wasPressed = v.isPressed
+                    v.isPressed = false
+                    if (longPressed) {
+                        val pick = rows.firstOrNull { it.first === hovered }?.second
+                        close()
+                        pick?.invoke()
+                    } else if (wasPressed) v.performClick()
+                }
+                android.view.MotionEvent.ACTION_CANCEL -> { main.removeCallbacks(longPress); v.isPressed = false; close() }
+            }
+            return true
+        }
+
+        private fun open(v: View) {
+            if (isFinishing || !v.isAttachedToWindow) return
+            longPressed = true
+            v.isPressed = false
+            v.parent?.requestDisallowInterceptTouchEvent(true)
+            haptics.play(Haptics.Event.LOCKED)
+            coach?.event("tools")
+            val root = window.decorView as? FrameLayout ?: return
+            val presets = Presets.list(this@CameraActivity).take(6)
+            val card = LinearLayout(this@CameraActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 18f, stroke = Style.HAIRLINE)
+                elevation = dp(10).toFloat()
+            }
+            card.addView(TextView(this@CameraActivity).apply {
+                text = if (presets.isEmpty()) "还没有预设" else "滑到预设上松开即换上"
+                textSize = 11f; setTextColor(Style.TEXT_3)
+                setPadding(dp(12), dp(4), dp(12), dp(6))
+            })
+            val made = mutableListOf<Pair<View, () -> Unit>>()
+            fun row(title: String, detail: String?, accent: Boolean, swatch: Map<String, Float>? = null, action: () -> Unit) {
+                val r = LinearLayout(this@CameraActivity).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    minimumHeight = dp(48)
+                    setPadding(dp(10), dp(7), dp(12), dp(7))
+                    if (swatch != null) addView(PresetSwatch(presetStock(swatch)), LinearLayout.LayoutParams(dp(22), dp(30)).apply { marginEnd = dp(10) })
+                }
+                val texts = LinearLayout(this@CameraActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(this@CameraActivity).apply {
+                        text = title; textSize = 15f; typeface = Style.medium
+                        setTextColor(if (accent) Style.ACCENT else Style.TEXT)
+                        maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+                    })
+                    detail?.let { d -> addView(TextView(this@CameraActivity).apply {
+                        text = d; textSize = 11f; setTextColor(Style.TEXT_2)
+                        maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+                    }) }
+                }
+                r.addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+                card.addView(r, LinearLayout.LayoutParams(-1, -2))
+                made += r to action
+            }
+            for (preset in presets) row(preset.name, presetSummary(preset.values), false, preset.values) {
+                val changed = Presets.apply(preset, store)
+                haptics.play(Haptics.Event.SEGMENT)
+                status.text = if (changed == 0) "已经是预设「${preset.name}」" else "已换上预设「${preset.name}」"
+            }
+            row(if (presets.isEmpty()) "存当前设置为预设…" else "管理预设…", null, true) { showPresets() }
+            rows = made
+            hovered = null
+            val layer = FrameLayout(this@CameraActivity)
+            val w = minOf(dp(260), root.width - dp(24))
+            layer.addView(card, FrameLayout.LayoutParams(w, -2))
+            root.addView(layer, FrameLayout.LayoutParams(-1, -1))
+            peek = layer
+            // beside the capsule: below it when there is room, else above; kept on screen
+            val at = IntArray(2); v.getLocationInWindow(at)
+            card.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(root.height, View.MeasureSpec.AT_MOST))
+            val h = card.measuredHeight
+            val below = at[1] + v.height + dp(8)
+            val y = if (below + h <= root.height - dp(12)) below else (at[1] - h - dp(8)).coerceAtLeast(dp(12))
+            val x = at[0].coerceIn(dp(12), maxOf(dp(12), root.width - w - dp(12)))
+            card.x = x.toFloat(); card.y = y.toFloat()
+            card.pivotX = (at[0] + v.width / 2f - x).coerceIn(0f, w.toFloat())
+            card.pivotY = if (y >= below) 0f else h.toFloat()
+            card.alpha = 0f; card.scaleX = 0.92f; card.scaleY = 0.92f
+            card.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(150)
+                .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+        }
+
+        private fun hover(x: Float, y: Float) {
+            val at = IntArray(2)
+            val over = rows.firstOrNull { (r, _) ->
+                r.getLocationOnScreen(at)
+                x >= at[0] && x < at[0] + r.width && y >= at[1] && y < at[1] + r.height
+            }?.first
+            if (over === hovered) return
+            hovered?.background = null
+            hovered = over
+            over?.background = Style.surface(this@CameraActivity, fill = Style.SURFACE_2, radiusDp = 12f)
+            if (over != null) haptics.play(Haptics.Event.TICK)
+        }
+
+        private fun close() {
+            val layer = peek ?: return
+            peek = null; rows = emptyList(); hovered = null; longPressed = false
+            layer.animate().alpha(0f).setDuration(120).withEndAction { (layer.parent as? android.view.ViewGroup)?.removeView(layer) }.start()
+        }
+    }
+
+    /** A film's label as a small swatch (its box colours and ISO); a plain one without film. */
+    private inner class PresetSwatch(stock: String?) : View(this@CameraActivity) {
+        private val look = stock?.let { org.photoall.film.ui.FilmLabel.of(it) }
+        private val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        private val r = android.graphics.RectF()
+        override fun onDraw(c: android.graphics.Canvas) {
+            val d = resources.displayMetrics.density
+            r.set(0f, 0f, width.toFloat(), height.toFloat())
+            val rad = 7 * d
+            if (look == null) {
+                p.color = Style.SURFACE_2; c.drawRoundRect(r, rad, rad, p)
+                p.color = Style.TEXT_3; p.strokeWidth = 1.5f * d
+                c.drawLine(width * 0.32f, height / 2f, width * 0.68f, height / 2f, p)
+                return
+            }
+            p.color = look.base; c.drawRoundRect(r, rad, rad, p)
+            c.save(); val clip = android.graphics.Path().apply { addRoundRect(r, rad, rad, android.graphics.Path.Direction.CW) }; c.clipPath(clip)
+            p.color = look.band; c.drawRect(0f, height * 0.56f, width.toFloat(), height * 0.80f, p)
+            c.restore()
+            p.color = look.ink; p.textAlign = android.graphics.Paint.Align.CENTER
+            p.typeface = android.graphics.Typeface.create("sans-serif-condensed", android.graphics.Typeface.BOLD)
+            p.textSize = 11 * d
+            c.drawText(look.iso.ifEmpty { "·" }, width / 2f, height * 0.44f, p)
+        }
+    }
+
+    /** The film a preset (or the settings now) shows on its swatch: null for none or 直出. */
+    private fun presetStock(v: Map<String, Float>?): String? {
+        fun value(key: String) = v?.get(key) ?: store[key]
+        if (v != null && "film" !in v && Settings.FILM_ON !in v) return null
+        if (value(Settings.FILM_ON) < 0.5f) return null
+        return FilmEngine.filmStocks[value("film").toInt().coerceIn(0, FilmEngine.filmStocks.lastIndex)]
+    }
+
+    /**
+     * Presets, on one page: the settings now with a name field and 保存 (keeping film, paper
+     * and LUT unless 「保存内容」 says more, on a second level); below, the presets — tap to put one
+     * on, 「⋯」 for rename, overwrite and delete in place. The picture behind is not dimmed, and
+     * the page is as tall as what it holds.
+     */
+    private fun showPresets() {
+        val defaultParts = setOf(Presets.Part.FILM, Presets.Part.PAPER, Presets.Part.LUT)
+        val chosen = defaultParts.toMutableSet()
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, 0, dp(8)) }
+        var sheet: org.photoall.film.ui.Sheet? = null
+        var opened = -1 // the preset whose actions are showing
+        var renaming = -1
+        var confirmDelete = -1
+        var page = 0 // 0 the presets, 1 what a new preset keeps
+        var draftName: String? = null
+
+        fun label(text: String, size: Float, color: Int, medium: Boolean = false) = TextView(this).apply {
+            this.text = text; textSize = size; setTextColor(color); if (medium) typeface = Style.medium
+        }
+        fun pill(text: String, filled: Boolean, onClick: () -> Unit) = TextView(this).apply {
+            this.text = text; textSize = 13f; typeface = Style.medium; gravity = Gravity.CENTER
+            setTextColor(if (filled) Style.BG else Style.TEXT)
+            setPadding(dp(14), 0, dp(14), 0)
+            background = Style.surface(this@CameraActivity, fill = if (filled) Style.ACCENT else Style.SURFACE_2, radiusDp = 12f)
+            Style.pressable(this)
+            setOnClickListener { onClick() }
+        }
+        fun field(start: String) = android.widget.EditText(this).apply {
+            setText(start); setSelection(start.length)
+            isSingleLine = true; textSize = 15f
+            setTextColor(Style.TEXT); setHintTextColor(Style.TEXT_3)
+            hint = "预设名称"
+            setPadding(dp(12), 0, dp(12), 0)
+            background = Style.surface(this@CameraActivity, fill = Style.BG, radiusDp = 12f)
+            filters = arrayOf(android.text.InputFilter.LengthFilter(24))
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+        }
+        fun partsText(parts: Set<Presets.Part>) = Presets.Part.values().filter { it in parts }.joinToString(" · ") { it.label }
+
+        lateinit var render: () -> Unit
+        fun freeName(base: String): String {
+            val names = Presets.list(this).map { it.name }.toSet()
+            if (base !in names) return base
+            var n = 2
+            while ("$base $n" in names) n++
+            return "$base $n"
+        }
+
+        fun mainPage() {
+            // the settings now, and saving them
+            val now = Presets.capture(store, chosen)
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(14), dp(14), dp(12))
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 16f, stroke = Style.HAIRLINE)
+            }
+            card.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(PresetSwatch(presetStock(null)), LinearLayout.LayoutParams(dp(30), dp(40)))
+                addView(LinearLayout(this@CameraActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(12), 0, 0, 0)
+                    addView(label("当前设置", 11f, Style.TEXT_3))
+                    addView(label(presetSummary(now), 14f, Style.TEXT, medium = true).apply {
+                        maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(0, dp(2), 0, 0)
+                    })
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+            })
+            val name = field(draftName ?: freeName(presetSummary(now).substringBefore(" · ").ifEmpty { "预设" }))
+            name.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(e: android.text.Editable?) { draftName = e?.toString() }
+            })
+            fun save() {
+                val n = name.text.toString().trim().ifEmpty { freeName("预设") }
+                Presets.add(this, n, store, chosen)
+                haptics.play(Haptics.Event.LOCKED)
+                status.text = "已存为预设「$n」"
+                draftName = null
+                (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).hideSoftInputFromWindow(name.windowToken, 0)
+                render()
+            }
+            name.setOnEditorActionListener { _, _, _ -> save(); true }
+            card.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(name, LinearLayout.LayoutParams(0, dp(44), 1f))
+                addView(pill("保存", true) { save() }, LinearLayout.LayoutParams(-2, dp(44)).apply { marginStart = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+            card.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(10), 0, 0)
+                addView(label("保存内容", 12f, Style.TEXT_3))
+                addView(label(partsText(chosen), 12f, Style.TEXT_2).apply {
+                    maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(dp(8), 0, dp(8), 0)
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+                addView(label("更改 ›", 12f, Style.ACCENT, medium = true))
+                Style.pressable(this)
+                setOnClickListener { page = 1; render() }
+            })
+            root.addView(card, LinearLayout.LayoutParams(-1, -2))
+
+            // the presets
+            val presets = Presets.list(this)
+            if (presets.isEmpty()) return
+            root.addView(label("已存的预设 · ${presets.size}", 12f, Style.TEXT_3).apply { setPadding(dp(4), dp(18), 0, dp(8)) })
+            for ((i, preset) in presets.withIndex()) {
+                val current = Presets.matches(preset, store)
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 14f, stroke = if (current) Style.ACCENT else Style.HAIRLINE)
+                }
+                val head = LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(12), dp(10), dp(4), dp(10))
+                    addView(PresetSwatch(presetStock(preset.values)), LinearLayout.LayoutParams(dp(26), dp(36)))
+                    val texts = LinearLayout(this@CameraActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dp(12), 0, dp(4), 0)
+                    }
+                    if (renaming == i) {
+                        val edit = field(preset.name)
+                        fun done() {
+                            Presets.rename(this@CameraActivity, i, edit.text.toString().trim().ifEmpty { preset.name })
+                            (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).hideSoftInputFromWindow(edit.windowToken, 0)
+                            renaming = -1; opened = -1; render()
+                        }
+                        edit.setOnEditorActionListener { _, _, _ -> done(); true }
+                        texts.addView(LinearLayout(this@CameraActivity).apply {
+                            gravity = Gravity.CENTER_VERTICAL
+                            addView(edit, LinearLayout.LayoutParams(0, dp(40), 1f))
+                            addView(pill("完成", true) { done() }, LinearLayout.LayoutParams(-2, dp(40)).apply { marginStart = dp(6) })
+                        })
+                        edit.post { edit.requestFocus() }
+                    } else {
+                        texts.addView(LinearLayout(this@CameraActivity).apply {
+                            gravity = Gravity.CENTER_VERTICAL
+                            addView(label(preset.name, 15f, Style.TEXT, medium = true).apply {
+                                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+                            }, LinearLayout.LayoutParams(0, -2, 1f))
+                            if (current) addView(label("当前", 11f, Style.ACCENT, medium = true).apply { setPadding(dp(6), 0, 0, 0) })
+                        })
+                        texts.addView(label(presetSummary(preset.values), 12f, Style.TEXT_2).apply {
+                            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(0, dp(2), 0, 0)
+                        })
+                        if (preset.parts != defaultParts) texts.addView(label("含 " + partsText(preset.parts), 11f, Style.TEXT_3).apply {
+                            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(0, dp(1), 0, 0)
+                        })
+                    }
+                    addView(texts, LinearLayout.LayoutParams(0, -2, 1f))
+                    if (renaming != i) addView(label("⋯", 20f, if (opened == i) Style.ACCENT else Style.TEXT_2).apply {
+                        gravity = Gravity.CENTER
+                        contentDescription = "更多操作"
+                        Style.pressable(this)
+                        setOnClickListener { opened = if (opened == i) -1 else i; confirmDelete = -1; render() }
+                    }, LinearLayout.LayoutParams(dp(44), dp(44)))
+                    if (renaming != i) {
+                        Style.pressable(this)
+                        setOnClickListener {
+                            val changed = Presets.apply(preset, store)
+                            haptics.play(Haptics.Event.SEGMENT)
+                            status.text = if (changed == 0) "已经是预设「${preset.name}」" else "已换上预设「${preset.name}」"
+                            sheet?.dismiss()
+                            studioSheet?.dismiss()
+                        }
+                    }
+                }
+                row.addView(head)
+                if (opened == i && renaming != i) row.addView(LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(12), 0, dp(12), dp(12))
+                    addView(pill("重命名", false) { renaming = i; render() }, LinearLayout.LayoutParams(0, dp(38), 1f))
+                    addView(pill("用当前覆盖", false) {
+                        Presets.update(this@CameraActivity, i, store)
+                        haptics.play(Haptics.Event.LOCKED)
+                        status.text = "预设「${preset.name}」已更新"
+                        opened = -1; render()
+                    }, LinearLayout.LayoutParams(0, dp(38), 1.3f).apply { marginStart = dp(6) })
+                    addView(pill(if (confirmDelete == i) "确定删除" else "删除", confirmDelete == i) {
+                        if (confirmDelete == i) {
+                            Presets.delete(this@CameraActivity, i)
+                            haptics.play(Haptics.Event.LOCKED)
+                            opened = -1; confirmDelete = -1
+                        } else confirmDelete = i
+                        render()
+                    }, LinearLayout.LayoutParams(0, dp(38), 1f).apply { marginStart = dp(6) })
+                })
+                root.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+            }
+        }
+
+        fun partsPage() {
+            root.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(label("‹ 返回", 14f, Style.ACCENT, medium = true).apply {
+                    setPadding(dp(4), dp(8), dp(12), dp(8))
+                    Style.pressable(this)
+                    setOnClickListener { page = 0; render() }
+                })
+                addView(View(this@CameraActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(label("恢复默认", 13f, Style.TEXT_2).apply {
+                    setPadding(dp(12), dp(8), dp(4), dp(8))
+                    Style.pressable(this)
+                    setOnClickListener { chosen.clear(); chosen += defaultParts; render() }
+                })
+            })
+            root.addView(label("新预设保存哪些", 16f, Style.TEXT, medium = true).apply { setPadding(dp(4), dp(6), 0, dp(2)) })
+            root.addView(label("默认只存胶片、相纸与 LUT；套用预设时只改它存了的部分。", 12f, Style.TEXT_3).apply { setPadding(dp(4), 0, 0, dp(10)) })
+            val what = mapOf(
+                Presets.Part.FILM to "胶卷与胶片模拟开关",
+                Presets.Part.PAPER to "相纸与印放开关",
+                Presets.Part.LUT to "LUT、开关与强度",
+                Presets.Part.DEVELOP to "胶片与相纸曝光、反差、颗粒、光晕、滤色等全部冲洗参数",
+                Presets.Part.EXPOSURE to "自动 / 手动、ISO、快门、白平衡、测光、胶片测光、闪光强度",
+                Presets.Part.DENOISE to "RAW 降噪与彩色降噪",
+                Presets.Part.FRAME to "边框样式、片边文字与日期印",
+            )
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(2), dp(10), dp(2))
+                background = Style.surface(this@CameraActivity, fill = Style.SURFACE, radiusDp = 16f, stroke = Style.HAIRLINE)
+            }
+            for ((k, part) in Presets.Part.values().withIndex()) {
+                if (k > 0) box.addView(Style.hairline(this), LinearLayout.LayoutParams(-1, 1))
+                box.addView(LinearLayout(this).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    minimumHeight = dp(56)
+                    addView(LinearLayout(this@CameraActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(0, dp(8), dp(8), dp(8))
+                        addView(label(part.label, 15f, Style.TEXT))
+                        addView(label(what[part] ?: "", 11f, Style.TEXT_3).apply { setPadding(0, dp(1), 0, 0) })
+                    }, LinearLayout.LayoutParams(0, -2, 1f))
+                    addView(android.widget.Switch(this@CameraActivity).apply {
+                        Style.switch(this)
+                        isChecked = part in chosen
+                        setOnCheckedChangeListener { _, on ->
+                            if (on) chosen += part
+                            else if (chosen.size > 1) chosen -= part
+                            else { isChecked = true; status.text = "至少保存一项" }
+                        }
+                    })
+                })
+            }
+            root.addView(box, LinearLayout.LayoutParams(-1, -2))
+        }
+
+        render = {
+            root.removeAllViews()
+            if (page == 0) mainPage() else partsPage()
+        }
+        render()
+        sheet = org.photoall.film.ui.Sheet(this, "预设", root, dimmed = false)
+        sheet?.show()
+    }
+
     private fun showFlashModes(anchor: View) {
         if (flashDock != null) { closeFlashModes(); return }
         if (exposure?.hasFlash != true) {
@@ -4734,16 +6232,34 @@ class CameraActivity : ComponentActivity() {
         val sheet = Sheet(this, "拍摄设置", body)
         fun build() {
             body.removeAllViews()
-            body.addView(sheetTitle("闪光"))
-            val mode = flashMode()
-            val hasFlash = exposure?.hasFlash == true
-            body.addView(Segmented(this, Settings.flashModes).apply {
-                enabled = { i -> hasFlash && (i != Settings.FLASH_OVERPOWER || rawCapture) }
-                onBlocked = { haptics.play(Haptics.Event.ERROR) }
-                select(mode, animate = false)
-                onPick = { i -> store[Settings.FLASH] = i.toFloat(); haptics.play(Haptics.Event.SEGMENT) }
+            // 引擎参数: the engine presets saved from the 调参台, one tap each (the flash is on the lightning key)
+            body.addView(sheetTitle("引擎参数"))
+            val engine = Presets.engine(this)
+            // single choice: only the chip last tapped is lit, even when two hold the same values
+            val selected = Presets.engineSelected(this, store)
+            body.addView(org.photoall.film.ui.FlowRow(this, dp(8), dp(8)).apply {
+                addView(chip("默认", selected == 0L) {
+                    Presets.setEngineActive(this@CameraActivity, 0L)
+                    if (Presets.resetEngine(store) > 0) {
+                        haptics.play(Haptics.Event.SEGMENT)
+                        android.widget.Toast.makeText(this@CameraActivity, "引擎参数回到默认", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    body.post { build() }
+                }, android.view.ViewGroup.LayoutParams(-2, dp(36)))
+                for ((_, p) in engine) addView(chip(p.name, selected == p.created) {
+                    Presets.setEngineActive(this@CameraActivity, p.created)
+                    if (Presets.apply(p, store) > 0) {
+                        haptics.play(Haptics.Event.SEGMENT)
+                        android.widget.Toast.makeText(this@CameraActivity, "换上「${p.name}」：接下来的照片按它冲洗", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    body.post { build() }
+                }, android.view.ViewGroup.LayoutParams(-2, dp(36)))
+                addView(chip("调参台 ›", false) {
+                    sheet.dismiss()
+                    tuneBench.launch(Intent(this@CameraActivity, org.photoall.film.gallery.TuneActivity::class.java))
+                }, android.view.ViewGroup.LayoutParams(-2, dp(36)))
             }, LinearLayout.LayoutParams(-1, -2))
-            if (!hasFlash) body.addView(sheetNote("这个镜头没有闪光灯"))
+            if (engine.isEmpty()) body.addView(sheetNote("在调参台调好参数，点右上角「存为预设」，就能在这里一键切换"))
             val guides = store[Settings.GUIDES].toInt().coerceIn(0, Settings.guideNames.lastIndex)
             val focus = focusMode()
             body.addView(tileRow(
@@ -5177,7 +6693,7 @@ class CameraActivity : ComponentActivity() {
         viewfinder.soften = store[Settings.FINDER_SOFT]
         viewfinder.saturation = store[Settings.FINDER_SAT]
         viewfinder.grain = store[Settings.FINDER_GRAIN]
-        viewfinder.exposure = store[Settings.FINDER_EV]
+        syncFinderEv()
         viewfinder.setLut(if (store.flag(Settings.FINDER_LUT)) lastLut else null, 33)
         syncRecButton()
         org.photoall.film.reel.Reel.before = store[Settings.REEL_BEFORE]
@@ -5492,6 +7008,20 @@ class CameraActivity : ComponentActivity() {
         speedDial.asa = Settings.iso(asaSteps[bodyPrefs.getInt("asa", 2).coerceIn(0, asaSteps.lastIndex)].toFloat()).toString()
     }
 
+    /**
+     * A manual exposure, kept in the develop. A RAW is developed at the reference spektrafilm's
+     * exposure, its meter bringing every frame to mid-grey: right for auto, but on a manual
+     * shot it undid the setting (a night scene exposed dark came out lifted, its shadows noisy;
+     * vivo X200 Pro). The viewfinder's meter needle says how far the manual setting is from
+     * mid-grey: that much is put back. Auto exposure, a flash, an HDR burst: 0, as before.
+     */
+    private fun manualKept(controller: FilmExposure?, flash: Boolean, hdr: Boolean): Float {
+        if (controller?.manual == null || flash || hdr) return 0f
+        val key = meter?.key ?: return 0f
+        if (key <= 0f) return 0f
+        return (ln(key / 0.18f) / ln(2f)).coerceIn(-6f, 3f)
+    }
+
     /** The meter needle: how far what the viewfinder shows is from a mid-grey exposure. */
     private fun updateLightMeter() {
         val now = android.os.SystemClock.uptimeMillis()
@@ -5500,6 +7030,8 @@ class CameraActivity : ComponentActivity() {
         val key = meter?.key ?: return
         if (key <= 0f) return
         lightMeter.stops = (Math.log(key / 0.18) / Math.log(2.0)).toFloat()
+        // 旁轴, manual: the display's triangles
+        overlay.rfMeter = if (store.flag(Settings.MANUAL)) lightMeter.stops else null
     }
 
     /**
@@ -5558,7 +7090,8 @@ class CameraActivity : ComponentActivity() {
             col.addView(LinearLayout(this).apply {
                 gravity = Gravity.CENTER_VERTICAL
                 addView(flashIcon, LinearLayout.LayoutParams(dp(40), dp(40)))
-                addView(View(this@CameraActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                (studioEntry.parent as? android.view.ViewGroup)?.removeView(studioEntry)
+                addView(studioEntry, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(6); marginEnd = dp(6) })
                 addView(facingButton, LinearLayout.LayoutParams(dp(40), dp(40)))
             }, LinearLayout.LayoutParams(-1, dp(44)).apply { topMargin = dp(2) })
         }
@@ -5785,6 +7318,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     companion object {
+        /** Zoomed this far on the main camera, a telephoto's reach: the shot goes to JPEG (see settleZoomLens). */
+        private const val TELE_FROM = 1.8f
         private const val TURN_OUT = 150L // the controls draw back
         private const val TURN_IN = 320L  // the new controls come in
         private const val CURTAIN_SHUT = 0L  // the blackout is instant

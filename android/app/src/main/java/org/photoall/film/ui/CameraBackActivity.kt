@@ -37,6 +37,10 @@ class CameraBackActivity : Activity() {
             setBackgroundColor(Color.rgb(14, 13, 12))
             settings.javaScriptEnabled = true
             settings.allowFileAccess = true
+            // the camera model's textures are files beside the page: without this WebGL refuses them as
+            // cross-origin and the camera draws black (they are this app's own assets, nothing else loads)
+            @Suppress("DEPRECATION")
+            settings.allowFileAccessFromFileURLs = true
             overScrollMode = View.OVER_SCROLL_NEVER
             addJavascriptInterface(object {
                 @JavascriptInterface fun done() = runOnUiThread { finishWith(RESULT_OK) }

@@ -11,6 +11,10 @@ namespace film {
 struct RawImage
 {
   int width = 0, height = 0;
+  // 1: a Bayer mosaic (cfa holds width*height samples). 3: a linear DNG, already
+  // demosaiced (Samsung Expert RAW, Apple ProRAW): cfa holds width*height*3, RGB interleaved
+  // in camera space; black[0..2] and the white level are per channel then.
+  int channels = 1;
   std::vector<uint16_t> cfa;         // width*height samples, row-major
   int cfa_colour[4] = {0, 1, 1, 2};  // colour (0 R, 1 G, 2 B) at 2x2 positions (0,0) (1,0) (0,1) (1,1)
   float black[4] = {0, 0, 0, 0};     // per 2x2 position

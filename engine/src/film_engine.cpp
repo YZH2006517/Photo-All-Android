@@ -42,7 +42,8 @@ void report_stage(const char *stage)
 enum Kernel
 {
   kSetup, kDirlut, kFast, kExpose, kDevelop, kHalin, kHalout, kScatter, kNegprint,
-  kBlur, kDownsample, kDecode, kEncode, kRaw, kHpQuad, kHpPyramid, kHpAlign, kHpWarp, kHpMerge, kHpBayer, kFusion, kChroma, kDnHalf, kDnDowncov, kDnDown, kDnAssemble, kDnDoub, kFlashmix, kFlashfrac, kFlashwb, kKernelCount
+  kBlur, kDownsample, kDecode, kEncode, kRaw, kFusion, kChroma, kDnHalf, kDnDowncov, kDnDown, kDnAssemble, kDnDoub, kFlashmix, kFlashfrac, kFlashwb,
+  kDiffpick, kDiffuse, kFinish, kKernelCount
 };
 
 struct KernelSpec
@@ -54,16 +55,15 @@ struct KernelSpec
 
 constexpr KernelSpec kKernels[kKernelCount] = {
     {"setup", "SBS", 16},      {"dirlut", "IB", 0},       {"fast", "SBSI", 0},
-    {"expose", "SSBII", 0},    {"develop", "SBSSI", 0},   {"halin", "SBSI", 0},
-    {"halout", "SBSISSSSSS", 0}, {"scatter", "SISSSS", 0}, {"negprint", "SSBI", 0},
+    {"expose", "SSBII", 0},    {"develop", "SBSSI", 0},   {"halin", "SBI", 0},
+    {"halout", "SBSISSSSSSS", 0}, {"scatter", "SISSSS", 0}, {"negprint", "SSBI", 0},
     {"blur", "SI", 16},        {"downsample", "SI", 4},   {"decode", "SI", 96},
     {"encode", "SIS", 112},     {"raw", "SSI", 128},
-    {"hp_quad", "SI", 32},     {"hp_pyramid", "SI", 32},  {"hp_align", "SSSI", 32},
-    {"hp_warp", "SSI", 16},    {"hp_merge", "SSSSSSI", 56}, {"hp_bayer", "SI", 16},
     {"fusion", "SSSSI", 32},   {"chroma", "SSSI", 16},
     {"dn_half", "SI", 48},     {"dn_downcov", "SII", 16}, {"dn_down", "SI", 16},
     {"dn_assemble", "SSSSSI", 32}, {"dn_doub", "SSSI", 64},  {"flashmix", "SSI", 128},
     {"flashfrac", "SSI", 64},  {"flashwb", "SSI", 80},
+    {"diffpick", "SI", 16},    {"diffuse", "SSSI", 32},  {"finish", "SSI", 16},
 };
 constexpr int kMaxBurst = 6;
 // Timestamps: one before the passes and one after each, up to this many.
@@ -86,8 +86,68 @@ constexpr float kRec2020ToP3[9] = {1.343578f, -0.282180f, -0.061399f, -0.065297f
                                    -0.010490f, 0.002822f, -0.019598f, 1.016777f};
 constexpr float kIdentity[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
+// ---------------------------------------------------------------------------
+// The film's own light: the scene (D65, Rec.2020's white) is brought to the stock's
+// reference illuminant by a chromatic adaptation in CAT16 cone space (Li et al. 2017,
+// full adaptation), as the reference spektrafilm does, instead of filmsim's spectral
+// relighting. For a tungsten stock the two differ a lot (greens); measured on the chart,
+// Vision3 200T / 500T go from ΔE 5.0 / 5.5 to 2.3 / 2.5 against the reference.
+
+constexpr double kRec2020ToXyz[9] = {0.636958, 0.144617, 0.168881, 0.262700, 0.677998,
+                                     0.059302, 0.000000, 0.028073, 1.060985};
+constexpr double kCat16[9] = {0.401288, 0.650173, -0.051461, -0.250268, 1.204414,
+                              0.045854, -0.002079, 0.048952, 0.953127};
+constexpr double kD65Xy[2] = {0.3127, 0.3290};
+constexpr double kD55Xy[2] = {0.33242, 0.34743};      // CIE D55
+constexpr double kTungstenXy[2] = {0.45073, 0.40805}; // incandescent, about 2800 K
+constexpr float kD65Cct = 6504.0f;                    // filmsim: relighting to this is none
+
+void mul3(const double *a, const double *b, double *out)
+{
+  for(int r = 0; r < 3; r++)
+    for(int c = 0; c < 3; c++) out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+}
+
+void inv3(const double *m, double *out)
+{
+  const double a = m[4] * m[8] - m[5] * m[7], b = m[5] * m[6] - m[3] * m[8], c = m[3] * m[7] - m[4] * m[6];
+  const double det = m[0] * a + m[1] * b + m[2] * c;
+  out[0] = a / det; out[1] = (m[2] * m[7] - m[1] * m[8]) / det; out[2] = (m[1] * m[5] - m[2] * m[4]) / det;
+  out[3] = b / det; out[4] = (m[0] * m[8] - m[2] * m[6]) / det; out[5] = (m[2] * m[3] - m[0] * m[5]) / det;
+  out[6] = c / det; out[7] = (m[1] * m[6] - m[0] * m[7]) / det; out[8] = (m[0] * m[4] - m[1] * m[3]) / det;
+}
+
+// Rec.2020 (D65) -> Rec.2020 numbers of the same scene adapted to the film's white.
+void film_adaptation(int film, float out[9])
+{
+  const double *xy = film == 13 || film == 14 ? kTungstenXy : kD55Xy; // Vision3 200T, 500T
+  auto lms = [](const double *w, double *l) {
+    const double xyz[3] = {w[0] / w[1], 1.0, (1.0 - w[0] - w[1]) / w[1]};
+    for(int r = 0; r < 3; r++) l[r] = kCat16[r * 3] * xyz[0] + kCat16[r * 3 + 1] * xyz[1] + kCat16[r * 3 + 2] * xyz[2];
+  };
+  double src[3], dst[3];
+  lms(kD65Xy, src);
+  lms(xy, dst);
+  double cat_inv[9], xyz_to_rgb[9], scaled[9], t[9], u[9], m[9];
+  inv3(kCat16, cat_inv);
+  inv3(kRec2020ToXyz, xyz_to_rgb);
+  for(int r = 0; r < 3; r++)
+    for(int c = 0; c < 3; c++) scaled[r * 3 + c] = kCat16[r * 3 + c] * dst[r] / src[r];
+  mul3(scaled, kRec2020ToXyz, t);
+  mul3(cat_inv, t, u);
+  mul3(xyz_to_rgb, u, m);
+  for(int k = 0; k < 9; k++) out[k] = static_cast<float>(m[k]);
+}
+
 // filmsim constants from main.c.
 constexpr float kScatterCoreUm = 1.9333333f;
+constexpr float kGrainSizeMatch = 0.25f;
+constexpr float kGrainAmountMatch = 3.6f;
+constexpr float kHalationMatch = 0.3f;
+constexpr float kScatterMatch = 1.75f;
+// The DIR inhibitors' long tail (the reference's diffusion_tail_um and its weight).
+constexpr float kCouplerTailUm = 200.0f;
+constexpr float kCouplerTailWeight = 0.06f;
 constexpr float kScatterTailUm = 9.3666667f;
 constexpr float kScatterExpRatio[3] = {0.5360f, 1.5236f, 2.7684f};
 constexpr uint32_t kPrepBytes = 2048 * sizeof(float);
@@ -311,8 +371,14 @@ struct FilmEngine::Impl
     char value[256];
     va_list args;
     va_start(args, format);
-    std::vsnprintf(value, sizeof(value), format, args);
+    const int n = std::vsnprintf(value, sizeof(value), format, args);
     va_end(args);
+    if(n >= static_cast<int>(sizeof(value)))
+    { // cut short: never in the middle of a character (JNI refuses broken UTF-8 outright)
+      size_t end = sizeof(value) - 1;
+      while(end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80) end--;
+      value[end] = '\0';
+    }
     record += section;
     record += '\t';
     record += key;
@@ -734,7 +800,6 @@ struct FilmEngine::Impl
     for(int k = 0; k < kKernelCount; k++)
     {
       const KernelSpec &spec = kKernels[k];
-      if(!info.burst && std::strncmp(spec.name, "hp_", 3) == 0) continue; // left out, see create
       const ShaderBlob *blob = find_shader(info.safe_shaders ? (std::string(spec.name) + "_safe").c_str() : spec.name);
       if(!blob)
       {
@@ -894,6 +959,66 @@ struct FilmEngine::Impl
     return out;
   }
 
+  // A diffusion filter in front of the lens (diffpick.comp, diffuse.comp): what it spreads
+  // (all the light, or the highlights from a soft threshold), a near and a far blur of it,
+  // laid back over the scene with a share of the direct light taken away. Sizes are shares
+  // of the frame (a filter sits in front of the lens, so it scales with the picture).
+  //
+  // Pro-Mist, Black Pro-Mist and Cinebloom follow the reference spektrafilm's filters: all the
+  // light is spread and none is made (loss = gain), and the two blurs are fitted to the
+  // radial profile its filter gives a bright spot (+6 stops, 8 px across a 2400 px frame,
+  // strength 0.5; Portra 400 on Portra Endura). Its three-scale PSF (core, halo, bloom) does
+  // not fit two Gaussians exactly: Pro-Mist is within 0.05 of it from 2 to 56 px out, Black
+  // Pro-Mist within 0.03, Cinebloom within 0.07 (the bloom a little long). Glimmerglass, which
+  // the reference has not, keeps its own look.
+  int diffuse(Graph &g, int input, uint32_t w, uint32_t h, const Stages &s)
+  {
+    struct Preset { const char *name; float threshold, near_frac, far_frac, near_w, loss, gain, warm; };
+    static constexpr Preset kPresets[] = {
+        {"", 0, 0, 0, 0, 0, 0, 0},
+        // a broad halo and a long veil: lower contrast, haze over everything
+        {"柔焦（Pro-Mist）", 0.0f, 0.004f, 0.016f, 0.42f, 0.52f, 0.52f, 0.0f},
+        // a tight halo (95 um on the frame, about 6 px at 2400) and a short bloom
+        {"黑柔（Black Pro-Mist）", 0.0f, 0.0025f, 0.009f, 0.55f, 0.32f, 0.32f, 0.0f},
+        // tight sparkling halos round the brightest points
+        {"微光（Glimmerglass）", 0.9f, 0.003f, 0.012f, 0.75f, 0.04f, 0.6f, 0.0f},
+        // the bloom carrying most of it, wide and warm
+        {"泛光（Cinebloom）", 0.0f, 0.003f, 0.016f, 0.2f, 0.5f, 0.5f, 0.35f},
+    };
+    const Preset &p = kPresets[std::clamp(s.diffusion, 1, 4)];
+    const float long_edge = static_cast<float>(std::max(w, h));
+    struct { float threshold, knee, pad0, pad1; } pick{p.threshold, 2.0f, 0, 0};
+    const int picked = g.image(w, h);
+    g.pixels(kDiffpick, {img(input), img(picked)}, picked, pick);
+    const int near = g.blur(picked, p.near_frac * s.diff_size * long_edge, true);
+    const int far = g.blur(picked, p.far_frac * s.diff_size * long_edge, true);
+    const float warm = std::clamp(p.warm + s.diff_warm, -1.0f, 1.0f);
+    struct { float tint[4]; float amount, near_w, loss, gain; } mix{
+        {1.0f + 0.18f * warm, 1.0f, 1.0f - 0.22f * warm, 0.0f}, s.diff_amount, p.near_w, p.loss, p.gain};
+    static_assert(sizeof(mix) == 32, "diffuse push constants");
+    const int out = g.image(w, h);
+    g.pixels(kDiffuse, {img(input), img(near), img(far), img(out)}, out, mix);
+    note("光学", "扩散滤镜", "%s · 强度 %.2f · 大小 ×%.2f · 冷暖 %+.2f", p.name, s.diff_amount, s.diff_size, warm);
+    return out;
+  }
+
+  // The scanner (finish.comp): its softness, sharpening on luminance, black and white points;
+  // nothing at all while they are at rest.
+  int scanner_finish(Graph &g, int input, uint32_t w, uint32_t h, const Stages &s)
+  {
+    const bool soft = s.scan_blur > 0.05f, sharp = s.scan_sharp > 0.0f;
+    const bool levels = s.black > 0.0f || std::abs(s.white - 1.0f) > 1e-4f;
+    if(!soft && !sharp && !levels) return input;
+    const int base = soft ? g.blur(input, s.scan_blur, false) : input;
+    const int wide = sharp ? g.blur(base, s.scan_radius, false) : base;
+    struct { float sharpen, black, white, pad; } push{s.scan_sharp, s.black, std::max(s.white, s.black + 0.05f), 0};
+    const int out = g.image(w, h);
+    g.pixels(kFinish, {img(base), img(wide), img(out)}, out, push);
+    note("扫描", "扫描仪", "柔化 %.1f px · 锐化 %.2f（半径 %.1f px）· 黑点 %.3f · 白点 %.2f",
+         s.scan_blur, s.scan_sharp, s.scan_radius, s.black, s.white);
+    return out;
+  }
+
   // Chroma noise reduction of the scene-linear `input` (see chroma.comp): colour from a
   // Gaussian blur of 0.3% of the long edge (12 px at 4000), at luminance edges from one
   // of 0.05% (2 px); luminance untouched.
@@ -962,13 +1087,33 @@ struct FilmEngine::Impl
   // filmsim_make_plan(): the film (and, unless scanning, the print) as compute passes.
   int develop_film(Graph &g, const FilmParams &params, int input, uint32_t w, uint32_t h)
   {
+    if(adapt_input)
+    { // the decode pass as a plain matrix: linear in, no tone, no white balance
+      struct
+      {
+        Rows m;
+        int32_t srgb_eotf;
+        float gain;
+        float pad[2];
+        float tone[4];
+        float tone2[4];
+      } push{{}, 0, 1.0f, {0, 0}, {0, 1, 1, 1}, {1, 1, 1, 1}};
+      static_assert(sizeof(push) == 96, "decode push constants");
+      float m[9];
+      film_adaptation(params.film, m);
+      push.m = rows(m);
+      const int adapted = g.image(w, h);
+      g.pixels(kDecode, {img(input), img(adapted)}, adapted, push);
+      input = adapted;
+    }
     const bool print_neg = params.process == kProcessPrintNegative;
     const bool couplers = params.couplers > 0;
     const bool halation = params.halation != 0;
     const bool scatter = params.scat_amt > 0.0f;
     const bool use_curvewarp = couplers && !print_neg;
     const bool fastpath = !print_neg && !couplers && !halation;
-    const float um_to_px = static_cast<float>(std::max(w, h)) / FILMSIM_FRAME_WIDTH_UM;
+    const float frame_um = params.frame_um > 0.0f ? params.frame_um : FILMSIM_FRAME_WIDTH_UM;
+    const float um_to_px = static_cast<float>(std::max(w, h)) / frame_um;
     const float cp_sigma = params.couplers_radius * um_to_px;
     const float hal_sigma = params.halation_radius * um_to_px;
     const int hal_bounces = std::clamp(params.hal_bnc, 1, FILMSIM_MAX_HAL_BOUNCES);
@@ -1000,9 +1145,24 @@ struct FilmEngine::Impl
       const int exposure = g.image(w, h);
       g.pixels(kExpose, {img(input), kSpectraLut, kPrep, img(coupler), img(exposure)}, exposure);
       // Coupler inhibition is read with texture(): a low-resolution blur is fine.
-      const int coupler_blur = couplers ? g.blur(coupler, cp_sigma, true) : coupler;
+      int coupler_blur = couplers ? g.blur(coupler, cp_sigma, true) : coupler;
+      if(couplers && cp_sigma > 0.0f)
+      { // the inhibitors' long reach, as the reference's: 6% of them spread far (an exponential
+        // tail of 200 um, as a Gaussian of the same spread), the rest as before
+        const int tail = g.blur(coupler, kCouplerTailUm * 1.41421356f * um_to_px, true);
+        // at the near blur's own size (diffuse.comp reads its first input texel for texel)
+        const LogicalImage near_size = g.images[coupler_blur];
+        const int mixed = g.image(near_size.width, near_size.height);
+        struct { float tint[4]; float amount, near_w, loss, gain; } mix{
+            {1.0f, 1.0f, 1.0f, 0.0f}, 1.0f, 1.0f, kCouplerTailWeight, kCouplerTailWeight};
+        // diffuse.comp: in * (1 - loss) + mix(far, near, near_w) * gain; here in = near = the
+        // near blur, so near_w = 0 for the tail: in * (1 - w) + tail * w
+        mix.near_w = 0.0f;
+        g.pixels(kDiffuse, {img(coupler_blur), img(coupler_blur), img(tail), img(mixed)}, mixed, mix);
+        coupler_blur = mixed;
+      }
       const int dev1 = g.image(w, h);
-      if(halation) g.pixels(kHalin, {img(exposure), kPrep, img(coupler_blur), img(dev1)}, dev1);
+      if(halation) g.pixels(kHalin, {img(exposure), kPrep, img(dev1)}, dev1);
       else g.pixels(kDevelop, {img(exposure), kPrep, img(cwarp), img(coupler_blur), img(dev1)}, dev1);
       developed = dev1;
       if(halation)
@@ -1023,7 +1183,8 @@ struct FilmEngine::Impl
           hal[k] = k < hal_bounces ? g.blur(source_exposure, hal_sigma * std::sqrt(k + 1.0f), true) : hal[0];
         developed = g.image(w, h);
         g.pixels(kHalout, {img(source_exposure), kPrep, cwarp >= 0 ? img(cwarp) : kFilmsimLut, img(developed),
-                           img(hal[0]), img(hal[1]), img(hal[2]), img(hal[3]), img(hal[4]), img(hal[5])},
+                           img(hal[0]), img(hal[1]), img(hal[2]), img(hal[3]), img(hal[4]), img(hal[5]),
+                           img(coupler_blur)},
                  developed);
       }
     }
@@ -1031,144 +1192,28 @@ struct FilmEngine::Impl
     return developed;
   }
 
-  // HDR+ burst merge (Hasinoff et al. 2016), ported from hdr-plus-swift (GPL-3.0; see
-  // shaders/hdrplus/README.md): every frame as RGBA quads at the reference exposure; a
-  // grey pyramid per frame; tile alignment from the coarsest level down; each frame
-  // warped onto the reference; then the robust merge in the frequency domain, four runs
-  // on half-tile shifted grids. Returns the merged mosaic (R32_UINT, 0..kMergeScale).
-  int burst_merge(Graph &g, const SourceImage &source, const RawImage &raw, int frames)
-  {
-    const uint32_t qw = raw.width / 2, qh = raw.height / 2;
-    std::vector<int> quads;
-    for(int i = 0; i < frames; i++)
-    {
-      const RawImage &f = *source.burst[i];
-      struct
-      {
-        float black[4];
-        float white, gain, pad0, pad1;
-      } push{};
-      static_assert(sizeof(push) == 32, "hp_quad push constants");
-      std::memcpy(push.black, f.black, sizeof(push.black));
-      push.white = f.white;
-      push.gain = i < static_cast<int>(alignment.gain.size()) ? alignment.gain[i] : 1.0f;
-      const int q = g.image(qw, qh);
-      g.pixels(kHpQuad, {upload(i), img(q)}, q, push);
-      quads.push_back(q);
-    }
-    // Pyramid: level 0 is the quads' grey; halve while the shorter side exceeds 64,
-    // with tiles of 32, 16 and then 8 pixels (hdr-plus-swift's "medium" settings).
-    std::vector<int> tile{32};
-    for(uint32_t r = std::min(qw, qh); r > 64; r /= 2) tile.push_back(std::max(tile.back() / 2, 8));
-    struct
-    {
-      float balance[4];
-      int32_t mode, pad0, pad1, pad2;
-    } pyr{};
-    static_assert(sizeof(pyr) == 32, "hp_pyramid push constants");
-    float mean_wb = 0.0f;
-    for(int k = 0; k < 4; k++) mean_wb += 0.25f * raw.wb[raw.cfa_colour[k]];
-    for(int k = 0; k < 4; k++) pyr.balance[k] = raw.wb[raw.cfa_colour[k]] / mean_wb;
-    std::vector<std::vector<int>> levels(frames);
-    for(int i = 0; i < frames; i++)
-    {
-      int level = g.image(qw, qh);
-      pyr.mode = 0;
-      g.pixels(kHpPyramid, {img(quads[i]), img(level)}, level, pyr);
-      levels[i].push_back(level);
-      for(size_t l = 1; l < tile.size(); l++)
-      {
-        const LogicalImage &above = g.images[levels[i].back()];
-        const int next = g.image((above.width + 1) / 2, (above.height + 1) / 2);
-        pyr.mode = 1;
-        g.pixels(kHpPyramid, {img(levels[i].back()), img(next)}, next, pyr);
-        levels[i].push_back(next);
-      }
-    }
-    std::vector<int> aligned{quads[0]};
-    for(int i = 1; i < frames; i++)
-    {
-      int prev = -1;
-      int32_t prev_tiles[2] = {1, 1};
-      for(int l = static_cast<int>(tile.size()) - 1; l >= 0; l--)
-      {
-        const LogicalImage &level = g.images[levels[0][l]];
-        const int32_t nx = std::max<int32_t>(1, static_cast<int32_t>(level.width) / (tile[l] / 2) - 1);
-        const int32_t ny = std::max<int32_t>(1, static_cast<int32_t>(level.height) / (tile[l] / 2) - 1);
-        struct
-        {
-          int32_t tile, search, has_prev, ssd;
-          int32_t tiles[2], prev_tiles[2];
-        // L2 on the coarse levels; at the finest L1 on every other pixel each way (ssd 4).
-        } push{tile[l], l > 0 ? 2 : 1, prev >= 0, l > 0 ? 1 : 4, {nx, ny}, {prev_tiles[0], prev_tiles[1]}};
-        static_assert(sizeof(push) == 32, "hp_align push constants");
-        const int out = g.image(nx, ny);
-        // one workgroup per tile
-        g.pass(kHpAlign, {img(levels[0][l]), img(levels[i][l]), img(prev >= 0 ? prev : levels[0][l]), img(out)}, nx, ny,
-               push);
-        prev = out;
-        prev_tiles[0] = nx;
-        prev_tiles[1] = ny;
-      }
-      struct
-      {
-        int32_t half_tile, pad;
-        int32_t tiles[2];
-      } warp_push{tile[0] / 2, 0, {prev_tiles[0], prev_tiles[1]}};
-      static_assert(sizeof(warp_push) == 16, "hp_warp push constants");
-      const int a = g.image(qw, qh);
-      g.pixels(kHpWarp, {img(quads[i]), img(prev), img(a)}, a, warp_push);
-      aligned.push_back(a);
-    }
-    // Noise of the reference (normalised units); without a NoiseProfile, a typical phone
-    // sensor at mid ISO. Denoising leans harder on agreeing tiles in the dark (Liba et
-    // al. 2019: 1 in daylight up to ~6 at night), here from the noise at mid grey.
-    const float s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
-    const float o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
-    const float sigma = std::sqrt(s * 0.18f + o);
-    struct
-    {
-      int32_t frames, first;
-      int32_t shift[2];
-      float noise_s, noise_o, strength, max_motion;
-      float gain[6];
-    } merge{};
-    static_assert(sizeof(merge) == 56, "hp_merge push constants");
-    merge.frames = frames;
-    merge.noise_s = s;
-    merge.noise_o = o;
-    merge.strength = merge_strength;
-    merge.max_motion = std::clamp(1.0f + (sigma - 0.003f) / 0.002f, 1.0f, 6.0f);
-    for(int i = 0; i < 6; i++)
-      merge.gain[i] = i < frames && i < static_cast<int>(alignment.gain.size()) ? alignment.gain[i] : 1.0f;
-    note("合并", "算法", "HDR+ 频域合并（hdr-plus-swift 移植）：%d 层金字塔，分块 %d px", static_cast<int>(tile.size()), 2 * tile[0]);
-    note("合并", "噪声 σ(18%) / 强度 / 静止区加强", "%.4f / %.1f / %.2f", sigma, merge.strength, merge.max_motion);
-    const int acc = g.image(qw, qh, VK_FORMAT_R32G32B32A32_SFLOAT);
-    std::vector<Ref> bindings{img(aligned[0])};
-    for(int i = 1; i < 6; i++) bindings.push_back(img(aligned[i < frames ? i : 0]));
-    bindings.push_back(img(acc));
-    for(int run = 0; run < 4; run++)
-    {
-      merge.first = run == 0;
-      merge.shift[0] = (run & 1) * 4;
-      merge.shift[1] = (run >> 1) * 4;
-      g.pass(kHpMerge, bindings, (qw + merge.shift[0] + 7) / 8, (qh + merge.shift[1] + 7) / 8, merge);
-    }
-    const int out = g.image(raw.width, raw.height, VK_FORMAT_R32_UINT);
-    struct
-    {
-      float scale;
-      int32_t pad0, pad1, pad2;
-    } bayer{kMergeScale, 0, 0, 0};
-    g.pixels(kHpBayer, {img(acc), img(out)}, out, bayer);
-    return out;
-  }
-
   Graph build_graph(const FilmParams &params, uint32_t w, uint32_t h, const SourceImage &source,
                     const DevelopOptions &options, int &output)
   {
     Graph g;
     const int input = g.image(w, h);
+    // How much of the denoise strengths a RAW needs: its own noise at mid grey (the DNG noise
+    // model at the raw level that prints as mid grey, after this develop's exposure; merged
+    // frames lower it). A clean daylight frame (noise under 1 %) gets none, so its fine detail
+    // and colour stay; from 5 % (high ISO, low light) the full strengths, as set.
+    float nr_factor = 1.0f;
+    float nr_noise = 0.0f;
+    if(source.raw)
+    {
+      const RawImage &r = *source.raw;
+      const float s = r.noise_scale > 0 ? r.noise_scale : 2e-4f;
+      const float o = r.noise_scale > 0 ? r.noise_offset : 2e-6f;
+      const float mid = std::clamp(0.184f / std::exp2(options.exposure_ev), 1e-4f, 1.0f);
+      const float merged = source.burst_count >= 2 && !options.flash.enabled ? 0.5f * source.burst_count : 1.0f;
+      nr_noise = std::sqrt(s * mid + o) / mid / std::sqrt(std::max(merged, 1.0f));
+      nr_factor = std::clamp((nr_noise - 0.01f) / 0.04f, 0.0f, 1.0f);
+    }
+    const float raw_nr = options.raw_denoise * nr_factor, chroma_nr = options.chroma_denoise * nr_factor;
     struct
     {
       Rows m;
@@ -1194,7 +1239,12 @@ struct FilmEngine::Impl
       note("场景还原", "白平衡（色温 / 色调）", "%+.2f / %+.2f", options.stages.temp, options.stages.tint);
     }
     if(source.rgba8 && options.stages.restore > 0.0f)
-      decode.gain *= choose_restore(source, std::min(options.stages.restore, 1.0f), decode.tone, decode.tone2);
+    {
+      // its tone constants always; its auto exposure only while metering (imports may turn it off)
+      const float restore_gain = choose_restore(source, std::min(options.stages.restore, 1.0f), decode.tone, decode.tone2);
+      if(options.stages.meter) decode.gain *= restore_gain;
+      else note("场景还原", "自动曝光", "关（不测光，亮度按原图）");
+    }
     if(source.raw)
     {
       const RawImage &raw = *source.raw;
@@ -1230,17 +1280,7 @@ struct FilmEngine::Impl
       // Flash white balance: frame 0 is the flash frame, frame 1 the ambient one (not merged).
       const bool white_map = options.flash_white.enabled && !flash && source.burst_count == 2;
       const int ambient_frames = white_map ? 1 : std::min(source.burst_count, kMaxBurst) - (flash ? 1 : 0);
-      // without the merge kernels (left out on this GPU) the reference frame stands alone
-      const bool merge = ambient_frames > 1 && info.burst;
-      if(merge)
-      { // merge first; the merged mosaic is black-subtracted, at frame 0's exposure, and spans 0..kMergeScale
-        const int frames = ambient_frames;
-        note("合并", "合并帧数", "%d", frames);
-        const int merged = burst_merge(g, source, raw, frames);
-        sensor = img(merged);
-        for(float &b : push.black) b = 0.0f;
-        push.wb_white[3] = kMergeScale;
-      }
+      // no burst merge (the HDR+ merge was taken out): the reference frame stands alone
       float noise_gain = 1.0f; // how much the mixes scaled the signal (and so its noise)
       if(white_map)
       {
@@ -1323,7 +1363,8 @@ struct FilmEngine::Impl
         push.wb_white[3] = kMergeScale;
         noise_gain = std::max(options.flash.ambient, flash_gain);
       }
-      if(options.raw_denoise > 0.0f && raw.width >= 64 && raw.height >= 64)
+      note("降噪", "按噪声自适应", "中灰噪声 %.1f%%，降噪用设定的 %.0f%%", 100.0f * nr_noise, 100.0f * nr_factor);
+      if(raw_nr > 0.0f && raw.width >= 64 && raw.height >= 64)
       {
         // Noise model of the reference frame (DNG NoiseProfile, normalised units). A merge
         // averages frames: the variance drops by the frames' total light relative to the
@@ -1331,14 +1372,7 @@ struct FilmEngine::Impl
         // keep a real merge from reaching it.
         const float s = raw.noise_scale > 0 ? raw.noise_scale : 2e-4f;
         const float o = raw.noise_scale > 0 ? raw.noise_offset : 2e-6f;
-        float frames = 1.0f;
-        if(merge)
-        {
-          float light = 0.0f;
-          for(int i = 0; i < ambient_frames; i++)
-            light += i < static_cast<int>(alignment.gain.size()) && alignment.gain[i] > 0 ? 1.0f / alignment.gain[i] : 1.0f;
-          frames = 1.0f + 0.5f * (light - 1.0f);
-        }
+        float frames = 1.0f; // one frame: nothing merged
         const float o_gain = noise_gain;
         const float wb[3] = {raw.wb[0], raw.wb[1], raw.wb[2]};
         // vkdt fits its noise profile on values normalised to [0, 1] but compares it with
@@ -1350,11 +1384,11 @@ struct FilmEngine::Impl
         // Scaling the signal by k scales the noise variance s x + o into k s x + k^2 o.
         const float kappa2 = kappa * kappa;
         frames /= noise_gain;
-        note("降噪", "RAW 降噪 (vkdt)", "强度 %.2f，σ 刻度 κ %.1f，合并等效帧 %.2f，信号增益 %.2f", options.raw_denoise, kappa,
+        note("降噪", "RAW 降噪 (vkdt)", "强度 %.2f，σ 刻度 κ %.1f，合并等效帧 %.2f，信号增益 %.2f", raw_nr, kappa,
              frames * noise_gain, noise_gain);
         note("降噪", "使用的噪声模型 (s o)", "%.4g %.4g", s, o);
         const int denoised = raw_denoise(g, sensor, raw.width, raw.height, push.black, push.wb_white[3], raw.cfa_colour,
-                                         wb, kappa2 * o * o_gain / frames, kappa2 * s / frames, std::min(options.raw_denoise, 1.0f));
+                                         wb, kappa2 * o * o_gain / frames, kappa2 * s / frames, std::min(raw_nr, 1.0f));
         sensor = img(denoised);
         for(float &b : push.black) b = 0.0f;
         push.wb_white[3] = kMergeScale;
@@ -1375,23 +1409,33 @@ struct FilmEngine::Impl
     else g.pixels(kDecode, {kUpload, img(input)}, input, decode);
 
     int scene = input;
-    note("降噪", "彩色降噪", options.chroma_denoise > 0 ? "%.2f" : "关", options.chroma_denoise);
+    note("降噪", "彩色降噪", chroma_nr > 0 ? "%.2f" : "关", chroma_nr);
     note("影调", "HDR 影调压缩（曝光融合）", options.local_tone > 0 ? "%.2f" : "关", options.local_tone);
+    if(!options.stages.film) note("影调", "不用胶片时的影调", options.stages.display && source.rgba8 ? "原样（成品照片）" : "中性曲线（场景光）");
     note("冲洗曝光", "工作尺寸", "%ux%u（长边上限 %d）", w, h, options.max_long_edge);
-    if(options.chroma_denoise > 0.0f)
-      scene = chroma_denoise(g, scene, w, h, std::min(options.chroma_denoise, 1.0f));
+    if(chroma_nr > 0.0f)
+      scene = chroma_denoise(g, scene, w, h, std::min(chroma_nr, 1.0f));
     if(options.local_tone > 0.0f) scene = local_tone(g, scene, w, h);
+    // the lens filter and the scanner belong to the film: without it (直出) the picture is left alone
+    if(options.stages.film && options.stages.diffusion > 0 && options.stages.diff_amount > 0.0f)
+      scene = diffuse(g, scene, w, h, options.stages);
 
     // Film off: the scene itself under the camera-like display curve. The same for a raw
     // and for the viewfinder's frames (the camera is asked for a plain sRGB curve, so
     // they are scene light too): the viewfinder then shows what the shot will be.
     int developed = scene;
-    int mode = 1;
+    // a finished picture (an import) without film: as it came, no tone curve over it
+    int mode = options.stages.display && source.rgba8 ? 0 : 1;
     if(options.stages.film)
     {
       developed = develop_film(g, params, scene, w, h);
+      // grain is laid down and then spread a little by the developer, as the reference does
+      if(params.grain != 0 && params.process != kProcessPrintNegative)
+        developed = g.blur(developed, options.stages.grain_blur, false);
       // Print off: slides are positive already; negatives get the lab-scan inversion.
       mode = !options.stages.print && !is_positive_film(params.film) ? 2 : 0;
+      // "stage negative": the scan as it is, no inversion (encode.comp's mode 3 passes it through)
+      if(mode == 2 && options.stages.negative) mode = 3;
     }
     if(options.calibrate) mode = 3;
 
@@ -1403,10 +1447,20 @@ struct FilmEngine::Impl
       float scan[3][4]; // negative scan: mid grey log2 transmittance, slope, toe
     } encode{rows(options.output == ColourSpace::DisplayP3 ? kRec2020ToP3 : kRec2020ToSrgb),
              {creative_size > 1 && !options.calibrate ? creative_strength : 0.0f, static_cast<float>(creative_size),
-              static_cast<float>(mode), 0},
+              static_cast<float>(mode),
+              // the film's output softly into the display's gamut (see encode.comp)
+              options.stages.film && options.stages.gamut && !options.calibrate ? 1.0f : 0.0f},
              {}};
     static_assert(sizeof(encode) == 112, "encode push constants");
     if(mode == 2) std::memcpy(encode.scan, scan_cal, sizeof(scan_cal));
+    // a print or a slide: its own base white, its deepest density black (see calibrate_print)
+    if(mode == 0 && (print_m != 1.0f || print_q != 0.0f))
+    {
+      encode.scan[0][0] = print_q;
+      encode.scan[0][1] = print_m;
+      encode.scan[0][2] = 1.0f;
+    }
+    if(options.stages.film) developed = scanner_finish(g, developed, w, h, options.stages);
     g.pixels(kEncode, {img(developed), img(output), kCreative}, output, encode);
     return g;
   }
@@ -1541,6 +1595,81 @@ struct FilmEngine::Impl
     record.clear();
     laps.clear();
     lap_start = std::chrono::steady_clock::now();
+    // A linear DNG (Samsung Expert RAW, Apple ProRAW): demosaiced already, so no mosaic work;
+    // its camera RGB balanced, into Rec.2020, and on as scene light. Metered the reference's
+    // way here (its centre-weighted mean to mid grey, never below the file's own exposure).
+    float linear_ev = 0.0f;
+    bool linear = false;
+    // (the app hands even a single frame over as a burst of one)
+    if(!src.raw && src.burst && src.burst_count == 1 && src.burst[0]->channels == 3)
+    {
+      src.raw = src.burst[0];
+      src.burst = nullptr;
+      src.burst_count = 0;
+    }
+    if(src.raw && src.raw->channels == 3)
+    {
+      if(src.burst && src.burst_count > 1)
+      {
+        error = "linear DNGs are not merged";
+        return false;
+      }
+      const RawImage &r = *src.raw;
+      if(r.cfa.size() != static_cast<size_t>(r.width) * r.height * 3)
+      {
+        error = "linear DNG data does not match its size";
+        return false;
+      }
+      int f = 1; // a box of f x f while it is still twice the working size
+      while(std::max(r.width, r.height) / (2 * f) >= options.max_long_edge && f < 16) f *= 2;
+      const int w = r.width / f, h = r.height / f;
+      linear_buffer.assign(static_cast<size_t>(w) * h * 4, 1.0f);
+      const float *m = r.camera_to_rec2020;
+      float scale[3];
+      for(int c = 0; c < 3; c++) scale[c] = r.wb[c] / std::max(r.white - r.black[c], 1.0f) / float(f * f);
+      for(int y = 0; y < h; y++)
+        for(int x = 0; x < w; x++)
+        {
+          float v[3] = {0, 0, 0};
+          for(int dy = 0; dy < f; dy++)
+            for(int dx = 0; dx < f; dx++)
+            {
+              const uint16_t *s3 = &r.cfa[(static_cast<size_t>(y * f + dy) * r.width + x * f + dx) * 3];
+              for(int c = 0; c < 3; c++) v[c] += std::max(float(s3[c]) - r.black[c], 0.0f);
+            }
+          // balanced, held at white as the mosaic's develop holds it (blown highlights neutral)
+          for(int c = 0; c < 3; c++) v[c] = std::min(v[c] * scale[c], 1.0f);
+          float *o = &linear_buffer[(static_cast<size_t>(y) * w + x) * 4];
+          for(int k = 0; k < 3; k++) o[k] = std::max(0.0f, m[k * 3] * v[0] + m[k * 3 + 1] * v[1] + m[k * 3 + 2] * v[2]);
+        }
+      if(options.match_key != 0.0f)
+      { // the centre-weighted mean (sigma 0.2 of the long edge), as raw_center_mean
+        const float longest = float(std::max(w, h));
+        double sum = 0, weights = 0;
+        for(int y = 0; y < h; y += 4)
+          for(int x = 0; x < w; x += 4)
+          {
+            const float *o = &linear_buffer[(static_cast<size_t>(y) * w + x) * 4];
+            const double dx = (x + 0.5 - w / 2.0) / longest, dy = (y + 0.5 - h / 2.0) / longest;
+            const double wt = std::exp(-(dx * dx + dy * dy) / (2 * 0.2 * 0.2));
+            sum += wt * (0.2627 * o[0] + 0.6780 * o[1] + 0.0593 * o[2]);
+            weights += wt;
+          }
+        const float mean = weights > 0 ? float(sum / weights) : 0.0f;
+        if(mean > 0.0f) linear_ev = std::clamp(-std::log2(mean / 0.184f), 0.0f, 6.0f);
+        note("冲洗曝光", "线性 DNG 测光（中央重点）", "测光 %.4f → %+.2f EV（不低于文件曝光）", mean, linear_ev);
+      }
+      note("RAW 数据", "线性 DNG", "%dx%d，已去马赛克（%s），工作尺寸 %dx%d", r.width, r.height,
+           f > 1 ? "先按 2 的倍数缩小" : "原尺寸", w, h);
+      src.raw = nullptr;
+      src.burst = nullptr;
+      src.burst_count = 0;
+      src.rgba32f = linear_buffer.data();
+      src.width = w;
+      src.height = h;
+      src.space = ColourSpace::LinearRec2020;
+      linear = true;
+    }
     // Flash white balance: develop the flash frame (given last), compare the ambient one.
     const RawImage *white_order[2] = {nullptr, nullptr};
     const bool white_map = options.flash_white.enabled && !options.flash.enabled && source.burst &&
@@ -1635,7 +1764,7 @@ struct FilmEngine::Impl
     {
       src.width = src.raw->width;
       src.height = src.raw->height;
-      if(src.raw->cfa.size() != static_cast<size_t>(src.width) * src.height)
+      if(src.raw->cfa.size() != static_cast<size_t>(src.width) * src.height * src.raw->channels)
       {
         error = "raw image data does not match its size";
         return false;
@@ -1647,6 +1776,14 @@ struct FilmEngine::Impl
       return false;
     }
     DevelopOptions opts = options;
+    if(linear)
+    {
+      opts.exposure_ev += linear_ev;
+      opts.match_key = 0.0f;
+      // denoised already by the phone that merged it
+      opts.raw_denoise = 0.0f;
+      opts.chroma_denoise = 0.0f;
+    }
     // a file's own push (BaselineExposure), when nothing else sets the brightness: imports
     if(src.raw && opts.stages.baseline && src.raw->baseline_ev != 0.0f)
     {
@@ -1656,16 +1793,24 @@ struct FilmEngine::Impl
     if(src.raw && opts.match_key < 0.0f)
     {
       // The reference's exposure: spektrafilm meters the frame (centre-weighted mean to 0.184)
-      // and prints at its normalised print exposure. This engine's print lands 0.73 stop
-      // brighter for the same scene exposure (measured against spektrafilm 0.3.4 on Galaxy
-      // DNGs: -0.73 +- 0.02 over Portra 800, Vision3 500T, Ektar, Gold): taken off here.
-      constexpr float kReferencePrintOffset = -0.73f;
+      // and prints at its normalised print exposure; at equal exposure this engine's print
+      // matches it. The meter reads the picture as developed, lens shading corrected: the
+      // reference's own RAW loader skips a DNG's gain map, so on phones it meters (and shows)
+      // dark corners. A fixed -0.73 stop once stood in for that, measured on Galaxy DNGs; each
+      // phone's map differs (a Red Magic's corners are 2 stops up, a drone's DNG has none).
       const float mean = raw_center_mean(*src.raw);
       if(mean > 0.0f)
       {
-        const float ev = std::clamp(-std::log2(mean / 0.184f) + kReferencePrintOffset, -6.0f, 6.0f);
+        const float metered = std::clamp(-std::log2(mean / 0.184f), -6.0f, 6.0f);
+        // Never below the exposure the frame was shot at: an averaging meter takes a bright
+        // scene (white walls, sky in the middle) for mid grey and sinks the rest a stop; the
+        // camera's own meter had judged that scene already. Lifting a dark frame stays.
+        const float ev = std::max(metered, 0.0f);
         opts.exposure_ev += ev;
-        note("冲洗曝光", "原版曝光（中央重点）", "测光 %.4f → %+.2f EV", mean, ev);
+        if(ev != metered)
+          note("冲洗曝光", "原版曝光（中央重点）", "测光 %.4f → %+.2f EV，不低于拍摄曝光：%+.2f EV", mean, metered, ev);
+        else
+          note("冲洗曝光", "原版曝光（中央重点）", "测光 %.4f → %+.2f EV", mean, ev);
       }
     }
     else if(src.raw && opts.match_key > 0.0f)
@@ -1798,6 +1943,135 @@ struct FilmEngine::Impl
   std::vector<ScanCalibration> scan_cache;
   float scan_cal[3][4] = {};
 
+  // A print is seen against its own paper. The scan's light was normalised to the lamp, as
+  // if a perfect white reflector lay beside the print, so the paper's base (about 0.7 of
+  // that on Portra Endura) became the print's ceiling and every print topped out near 218 of
+  // 255, the reference spektrafilm's default the same. The eye, and a lab scanner, take the
+  // paper for white: the scanner's white point goes on the paper (its luminance, found as
+  // the scan with and without the base), and the print is exposed denser so that mid grey
+  // still prints where the reference prints it. Colour stays; only the range between mid grey and the paper opens
+  // up, as the reference's white correction with its print exposure correction does.
+  // Black too, as the reference's black correction: the deepest the print (or slide) goes
+  // (unexposed film, so the paper's or the slide's full density) is set at the reference's
+  // black level, 0.01 on the sRGB curve, instead of floating a little grey. As there, one
+  // linear map of luminance, Y' = m Y + q, each pixel scaled by Y'/Y so its colour stays
+  // (encode.comp), and the exposure solved so that mid grey comes out where the reference's does.
+  struct PrintCalibration
+  {
+    FilmParams params;
+    ColourSpace output;
+    bool slide;
+    float m, q, ev;
+  };
+  std::vector<PrintCalibration> print_cache;
+  float print_m = 1.0f;  // Y' = m Y + q: the base onto white, the deepest density onto black
+  float print_q = 0.0f;
+  float print_ev = 0.0f; // the paper exposure (a slide: the film's) that keeps mid grey there
+
+  bool calibrate_print(const FilmParams &base, ColourSpace output, bool slide, std::string &error)
+  {
+    for(const PrintCalibration &c : print_cache)
+      if(c.output == output && c.slide == slide && std::memcmp(&c.params, &base, sizeof(FilmParams)) == 0)
+      {
+        print_m = c.m;
+        print_q = c.q;
+        print_ev = c.ev;
+        return true;
+      }
+    // the patches' own develops are not this frame's: its record and timings stay as they were
+    struct Keep
+    {
+      Impl &self;
+      std::string record, laps;
+      ~Keep() { self.record = std::move(record); self.laps = std::move(laps); }
+    } keep{*this, record, laps};
+    FilmParams p = base;
+    p.grain = 0;
+    p.halation = 0;
+    p.scat_amt = 0.0f;
+    p.glare = 0.0f;
+    p.couplers_radius = 0.0f;
+    constexpr int kPatch = 32;
+    std::vector<float> grid(static_cast<size_t>(kPatch) * kPatch * 4);
+    const float base_full = slide ? p.f_base : p.p_base;
+    // a flat patch of [scene] grey through this process, exposure moved by [ev], base scaled
+    // by [b]; its luminance as scanned
+    auto measure = [&](float scene, float ev, float b, float &y) {
+      for(size_t i = 0; i < grid.size(); i += 4)
+      {
+        grid[i] = grid[i + 1] = grid[i + 2] = scene;
+        grid[i + 3] = 1.0f;
+      }
+      FilmParams q = p;
+      (slide ? q.ev_film : q.ev_paper) += ev;
+      (slide ? q.f_base : q.p_base) = b;
+      SourceImage source;
+      source.width = kPatch;
+      source.height = kPatch;
+      source.rgba32f = grid.data();
+      source.space = ColourSpace::LinearRec2020;
+      DevelopOptions options;
+      options.max_long_edge = kPatch;
+      options.output = output;
+      options.calibrate = true;
+      options.stages.print = !slide;
+      options.stages.scan_sharp = 0.0f;
+      DevelopResult result;
+      if(!develop_source(source, q, options, result, error)) return false;
+      double sum[3] = {};
+      int n = 0;
+      for(int yy = 6; yy < kPatch - 6; yy++)
+        for(int x = 6; x < kPatch - 6; x++, n++)
+          for(int c = 0; c < 3; c++)
+            sum[c] += result.rgba8[(static_cast<size_t>(yy) * result.width + x) * 4 + c];
+      float lin[3];
+      for(int c = 0; c < 3; c++) lin[c] = std::exp2(static_cast<float>(sum[c] / n / 255.0 * 20.0 - 16.0));
+      y = 0.2126f * lin[0] + 0.7152f * lin[1] + 0.0722f * lin[2];
+      return true;
+    };
+    // The reference's anchors: an 18.4% grey in the scene prints where the reference prints it,
+    // 117.5 of 255 on the sRGB curve (17.8%, its print exposure normalisation, with or without
+    // its black/white correction), and the deepest density at its black level (0.01 on the
+    // sRGB curve, as linear light).
+    constexpr float kMidGrey = 0.184f;
+    constexpr float kMidGreyPrinted = 0.1785f;
+    constexpr float kBlack = 0.000774f;
+    constexpr float kHighlight = kMidGrey * 32.0f; // five stops over: far up the toe, near the base
+    // the base: a highlight scanned with its base and without; the deepest: no light at all
+    float with_base = 0.0f, bare = 0.0f, deepest = 0.0f, mid = 0.0f;
+    if(!measure(kHighlight, 0.0f, base_full, with_base) ||
+       !measure(kHighlight, 0.0f, 0.0f, bare) ||
+       !measure(0.0f, 0.0f, base_full, deepest) ||
+       !measure(kMidGrey, 0.0f, base_full, mid))
+      return false;
+    const float white = std::clamp(bare > 1e-6f ? with_base / bare : 1.0f, 0.3f, 1.0f);
+    const float black = std::clamp(deepest, 0.0f, white * 0.5f);
+    const float m = (1.0f - kBlack) / std::max(white - black, 1e-4f);
+    const float q = kBlack - m * black;
+    // the exposure that prints mid grey there under the map: secant steps in stops
+    auto miss = [&](float y) { return std::log2(std::max(m * y + q, 1e-6f) / kMidGreyPrinted); };
+    float e0 = 0.0f, f0 = miss(mid);
+    float e1 = 0.25f, y1 = 0.0f;
+    if(!measure(kMidGrey, e1, base_full, y1)) return false;
+    float f1 = miss(y1);
+    for(int i = 0; i < 4 && std::abs(f1) > 0.005f && std::abs(f1 - f0) > 1e-5f; i++)
+    {
+      const float e2 = std::clamp(e1 - f1 * (e1 - e0) / (f1 - f0), -1.5f, 2.5f);
+      float y2 = 0.0f;
+      if(!measure(kMidGrey, e2, base_full, y2)) return false;
+      e0 = e1; f0 = f1;
+      e1 = e2; f1 = miss(y2);
+    }
+    if(print_cache.size() >= 8) print_cache.erase(print_cache.begin());
+    print_cache.push_back({base, output, slide, m, q, e1});
+    print_m = m;
+    print_q = q;
+    print_ev = e1;
+    return true;
+  }
+  std::vector<float> linear_buffer; // a linear DNG as scene light (develop's own source then)
+  bool adapt_input = false; // this develop brings the scene to the film's white first
+
   bool calibrate_scan(const FilmParams &base, ColourSpace output, std::string &error)
   {
     for(const ScanCalibration &c : scan_cache)
@@ -1888,10 +2162,38 @@ struct FilmEngine::Impl
     FilmParams base = raw_params;
     if(scanning) base.process = kProcessScanNegative;
     FilmParams params = resolve_auto_balance(base);
+    // Grain at the reference spektrafilm's level: measured on flat greys (Portra 400, 4000 px),
+    // filmsim's own grain is about a third as strong and coarser. "size" and "grain amt" 1
+    // stay the user's neutral, these factors put that neutral where the reference is.
+    params.grain_size *= kGrainSizeMatch;
+    params.grain_amount *= kGrainAmountMatch;
+    // Halation and emulsion scatter at the reference's level (fitted on a bright spot at +2.4,
+    // +4 and +6 stops, Portra 400 on Portra Endura, now that halation comes before the
+    // inhibitors): the user's 1 and 0.2 stay the neutral settings.
+    params.halation_amount *= kHalationMatch;
+    params.scat_amt = std::min(1.0f, params.scat_amt * kScatterMatch);
+    // slides carry far weaker inhibitor couplers than negatives (the reference's own
+    // reversal coupler set is about a third of its negative one; fitted on 4 slide stocks)
+    // (slides have their own inhibitor matrix in setup.glsl; kPositiveCouplers is no longer used)
+    // the film's own light by chromatic adaptation (see film_adaptation); a light the user
+    // picked for the film ("film ill", a mismatched film and light) stays filmsim's relight
+    adapt_input = params.film_ill == 0.0f && params.process != kProcessPrintNegative;
+    if(adapt_input) params.film_ill = kD65Cct;
     // Before this frame's uniforms are written: calibration develops a frame of its own.
     if(scanning && !options.calibrate && !is_positive_film(params.film) &&
        !calibrate_scan(base, options.output, error))
       return false;
+    const bool printing = options.stages.film && options.stages.print;
+    if(!options.calibrate)
+    {
+      print_m = 1.0f;
+      print_q = 0.0f;
+      print_ev = 0.0f;
+      // a print, or a slide scanned as it is: both are seen against their own base
+      const bool slide = scanning && is_positive_film(params.film);
+      if((printing || slide) && !calibrate_print(base, options.output, slide, error)) return false;
+      (slide ? params.ev_film : params.ev_paper) += print_ev;
+    }
     params.enlarge = 0;
     params.input_colour = 0;
     std::memcpy(params_ubo.mapped, &params, sizeof(params));
@@ -2076,9 +2378,8 @@ struct FilmEngine::Impl
         if(queries && i + 1 < kMaxQueries)
           vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, static_cast<uint32_t>(i + 1));
         // A phone GPU stops a submission that runs for seconds (VK_ERROR_DEVICE_LOST):
-        // the heavy burst passes go one per submission, the rest in groups.
-        const bool heavy = pass.kernel == kHpAlign || pass.kernel == kHpMerge;
-        if(i + 1 < n_passes && (heavy || (i + 1) % 16 == 0))
+        // the passes go in groups.
+        if(i + 1 < n_passes && (i + 1) % 16 == 0)
         {
           ok = submit_and_wait(error) && begin(error);
           if(!ok) break;
@@ -2281,8 +2582,24 @@ bool parse_lut(const uint8_t *data, size_t size, Lut &out, std::string &error)
   return true;
 }
 
+// The lens-shading gain at a point (relative coordinates, the pixel's centre) for one 2x2
+// position, exactly as raw.comp samples it: the meters see the picture as it is developed.
+float raw_gain_at(const RawImage &raw, float rx, float ry, int position)
+{
+  if(raw.gain_map.empty() || raw.map_width < 2 || raw.map_height < 2) return 1.0f;
+  const float sx = raw.map_spacing[0] > 0 ? raw.map_spacing[0] : 1.0f;
+  const float sy = raw.map_spacing[1] > 0 ? raw.map_spacing[1] : 1.0f;
+  const float gx = std::clamp((rx - raw.map_origin[0]) / sx, 0.0f, float(raw.map_width - 1));
+  const float gy = std::clamp((ry - raw.map_origin[1]) / sy, 0.0f, float(raw.map_height - 1));
+  const int ix = std::min(int(gx), raw.map_width - 2), iy = std::min(int(gy), raw.map_height - 2);
+  const float fx = gx - ix, fy = gy - iy;
+  auto g = [&](int x, int y) { return raw.gain_map[(size_t(y) * raw.map_width + x) * 4 + position]; };
+  return (g(ix, iy) * (1 - fx) + g(ix + 1, iy) * fx) * (1 - fy) + (g(ix, iy + 1) * (1 - fx) + g(ix + 1, iy + 1) * fx) * fy;
+}
+
 float raw_key(const RawImage &raw)
 {
+  if(raw.channels != 1) return 0.0f; // a linear DNG is metered by develop itself
   // Sample a 128x96 grid of Bayer quads; same weighting as the app's preview meter.
   constexpr int kCols = 128, kRows = 96;
   const int qw = raw.width / 2, qh = raw.height / 2;
@@ -2292,15 +2609,7 @@ float raw_key(const RawImage &raw)
   const float yr = 0.2627f * m[0] + 0.6780f * m[3] + 0.0593f * m[6];
   const float yg = 0.2627f * m[1] + 0.6780f * m[4] + 0.0593f * m[7];
   const float yb = 0.2627f * m[2] + 0.6780f * m[5] + 0.0593f * m[8];
-  auto gain_at = [&](float rx, float ry, int position) {
-    if(raw.gain_map.empty() || raw.map_width < 2 || raw.map_height < 2) return 1.0f;
-    const float gx = std::clamp((rx - raw.map_origin[0]) / raw.map_spacing[0], 0.0f, float(raw.map_width - 1));
-    const float gy = std::clamp((ry - raw.map_origin[1]) / raw.map_spacing[1], 0.0f, float(raw.map_height - 1));
-    const int ix = std::min(int(gx), raw.map_width - 2), iy = std::min(int(gy), raw.map_height - 2);
-    const float fx = gx - ix, fy = gy - iy;
-    auto g = [&](int x, int y) { return raw.gain_map[(size_t(y) * raw.map_width + x) * 4 + position]; };
-    return (g(ix, iy) * (1 - fx) + g(ix + 1, iy) * fx) * (1 - fy) + (g(ix, iy + 1) * (1 - fx) + g(ix + 1, iy + 1) * fx) * fy;
-  };
+  auto gain_at = [&](float rx, float ry, int position) { return raw_gain_at(raw, rx, ry, position); };
   double log_sum = 0.0, weight_sum = 0.0;
   for(int r = 0; r < kRows; r++)
     for(int c = 0; c < kCols; c++)
@@ -2330,6 +2639,7 @@ float raw_key(const RawImage &raw)
 
 float raw_center_mean(const RawImage &raw)
 {
+  if(raw.channels != 1) return 0.0f; // a linear DNG is metered by develop itself
   constexpr int kCols = 128, kRows = 96;
   const int qw = raw.width / 2, qh = raw.height / 2;
   if(qw < kCols || qh < kRows) return 0.0f;
@@ -2351,7 +2661,10 @@ float raw_center_mean(const RawImage &raw)
         const float black = raw.black[position];
         float v = (raw.cfa[size_t(y) * raw.width + x] - black) / (raw.white - black);
         const int colour = raw.cfa_colour[position];
-        rgb[colour] += std::clamp(v * raw.wb[colour], 0.0f, 1.0f);
+        // with the lens shading corrected, as the develop does (a phone's corners can be
+        // two stops up): metered on the picture that is printed
+        const float gain = raw_gain_at(raw, (x + 0.5f) / raw.width, (y + 0.5f) / raw.height, position);
+        rgb[colour] += std::clamp(v * gain * raw.wb[colour], 0.0f, 1.0f);
         n[colour] += 1;
       }
       for(int k = 0; k < 3; k++) rgb[k] = n[k] > 0 ? rgb[k] / n[k] : 0.0f;
@@ -2366,6 +2679,7 @@ float raw_center_mean(const RawImage &raw)
 
 float raw_luminance_quantile(const RawImage &raw, float q)
 {
+  if(raw.channels != 1) return 0.0f; // a linear DNG is metered by develop itself
   // Every 4th Bayer quad each way, rendered as raw_key does (no shading map: the
   // quantile only needs the bright end, near the centre for most frames).
   const float *m = raw.camera_to_rec2020;

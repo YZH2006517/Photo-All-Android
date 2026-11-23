@@ -26,6 +26,10 @@ sealed class Setting(val key: String, val label: String, val group: String) {
 /** Every setting, in panel order. Film ranges follow filmsim's params.ui. */
 object Settings {
     const val RAW = "app.raw"
+    const val PUSH = "app.push"     // push / pull development, stops (+ push, - pull)
+    const val FORMAT = "app.format" // the negative's format: 135, half frame, 120 sizes
+    /** Each format's frame long edge, mm (filmsim's own scale is 35 for a 36 mm frame). */
+    val formatLongEdge = listOf(36f, 24f, 56f, 56f, 70f, 84f)
     const val RAW_EV = "app.rawev"
     const val KEEP_RAW = "app.keepraw"
     const val FINDER_SOFT = "app.finder.soft" // viewfinder: how much softer than the camera's picture
@@ -150,19 +154,20 @@ object Settings {
             Setting.Toggle(KEEP_RAW, "保存 RAW 格式（DNG 原片，可重新冲洗；打开会同时开启上面的 RAW 拍摄）", "相机", false),
             Setting.Toggle(PRIVATE_PHOTOS, "照片只存在本应用相册（不出现在手机相册；卸载或清除应用数据会一起删除）", "相机", false),
             Setting.Slider(RAW_EV, "RAW 冲洗曝光 EV", "相机", -3f, 3f, 0f),
-            Setting.Toggle(HDR, "HDR+ 多帧合成（实验 · 需 RAW · 部分机型可能不兼容）", "相机", false),
-            Setting.Slider(HDR_FRAMES, "HDR 短曝光帧数（加长曝光共最多 6 帧）", "相机", 2f, 6f, 5f, integer = true, format = "%.0f"),
-            Setting.Slider(HDR_UNDER, "HDR 最多欠曝档数（按取景器高光自动决定，不超过这个值）", "相机", 0f, 3f, 2f, format = "%.1f"),
-            Setting.Slider(HDR_LONG, "HDR 包围长曝光：比短曝光亮几档（暗部细节，0 = 不拍）", "相机", 0f, 4f, 2f, format = "%.1f"),
-            Setting.Slider(HDR_TONE, "HDR 影调：提亮暗部、收住高光（曝光融合，0 = 关）", "相机", 0f, 1f, 0.5f, format = "%.2f"),
+            // HDR+ is retired (its merge was GPL code, taken out for the CC BY-NC licence): no group, never shown
+            Setting.Toggle(HDR, "HDR+ 多帧合成（实验 · 需 RAW · 部分机型可能不兼容）", "", false),
+            Setting.Slider(HDR_FRAMES, "HDR 短曝光帧数（加长曝光共最多 6 帧）", "", 2f, 6f, 5f, integer = true, format = "%.0f"),
+            Setting.Slider(HDR_UNDER, "HDR 最多欠曝档数（按取景器高光自动决定，不超过这个值）", "", 0f, 3f, 2f, format = "%.1f"),
+            Setting.Slider(HDR_LONG, "HDR 包围长曝光：比短曝光亮几档（暗部细节，0 = 不拍）", "", 0f, 4f, 2f, format = "%.1f"),
+            Setting.Slider(HDR_TONE, "HDR 影调：提亮暗部、收住高光（曝光融合，0 = 关）", "", 0f, 1f, 0.5f, format = "%.2f"),
             Setting.Choice(FLASH, "闪光", "",
                 listOf("关", "闪光（单张，真闪光）", "补光（闪光灯常亮）", "压光（两帧合成，需 RAW）"), 0),
             Setting.Slider(FLASH_UNDER, "压光：环境光压暗档数", "闪光", 0.5f, 4f, 2f, format = "%.1f"),
             Setting.Slider(FLASH_FILL, "补光亮度（常亮档位，部分机型不可调）", "闪光", 0.1f, 1f, 1f, format = "%.2f"),
             Setting.Choice(FLASH_WHITE, "闪光白平衡", "闪光",
                 listOf("自动（闪光照到的地方按闪光，其余按室内光）", "统一按闪光（日光）", "统一按室内光"), 0),
-            Setting.Slider(CHROMA_NR, "RAW 彩色降噪（只平滑颜色，不动亮度细节；0 = 关）", "相机", 0f, 1f, 1f, format = "%.2f"),
-            Setting.Slider(RAW_DENOISE, "RAW 降噪（vkdt 小波降噪，去马赛克前按传感器噪声模型；0 = 关）", "相机", 0f, 0.6f, 0.3f, format = "%.2f"),
+            Setting.Slider(CHROMA_NR, "RAW 彩色降噪上限（噪点少时自动少降）", "相机", 0f, 1f, 1f, format = "%.2f"),
+            Setting.Slider(RAW_DENOISE, "RAW 降噪上限（噪点少时自动少降）", "相机", 0f, 0.6f, 0.3f, format = "%.2f"),
             Setting.Choice(LONG_EDGE, "冲洗尺寸（长边）", "相机", longEdges.map { if (it >= 8192) "原尺寸" else "$it" }, 2),
             Setting.Slider(JPEG_QUALITY, "JPEG 质量", "相机", 70f, 100f, 95f, integer = true, format = "%.0f"),
             Setting.Toggle(SOFT_3A, "胶片测光规则（手机测光引擎 + 测光模式/高光保护/胶片 ISO/标定白平衡）", "", false),
@@ -196,6 +201,7 @@ object Settings {
             Setting.Slider("g slow", "慢感光层反差", "胶片", 0.5f, 1.5f, 1f),
             Setting.Slider("exhaust", "显影液衰竭", "胶片", 0f, 1f, 0f),
             Setting.Slider("hl boost", "高光增强", "胶片", 0f, 10f, 0f),
+            Setting.Slider(PUSH, "推拉冲（+推 / −拉，档）", "胶片", -2f, 2f, 0f, integer = true, format = "%+.0f"),
 
             Setting.Toggle(PRINT_ON, "印放到相纸（关闭则直接扫描底片）", "", true),
             Setting.Choice("paper", "相纸", "", papers, 3),
@@ -206,6 +212,9 @@ object Settings {
             Setting.Slider("g slow p", "相纸慢层反差", "冲印", 0.5f, 1.5f, 1f),
             Setting.Slider("p exh", "相纸药液衰竭", "冲印", 0f, 1f, 0f),
             Setting.Slider("glare", "眩光", "冲印", 0f, 0.5f, 0f),
+            Setting.Slider("p gamma r", "相纸红层反差", "冲印", 0.5f, 1.5f, 1f),
+            Setting.Slider("p gamma g", "相纸绿层反差", "冲印", 0.5f, 1.5f, 1f),
+            Setting.Slider("p gamma b", "相纸蓝层反差", "冲印", 0.5f, 1.5f, 1f),
 
             Setting.Choice(BALANCE, "滤色方式", "放大机滤色",
                 listOf("保留胶片本色（统一滤色）", "自动中性（逐卷校正）", "手动"), 1),
@@ -221,10 +230,10 @@ object Settings {
             Setting.Slider("pf y", "预闪黄", "预闪", -1f, 1f, 0f),
 
             Setting.Toggle("couplers", "DIR 耦合剂", "耦合剂", true),
-            Setting.Slider("cp amt", "耦合剂强度", "耦合剂", 0f, 1f, 0.5f),
-            Setting.Slider("lang r", "红层抑制", "耦合剂", 0.01f, 2f, 1f),
-            Setting.Slider("lang g", "绿层抑制", "耦合剂", 0.01f, 2f, 1f),
-            Setting.Slider("lang b", "蓝层抑制", "耦合剂", 0.01f, 2f, 1f),
+            Setting.Slider("cp amt", "耦合剂强度", "耦合剂", 0f, 2f, 1f),
+            Setting.Slider("lang r", "红层抑制", "耦合剂", 0.01f, 3f, 1.5f),
+            Setting.Slider("lang g", "绿层抑制", "耦合剂", 0.01f, 3f, 1.5f),
+            Setting.Slider("lang b", "蓝层抑制", "耦合剂", 0.01f, 3f, 1.5f),
             Setting.Slider("cp rad", "扩散半径 µm", "耦合剂", 0f, 200f, 20f, format = "%.0f"),
 
             Setting.Toggle("halation", "光晕", "光晕", true),
@@ -239,8 +248,31 @@ object Settings {
             Setting.Slider("strength b", "蓝通道", "光晕", 0f, 2f, 1f),
 
             Setting.Toggle("grain", "颗粒", "颗粒", true),
-            Setting.Slider("size", "颗粒大小", "颗粒", 0.01f, 2.5f, 1f),
+            Setting.Slider("size", "颗粒大小", "颗粒", 0.01f, 2.5f, 0.5f),
             Setting.Slider("uniform", "颗粒均匀度", "颗粒", 0f, 1f, 1f),
+            Setting.Slider("grain amt", "颗粒强度（1 = 原版强度，0.5 = 减半）", "颗粒", 0f, 3f, 0.5f),
+
+            // a diffusion filter in front of the lens (the engine's diffuse pass)
+            Setting.Choice("stage diffusion", "扩散滤镜", "光学",
+                listOf("无", "柔焦 Pro-Mist", "黑柔 Black Pro-Mist", "微光 Glimmerglass", "泛光 Cinebloom"), 0),
+            Setting.Slider("stage diff amt", "滤镜强度", "光学", 0f, 1f, 0.5f),
+            Setting.Slider("stage diff size", "滤镜范围", "光学", 0.3f, 3f, 1f),
+            Setting.Slider("stage diff warm", "光晕冷暖（− 冷 / + 暖）", "光学", -1f, 1f, 0f),
+            // UV- and IR-cut filters in front of the film (the engine's camera band on the film's
+            // sensitivity, as the reference spektrafilm's filter_uv / filter_ir): off by default, as there
+            Setting.Slider("uv cut", "UV 截止滤镜（0 = 不加）", "光学", 0f, 1f, 0f, format = "%.2f"),
+            Setting.Slider("ir cut", "IR 截止滤镜（0 = 不加）", "光学", 0f, 1f, 0f, format = "%.2f"),
+
+            // the scanner after the print (the engine's finish pass)
+            Setting.Slider("stage scan blur", "扫描柔化（像素）", "扫描", 0f, 3f, 0f, format = "%.1f"),
+            Setting.Slider("stage scan sharp", "扫描锐化", "扫描", 0f, 2f, 0.3f),
+            Setting.Slider("stage scan radius", "锐化半径（像素）", "扫描", 0.5f, 5f, 0.7f, format = "%.1f"),
+            Setting.Slider("stage black", "黑点", "扫描", 0f, 0.1f, 0f, format = "%.3f"),
+            Setting.Slider("stage white", "白点", "扫描", 0.7f, 1.3f, 1f),
+
+            // the negative's size: grain, halation and coupler spread at their size on it
+            Setting.Choice(FORMAT, "画幅", "尺度",
+                listOf("135（36×24）", "半格（24×18）", "6×4.5", "6×6", "6×7", "6×9"), 0),
 
             Setting.Slider("scan ill", "扫描光源 K", "光源", 2000f, 10000f, 5000f, format = "%.0f"),
             Setting.Slider("scne ill", "场景光源 K（0=不校正）", "光源", 0f, 10000f, 0f, format = "%.0f"),
@@ -271,8 +303,24 @@ interface SettingValues {
         }
         // filmsim treats illuminants below its slider range as "off"
         for (key in listOf("scne ill", "film ill")) if (params.getValue(key) < 2000f) params[key] = 0f
+        // Push / pull: developed longer or shorter, so more or less contrast and coarser or
+        // finer grain, the shadows a little thinner when pushed; the brightness about the same.
+        val push = get(Settings.PUSH).coerceIn(-2f, 2f)
+        if (push != 0f) {
+            params["g film"] = (params.getValue("g film") * (1f + 0.12f * push)).coerceIn(0.4f, 1.8f)
+            params["size"] = (params.getValue("size") * (1f + 0.2f * push)).coerceIn(0.01f, 3f)
+            params["ev film"] = params.getValue("ev film") - 0.3f * push
+            params["ev paper"] = params.getValue("ev paper") - 0.2f * push
+        }
+        // the format: the frame's long edge on the negative, on filmsim's scale (35 for 135)
+        val format = get(Settings.FORMAT).toInt().coerceIn(0, Settings.formatLongEdge.lastIndex)
+        params["frame mm"] = 35f * Settings.formatLongEdge[format] / 36f
         // Which stages run (read by the engine bridge, not filmsim parameters).
         params["stage film"] = if (flag(Settings.FILM_ON)) 1f else 0f
+        // 直出 (and a LUT alone): the phone's own picture as it is, the LUT on it and nothing
+        // else (no tone curve meant for scene light); the camera then shoots JPEG in the
+        // phone's own rendering for it (CameraActivity.rawWanted, FilmExposure.systemTone)
+        if (!flag(Settings.FILM_ON)) params["stage display"] = 1f
         params["stage print"] = if (flag(Settings.PRINT_ON)) 1f else 0f
         return params
     }
@@ -315,9 +363,15 @@ class SettingsStore(context: Context) : SettingValues {
         if (prefs.getInt(SCHEMA, 1) < 8) { // HDR+ only by choice in the settings, after its warning: off for everyone
             prefs.edit().putFloat(Settings.HDR, 0f).putInt(SCHEMA, 8).apply()
         }
+        if (prefs.getInt(SCHEMA, 1) < 9) { // HDR+ retired: whoever had it on is told once (CameraActivity)
+            val wasOn = prefs.getFloat(Settings.HDR, 0f) >= 0.5f
+            prefs.edit().putFloat(Settings.HDR, 0f).putBoolean(HDR_RETIRED_NOTICE, wasOn).putInt(SCHEMA, 9).apply()
+        }
     }
 
-    override operator fun get(key: String): Float = prefs.getFloat(key, Settings.byKey.getValue(key).default)
+    override operator fun get(key: String): Float =
+        if (key == Settings.HDR) 0f // HDR+ retired: off whatever was stored
+        else prefs.getFloat(key, Settings.byKey.getValue(key).default)
 
     override operator fun set(key: String, value: Float) {
         prefs.edit().putFloat(key, value).apply()
@@ -338,7 +392,9 @@ class SettingsStore(context: Context) : SettingValues {
 
     val longEdge: Int get() = Settings.longEdges[get(Settings.LONG_EDGE).toInt().coerceIn(0, Settings.longEdges.lastIndex)]
 
-    private companion object {
-        const val SCHEMA = "schema"
+    companion object {
+        private const val SCHEMA = "schema"
+        /** Set when HDR+ was on as it was retired: the camera says so once. */
+        const val HDR_RETIRED_NOTICE = "hdr_retired_notice"
     }
 }

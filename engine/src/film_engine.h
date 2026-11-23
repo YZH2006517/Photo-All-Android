@@ -117,10 +117,11 @@ struct DeviceInfo
   uint32_t api_version = 0;
   uint32_t subgroup_size = 0;
   bool timestamps = false;
-  // false: the HDR+ merge kernels (hp_*) were left out, a burst develops its first frame only
+  // kept for the callers; the HDR+ merge is gone (retired with the GPL code), so a burst
+  // always develops its reference frame alone
   bool burst = true;
   // true: the unoptimised SPIR-V ("<kernel>_safe"), for a driver whose compiler crashed on
-  // the optimised kernels; the merge kernels are left out with it
+  // the optimised kernels
   bool safe_shaders = false;
 };
 
@@ -133,8 +134,8 @@ void set_stage_hook(void (*hook)(const char *stage));
 class FilmEngine
 {
 public:
-  // [burst_kernels] false leaves the HDR+ merge kernels out (a GPU driver that crashes
-  // compiling them); bursts then develop their reference frame alone.
+  // [burst_kernels] no longer changes anything (the HDR+ merge kernels were removed); bursts
+  // develop their reference frame alone.
   static std::unique_ptr<FilmEngine> create(const Lut &filmsim, const Lut &spectra, std::string &error,
                                             bool burst_kernels = true, bool safe_shaders = false);
   ~FilmEngine();

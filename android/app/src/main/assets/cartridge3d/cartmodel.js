@@ -23,10 +23,18 @@ window.CartridgeModel = function (THREE, renderer, look) {
   const model = new THREE.Group();
 
   // ------------------------------------------------------------------ textures drawn here
+  // look.lite (the shelf, many at once): textures drawn at full size, kept at half
+  const LITE = !!(look && look.lite);
   function canvasTexture(w, h, draw, srgb) {
-    const c = document.createElement('canvas');
+    let c = document.createElement('canvas');
     c.width = w; c.height = h;
     draw(c.getContext('2d'), w, h);
+    if (LITE) {
+      const s = document.createElement('canvas');
+      s.width = Math.max(64, w >> 1); s.height = Math.max(32, h >> 1);
+      s.getContext('2d').drawImage(c, 0, 0, s.width, s.height);
+      c = s;
+    }
     const t = new THREE.CanvasTexture(c);
     t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
     if (srgb) t.colorSpace = THREE.SRGBColorSpace;

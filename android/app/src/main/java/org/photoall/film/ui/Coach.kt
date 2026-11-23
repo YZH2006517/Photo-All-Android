@@ -279,6 +279,9 @@ class Coach(
                 nudge = 1f
                 // the frame gives a small shake; the button (or the marks) flare
                 card.animate().cancel()
+                // cancelling stops the entrance too: a tap during it must not leave the card
+                // half faded (and, below half, deaf to its own buttons), so it lands at once
+                card.alpha = 1f; card.translationY = 0f; card.rotation = 0f
                 card.translationX = dp(5f)
                 card.animate().translationX(0f).setDuration(420)
                     .setInterpolator(android.view.animation.OvershootInterpolator(6f)).start()

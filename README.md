@@ -4,7 +4,7 @@
 
 胶片模拟基于 [spektrafilm](https://github.com/andreavolpato/spektrafilm) 在 [vkdt](https://github.com/hanatos/vkdt) 中的 GPU 实现（filmsim 模块）。我们把它移植成一个独立的 C++ / Vulkan 计算引擎，直接跑在手机上。
 
-> 当前版本 0.2.2（debug 签名）。第一次打开会有一段手把手的新手教程，完整说明在应用内「参数 → 使用指南」。
+> 当前版本 0.3.0（debug 签名）。第一次打开会有一段手把手的新手教程，完整说明在应用内「参数 → 使用指南」。
 
 ## 下载
 
@@ -16,35 +16,45 @@
 
 遇到问题：应用意外退出后，下次打开会弹出问题报告；没有崩溃但不正常时，在「参数 → 复制诊断信息」。复制后发到 [Issues](../../issues) 即可，报告不含照片。
 
-## 0.2.2 更新
+## 0.3.0 更新
 
-**3D 暗盒与装片**
-- 应用里所有暗盒都换成按实物尺寸建模的 3D 暗盒（Three.js 渲染）：胶卷墙、胶卷卡片、拟真相机的胶片仓、边框
-- 胶卷墙可以「3D 细看」：旋转、缩放、抽出胶片
-- 「装进相机」：正上方俯视、铺满全屏的相机后盖，拖进暗盒、牵引片头、过片、合盖，画面随手机倾斜
+**观片台**
+- 把照片摊在灯箱上：台面自由摆片并记住位置，联排自动播放，放大镜下看颗粒
+- 关灯时台面仍是米色，照片暗下去，像没开灯的真底片
+- 自选只留心头好；看罢一键收回片盒，清出台面的照片在相册里依旧保留
+- 设置里可改底色、亮度、片边、平铺列数、放大镜大小；五种外观随主题
 
-**边框**
-- 135 片边按真实胶片重做：片边字体、DX 条码、格号、边缘灰雾与漏光
-- 五张主题相纸：教堂、飞鸟、晴空、图纸、暗盒（暗盒正面站立，拉出的胶片按画格分格）
-- 画面上可以放这张照片所用胶卷的 3D 暗盒，拖动挪位置、双指缩放
-- 文字自动避让：自己找画面最干净、没被遮挡的位置
-- 编辑器选项可折叠，预览与版式缩略图更快；带暗盒的版式存储时会提示正在渲染
+**调参台**
+- 边调边看：原片与成片隔线对照，参数每动一格画面随之变化
+- 标准模式讲白话，Pro 模式看全部参数；调好的一套可存为预设
 
-**导入冲洗**
-- 场景还原：把已经渲染过的 JPEG 还原到场景线性，再按胶片冲洗
-- EDR / Ultra HDR 导出（Android 14 及以上，带增益图）
-- 微调面板：色温、色调、场景还原、EDR
+**胶片引擎**
+- 相纸重新校准：白是相纸的白，黑位干净，中灰不动，高光不再被削平
+- 晕光加在曝光上，亮处的光晕更真实；反转片色彩更浓
+- 颗粒三层同时显影，二十种胶卷各按自己的颗粒
+- 柔焦、黑柔、泛光重新调过；新增 UV 与 IR 截止滤镜（参数 → 光学）
+
+**胶卷架与预设**
+- 3D 胶卷架，每一卷附一页手记：色彩脾性、适合的光与景、拍与冲的诀窍
+- 预设：长按「工具」滑到想要的一套，松手即换
+
+**RAW 与导入**
+- 相机 RAW：NEF、CR2/CR3、ARW、RAF、ORF、RW2 等（LibRaw 解包）
+- 三星 Expert RAW（线性 DNG）
+- 导入的照片按原图尺寸冲洗；选「直出」时使用系统渲染的那一张
 
 **拍摄**
-- 新增四套界面皮肤：光、经典（拟真相机）、漫、风
-- 取景器可以加颗粒；闪光亮度匹配只提暗部
-- 拍摄录屏：打开后每按一次快门，保存按下前后几秒的屏幕录像
-- HDR+ 多帧合成改为实验功能：默认关闭，只能在「参数 → 相机」里打开，打开前会提示可能的兼容问题
-- 整个应用不显示状态栏（从顶部下滑可临时呼出）
+- 变焦尺随指拨动，焦段可自定
+- RAW 只用主摄，其他焦段拍 JPEG
+- 旁轴目镜里显示读数，取景更顺滑
 
-**稳定性**
-- 问题报告精简到一两屏截图就能看全
-- 相册进出沉浸模式不再闪动；主题切换动效修复
+**稳定性与问题报告**
+- 修复 RAW 冲洗时的闪退；更新后导入恢复可用
+- 设置底部「日志」一键复制或发送给开发者，只含机型与出错记录，不含照片
+
+**许可证**
+- 改为 CC BY-NC 4.0：可自由使用、修改与分享，须署名，不得商用
+- HDR+ 多帧合成随之移除（其代码来自 GPL 项目）
 
 ## 功能
 
@@ -66,10 +76,10 @@
 - 取景框下方的卡片分三页（胶卷、相纸、风格），左右拨动换页；长按在取景框里展开挑选条，按类别分组，画面实时换色
 - 挑风格时快门变成旋钮：在快门上画圈调 LUT 强度，顺时针更浓、逆时针更淡，边转边预览
 - RAW（DNG）拍摄后从 RAW 冲洗，默认冲洗成 JPG 后删掉 RAW（可选保留）
-- HDR+（实验功能，在「参数 → 相机」里打开）：按下即拍的零延迟连拍（多帧短曝光 RAW，可加一帧长曝光），HDR+ 风格的对齐与鲁棒合并，之后可选局部影调压缩
+- HDR+ 多帧合成已停用：它的合并代码移植自 GPL-3.0 项目，随许可变更为 CC BY-NC 4.0 移除；RAW 单张拍摄不受影响
 - 闪光：点闪电，四种模式贴着取景框边缘浮现
   - **闪光**：单张真闪光（手机预闪测光）；拍 RAW 时先补一帧环境光，按闪光照到的区域分别校正白平衡
-  - **补光**：闪光灯常亮，可与 HDR 同用
+  - **补光**：闪光灯常亮
   - **压光**：一帧环境光加一帧闪光，在 RAW 里算出闪光单独的光，再重新配比，压暗背景、突出主体（需开启 RAW）
 - 取景器实时预览胶片效果（33³ 3D LUT），预览和成片亮度、色彩对齐
 - 多镜头识别和切换（例如 S23 Ultra 的 0.6× / 1× / 3× / 10×），双指变焦
@@ -154,18 +164,22 @@ build/desktop/filmsim_cli --filmsim android/app/src/main/assets/filmsim/filmsim.
 
 | 内容 | 来源 | 许可 |
 | --- | --- | --- |
-| filmsim 着色器、白平衡表 | [vkdt](https://github.com/hanatos/vkdt)，hanatos | BSD 2-Clause（个别标注的文件为 GPLv3，见 `engine/shaders/vkdt/LICENCE.*`） |
+| filmsim 着色器、白平衡表 | [vkdt](https://github.com/hanatos/vkdt)，hanatos | BSD 2-Clause，见 `engine/shaders/vkdt/LICENCE.bsd2`（本项目取用的文件均为 BSD；同目录的 `LICENCE.gpl3` 是 vkdt 上游随附的，不适用于这些文件） |
 | RAW 降噪着色器（`engine/shaders/denoise/`） | 改写自 vkdt 的 denoise 模块，hanatos | BSD 2-Clause，改动见该目录的 `README.md` |
-| HDR+ 连拍对齐与频域合并（`engine/shaders/hdrplus/`） | 移植自 [hdr-plus-swift](https://github.com/martin-marek/hdr-plus-swift)（Burst Photo），Martin Marek、Christian Bauer 等 | GPL-3.0，改动见该目录的 `README.md` |
 | 胶片 / 相纸光谱数据（`assets/filmsim/filmsim.lut`） | [spektrafilm](https://github.com/andreavolpato/spektrafilm)，Andrea Volpato | CC BY-SA 4.0（经 vkdt 打包，未修改） |
 | 光谱上采样表（`assets/filmsim/spectra-em.lut`） | 用 vkdt 的 mkspectra 生成 | 同 vkdt |
+| JPEG XL 解码（DNG 1.7 的 JPEG XL 压缩，如三星 Expert RAW；构建时取 `third_party/libjxl`） | [libjxl](https://github.com/libjxl/libjxl) 0.11.1 及其依赖 Highway、Brotli、skcms | libjxl BSD-3-Clause；Highway Apache-2.0 / BSD-3；Brotli MIT；skcms BSD-3。只编入解码器 |
+| 相机 RAW 解包（`engine/libraw/`：NEF、CR2/CR3、ARW、RAF、ORF、RW2 等非 DNG 格式） | [LibRaw](https://www.libraw.org) 0.21.4，LibRaw LLC（含 Dave Coffin 的 dcraw 代码） | 按 CDDL 1.0 使用（LibRaw 为 LGPL 2.1 / CDDL 1.0 双许可），文件原样未改，由 `tools/sync_libraw.py` 导入，见 `engine/libraw/README.md`、`LICENSE.CDDL`。只用到解包，去马赛克和之后的步骤都是本引擎自己的；DNG 不经过它 |
 | 创意 LUT（`assets/luts/`） | [NatronGitHub/clut](https://github.com/NatronGitHub/clut)，Pat David、Juan Melara、Marc Roovers 等 | CC BY-SA 4.0，已从 HaldCLUT 8 级转换为 33³，见 `assets/luts/CREDITS.md` |
 | CCD 数码相机（`assets/luts/digicam/`、`cpp/digicam.cpp`、`engine/Digicam.kt`） | [Marcs Digicam Emulator](https://github.com/marc-gronenberg/marcs-digicam-emulator)，Marc Gronenberg | MIT。原版 37³ 相机 LUT 随附；取景器用的 33³ sRGB 版由 `tools/convert_digicam.py` 转换；成片的噪点、溢出、紫边、降噪、锐化移植自其滤镜源码，见该目录的 `LICENSE` |
 | 电影 / 调色 LUT（`assets/luts/editorhub/`） | [Editor Hub](https://editor-hub.com/assets/luts) 原创、电影风格与 FreshLUTs 社区精选 | CC0，由 `tools/convert_editorhub.py` 转换为 33³ |
 | 复古相机 LUT（`assets/luts/retro/`） | [ganjmeng/dazz-retro-camera](https://github.com/ganjmeng/dazz-retro-camera) 的 CCD、胶片机、拍立得、黑白相机风格 | MIT，由 `tools/convert_dazzretro.py` 转换为 33³ |
-| 3D 渲染（`assets/cartridge3d/three.min.js`） | [three.js](https://github.com/mrdoob/three.js) r155 | MIT，见 `assets/cartridge3d/THREE-LICENSE.txt`；暗盒与相机后盖的模型是本项目自己按实物尺寸建的 |
+| 3D 渲染（`assets/cartridge3d/three.min.js`） | [three.js](https://github.com/mrdoob/three.js) r155 | MIT，见 `assets/cartridge3d/THREE-LICENSE.txt`；暗盒与相纸盒的模型是本项目自己按实物尺寸建的 |
+| 相机后盖场景的相机模型（`assets/cartridge3d/camera01.js`、`camera01/`） | [Poly Haven](https://polyhaven.com/a/Camera_01) 的 Camera_01，Rajil Jose Macatangay | CC0，见 `camera01/LICENSE.txt`；为后盖开合做了切分与转换 |
 | 片边字体（`assets/fonts/edge/`） | TeX Gyre Heros（GUST）、DejaVu Sans Mono | GUST Font License、DejaVu 字体许可，见该目录的许可文件 |
 
 胶片、相纸和 LUT 名称里出现的商标属于各自的所有者，只用来说明模拟的是哪种胶片，本项目与这些公司没有关联。
 
-本项目以 [GPL-3.0](LICENSE) 发布（其中移植的 hdr-plus-swift 代码要求如此）。上表中各第三方部分保留各自的许可。
+本项目自己的代码与内容以 [CC BY-NC 4.0](LICENSE)（署名—非商业性使用 4.0 国际）发布：可以使用、修改和分享，但须署名 YZH2006517 并注明出处，**未经作者书面许可不得用于任何商业用途**。上表中各第三方部分保留各自的许可（其中 CC BY-SA 4.0 的数据与 LUT 仍按 CC BY-SA 4.0）。
+
+0.2.2 及更早的版本（至提交 800c692）以 GPL-3.0 发布，那些版本仍按 GPL-3.0 有效。

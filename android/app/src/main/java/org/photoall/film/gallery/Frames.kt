@@ -65,7 +65,12 @@ object Frames {
                   /** Light leaked in at the spool end of the strip, 0..1. */
                   val leak: Float = 0f,
                   /** Which leak: the same seed draws the same one. */
-                  val seed: Int = 0) {
+                  val seed: Int = 0,
+                  /**
+                   * Where the picture's window lies on the photo where their shapes differ, as
+                   * shares of the room left across and down the upright photo (0.5: the middle).
+                   */
+                  val cropX: Float = 0.5f, val cropY: Float = 0.5f) {
         /** The data lines, each printed on its own line: shooting data, phone, film recipe. */
         val lines get() = listOfNotNull(info, device, recipe).filter { it.isNotBlank() }
         val hasText get() = !caption.isNullOrBlank() || lines.isNotEmpty()
@@ -141,7 +146,14 @@ object Frames {
         val src = if (turn) rotate(photo, (360 - sheetTurn).toFloat()) else photo
 
         // Scale: the photo's own resolution across the picture, unless the sheet gets too big.
-        val crop = centreCrop(src.width, src.height, img.width() / img.height())
+        // the crop chosen on the upright photo, carried onto it as turned for the sheet
+        val (fx, fy) = when ((360 - sheetTurn) % 360) {
+            90 -> (1 - options.cropY) to options.cropX
+            180 -> (1 - options.cropX) to (1 - options.cropY)
+            270 -> options.cropY to (1 - options.cropX)
+            else -> options.cropX to options.cropY
+        }
+        val crop = centreCrop(src.width, src.height, img.width() / img.height(), fx, fy)
         var s = crop.width() / img.width()
         s = min(s, maxLong / max(l.w, l.h))
         val out = Bitmap.createBitmap(ceil(l.w * s).toInt(), ceil(l.h * s).toInt(), Bitmap.Config.ARGB_8888)
@@ -817,13 +829,15 @@ object Frames {
         if (w > maxWidth) textSize = size * maxWidth / w
     }
 
-    private fun centreCrop(w: Int, h: Int, aspect: Float): Rect {
+    private fun centreCrop(w: Int, h: Int, aspect: Float, fx: Float = 0.5f, fy: Float = 0.5f): Rect {
         return if (w.toFloat() / h > aspect) {
             val cw = (h * aspect).roundToInt()
-            Rect((w - cw) / 2, 0, (w - cw) / 2 + cw, h)
+            val x = ((w - cw) * fx.coerceIn(0f, 1f)).roundToInt()
+            Rect(x, 0, x + cw, h)
         } else {
             val ch = (w / aspect).roundToInt()
-            Rect(0, (h - ch) / 2, w, (h - ch) / 2 + ch)
+            val y = ((h - ch) * fy.coerceIn(0f, 1f)).roundToInt()
+            Rect(0, y, w, y + ch)
         }
     }
 

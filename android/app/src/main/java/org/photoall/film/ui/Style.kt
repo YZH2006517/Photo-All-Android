@@ -57,6 +57,9 @@ object Style {
     val BG get() = palette.bg
     val SURFACE get() = palette.surface        // buttons, panels
     val SURFACE_2 get() = palette.surface2     // selected / raised
+    /** The chosen entry of the theme list: 0-4 the themes, past them the camera styles (Skin). */
+    var themeIndex = 0
+        private set
     val HAIRLINE get() = palette.hairline
     val TEXT get() = palette.text
     val TEXT_2 get() = palette.text2           // secondary, inactive controls
@@ -81,8 +84,23 @@ object Style {
             raw.edit().remove(org.photoall.film.settings.Settings.SKIN).apply()
             store[org.photoall.film.settings.Settings.THEME] = theme.toFloat()
         }
+        applyTheme(activity, theme)
+    }
+
+    /** The colours and style of theme [theme] (an index into the themes, then the styles), nothing else. */
+    fun use(theme: Int) {
         palette = palettes[theme.coerceIn(0, palettes.lastIndex)]
+        themeIndex = theme.coerceAtLeast(0)
         Skin.load(if (theme >= palettes.size) theme - palettes.size + 1 else 0)?.let { palette = it }
+    }
+
+    /** The theme chosen in the settings (the app's own; a screen with a style of its own puts it back with [use]). */
+    fun storedTheme(context: android.content.Context) =
+        org.photoall.film.settings.SettingsStore(context)[org.photoall.film.settings.Settings.THEME].toInt()
+
+    /** [apply] with a given theme: a screen with a style of its own (the light table). */
+    fun applyTheme(activity: android.app.Activity, theme: Int) {
+        use(theme)
         activity.setTheme(if (palette.light) org.photoall.film.R.style.FilmThemeLight else org.photoall.film.R.style.FilmTheme)
         activity.window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(BG))
         activity.window.navigationBarColor = BG

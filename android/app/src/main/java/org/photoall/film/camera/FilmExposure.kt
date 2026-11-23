@@ -110,6 +110,9 @@ class FilmExposure(
     @Volatile private var liveCcm: FloatArray? = null
     @Volatile private var liveFocus: Float? = null
     @Volatile private var liveAfState = -1
+    /** The lens's focus now (diopters, 0 = infinity; null on a fixed-focus lens) and the AF state. */
+    val lensFocus: Float? get() = liveFocus
+    val afState: Int get() = liveAfState
     @Volatile private var liveAwbMode = -1
     @Volatile private var liveAwbState = -1
     @Volatile private var liveFrameNs = 0L
@@ -423,6 +426,12 @@ class FilmExposure(
      */
     var plain = false
 
+    /**
+     * 直出 / a LUT alone: the phone's own tone curve (its usual rendering), not the plain sRGB
+     * curve the film simulation needs as scene light.
+     */
+    var systemTone = false
+
     /** The lens a logical camera reports it is using (LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID), if it does. */
     @Volatile var activePhysical: String? = null
         private set
@@ -477,10 +486,11 @@ class FilmExposure(
                 return this
             }
         }
-        if (!plain) o.put(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
-                CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
-            .put(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_PRESET_CURVE)
-            .put(CaptureRequest.TONEMAP_PRESET_CURVE, CaptureRequest.TONEMAP_PRESET_CURVE_SRGB)
+        if (!plain) {
+            o.put(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+            if (!systemTone) o.put(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_PRESET_CURVE)
+                .put(CaptureRequest.TONEMAP_PRESET_CURVE, CaptureRequest.TONEMAP_PRESET_CURVE_SRGB)
+        }
 
         val fixed = hold ?: manual
         if (fixed != null) {

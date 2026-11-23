@@ -27,13 +27,15 @@ import android.widget.TextView
  */
 class Sheet(context: Context, title: String, content: View, header: View? = null,
             /** In portrait, a fixed share of the screen's height (0: fit the content, up to 3/4). */
-            private val fixedHeight: Float = 0f) : Dialog(context) {
+            private val fixedHeight: Float = 0f,
+            /** False: the screen behind stays as it is (a sheet used while looking at the picture). */
+            dimmed: Boolean = true) : Dialog(context) {
     private val density = context.resources.displayMetrics.density
     private fun dp(v: Float) = (v * density).toInt()
     private val panel: LinearLayout
     private var closing = false
     private val side = context.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-    private val dimTo = if (side) 0.22f else 0.45f
+    private val dimTo = if (!dimmed) 0f else if (side) 0.22f else 0.45f
 
     init {
         panel = LinearLayout(context).apply {

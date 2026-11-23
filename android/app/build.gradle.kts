@@ -1,20 +1,41 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
+}
+
+// Kept out of the repository: the problem-report address (cloud/report) and its token.
+val localProps = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
 }
 
 android {
     namespace = "org.photoall.film"
     compileSdk = 36
+    // The same debug key the released APKs have always used (a new key would stop updates),
+    // signed with v1 (JAR) as well as v2/v3: some phones' installers and security scanners look
+    // only for the META-INF signature files and call a v2-only APK unsigned.
+    signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
+    }
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "org.photoall.film"
         minSdk = 29
         targetSdk = 36
-        versionCode = 85
-        versionName = "0.2.2"
+        versionCode = 143
+        versionName = "0.3.0"
         ndk { abiFilters += "arm64-v8a" }
+        buildConfigField("String", "REPORT_URL", "\"${localProps.getProperty("report.url", "")}\"")
+        buildConfigField("String", "REPORT_TOKEN", "\"${localProps.getProperty("report.token", "")}\"")
     }
+
+    buildFeatures { buildConfig = true }
 
     externalNativeBuild {
         cmake {

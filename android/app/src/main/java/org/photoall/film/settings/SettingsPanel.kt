@@ -32,8 +32,18 @@ class SettingsPanel(
     /** The guide, as the list's first entry (the device's settings only). */
     onGuide: (() -> Unit)? = null,
     /** Diagnostics to copy when something does not work (the device's settings only). */
-    onDiagnostics: (() -> Unit)? = null,
+    /** 日志, the last entry (the device's settings only): what to send when something goes wrong. */
+    onLog: (() -> Unit)? = null,
+    /** 更新内容 (the device's settings only): what this version brought, tagged NEW until seen. */
+    onWhatsNew: (() -> Unit)? = null,
+    /** Tabs across the top, one group to a tab (an import's parameters), instead of folding sections. */
+    private val tabbed: Boolean = false,
+    /** Groups in this order first (the rest after, as listed); empty: the list's own order. */
+    groupOrder: List<String> = emptyList(),
+    /** The title row (title, 恢复默认, 完成); off where the panel sits inside another screen. */
+    showHeader: Boolean = true,
 ) : LinearLayout(context) {
+    private var tabBar: View? = null
     private val refreshers = mutableListOf<() -> Unit>()
 
     init {
@@ -44,7 +54,14 @@ class SettingsPanel(
             setPadding(dp(20), dp(10), dp(8), dp(10))
             addView(text(title, 20f).apply { typeface = Style.medium }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
             if (onBench != null) addView(action("测试台", Style.TEXT_2) { onBench() })
-            addView(action("恢复默认", Style.TEXT_2) { store.resetAll(); refresh() })
+            // only what this panel shows goes back to its defaults (a page of the film engine
+            // must not reset the theme, the camera and the rest)
+            addView(action("恢复默认", Style.TEXT_2) {
+                val shown = Settings.all.filter { it.group.isNotEmpty() && only(it) }
+                if (shown.size == Settings.all.count { it.group.isNotEmpty() }) store.resetAll()
+                else shown.forEach { store[it.key] = it.default }
+                refresh()
+            })
             addView(action("完成", Style.ACCENT) { onClose() })
         }
         val list = LinearLayout(context).apply {
@@ -56,7 +73,7 @@ class SettingsPanel(
                 setDuration(200)
             }
         }
-        list.addView(text("点分类展开 · 长按某一项恢复默认", 12f).apply {
+        list.addView(text(if (tabbed) "长按某一项恢复默认" else "点分类展开 · 长按某一项恢复默认", 12f).apply {
             setTextColor(Style.TEXT_3)
             setPadding(dp(4), dp(4), 0, dp(8))
         })
@@ -76,12 +93,6 @@ class SettingsPanel(
             Style.pressable(this)
             setOnClickListener { onGuide() }
         }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
-        if (onDiagnostics != null) list.addView(text("复制诊断信息（反馈问题时用）", 13f).apply {
-            setTextColor(Style.TEXT_2)
-            setPadding(dp(14), dp(12), dp(14), dp(14))
-            Style.pressable(this)
-            setOnClickListener { onDiagnostics() }
-        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
         // One section per topic, folded until opened (the list was long and mixed). A topic's
         // settings are together even where the list interleaves them.
         val groups = LinkedHashMap<String, MutableList<Setting>>()
@@ -90,7 +101,53 @@ class SettingsPanel(
             if (!only(setting)) continue
             groups.getOrPut(setting.group) { mutableListOf() } += setting
         }
-        for ((name, items) in groups) {
+        if (groupOrder.isNotEmpty()) {
+            val ordered = groups.entries.sortedBy { (name, _) -> groupOrder.indexOf(name).let { if (it < 0) groupOrder.size else it } }
+            groups.clear()
+            ordered.forEach { (k, v) -> groups[k] = v }
+        }
+        if (tabbed) {
+            // one group shown at a time, chosen from the tabs
+            val bodies = groups.map { (_, items) ->
+                LinearLayout(context).apply {
+                    orientation = VERTICAL
+                    setPadding(dp(14), dp(4), dp(14), dp(6))
+                    background = Style.surface(context, fill = Style.SURFACE, radiusDp = 14f)
+                    items.forEachIndexed { i, setting ->
+                        if (i > 0) addView(Style.hairline(context), LayoutParams(LayoutParams.MATCH_PARENT, 1))
+                        addView(row(setting))
+                    }
+                }
+            }
+            bodies.forEach { list.addView(it, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)) }
+            val names = groups.keys.toList()
+            val labels = mutableListOf<TextView>()
+            fun show(i: Int) {
+                bodies.forEachIndexed { k, b -> b.visibility = if (k == i) VISIBLE else GONE }
+                labels.forEachIndexed { k, t ->
+                    t.setTextColor(if (k == i) Style.ACCENT else Style.TEXT_2)
+                    t.typeface = if (k == i) Style.medium else Style.regular
+                }
+                open.clear(); open += names[i]
+            }
+            tabBar = android.widget.HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                isHorizontalFadingEdgeEnabled = true
+                setFadingEdgeLength(dp(24))
+                addView(LinearLayout(context).apply {
+                    setPadding(dp(10), 0, dp(10), 0)
+                    names.forEachIndexed { i, name ->
+                        addView(text(name, 15f).apply {
+                            gravity = Gravity.CENTER
+                            setPadding(dp(12), 0, dp(12), 0)
+                            setOnClickListener { show(i) }
+                            labels += this
+                        }, LayoutParams(LayoutParams.WRAP_CONTENT, dp(44)))
+                    }
+                })
+            }
+            show(names.indexOfFirst { it in open }.coerceAtLeast(0))
+        } else for ((name, items) in groups) {
             val body = LinearLayout(context).apply {
                 orientation = VERTICAL
                 setPadding(dp(14), 0, dp(14), dp(6))
@@ -125,7 +182,71 @@ class SettingsPanel(
                 addView(body)
             }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
         }
-        addView(header)
+        // 更新内容: this version's changes, an accent card above 日志
+        if (onWhatsNew != null) list.addView(LinearLayout(context).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(60)
+            setPadding(dp(14), dp(10), dp(10), dp(10))
+            background = Style.surface(context, fill = Style.SURFACE, radiusDp = 14f, stroke = Style.ACCENT)
+            addView(LinearLayout(context).apply {
+                orientation = VERTICAL
+                addView(LinearLayout(context).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(text("V${WhatsNewActivity.VERSION} 更新内容", 16f).apply { typeface = Style.medium; setTextColor(Style.ACCENT) })
+                    if (!WhatsNewActivity.seen(context)) addView(WhatsNewActivity.newTag(context).apply { tag = "new" },
+                        LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
+                })
+                addView(text("离胶片，又近了一格", 12f).apply { setTextColor(Style.TEXT_2) })
+            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(android.widget.ImageView(context).apply {
+                setImageDrawable(org.photoall.film.ui.Icon(org.photoall.film.ui.Icon.Kind.CHEVRON, Style.ACCENT, 1.8f))
+            }, LayoutParams(dp(18), dp(18)).apply { marginStart = dp(8) })
+            Style.pressable(this)
+            setOnClickListener {
+                findViewWithTag<View>("new")?.visibility = View.GONE
+                onWhatsNew()
+            }
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        // 日志: the diagnostics and the errors handled, to send to the developer
+        if (onLog != null) list.addView(LinearLayout(context).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(60)
+            setPadding(dp(14), dp(10), dp(10), dp(10))
+            background = Style.surface(context, fill = Style.SURFACE, radiusDp = 14f)
+            addView(LinearLayout(context).apply {
+                orientation = VERTICAL
+                addView(text("日志", 16f).apply { typeface = Style.medium })
+                addView(text("诊断信息与出错记录 · 复制给开发者", 12f).apply { setTextColor(Style.TEXT_2) })
+            }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            addView(android.widget.ImageView(context).apply {
+                setImageDrawable(org.photoall.film.ui.Icon(org.photoall.film.ui.Icon.Kind.CHEVRON, Style.TEXT_2, 1.8f))
+            }, LayoutParams(dp(18), dp(18)).apply { marginStart = dp(8) })
+            Style.pressable(this)
+            setOnClickListener { onLog() }
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8); bottomMargin = dp(8) })
+        // the last thing on the full settings screen: who made it, on what terms, where it lives
+        if (onGuide != null) list.addView(LinearLayout(context).apply {
+            orientation = VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(18), dp(28), dp(18), dp(30))
+            val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()
+            addView(text("Photo All" + (version?.let { " · $it" } ?: ""), 13f).apply { typeface = Style.medium; setTextColor(Style.TEXT_2) })
+            addView(text("作者 YZH2006517", 13f).apply { setTextColor(Style.TEXT_2); setPadding(0, dp(6), 0, 0) })
+            addView(text("本软件以 CC BY-NC 4.0 发布：可使用、修改与分享，须署名作者并注明出处；未经作者书面许可，不得用于任何商业用途。", 12f).apply {
+                setTextColor(Style.TEXT_3); gravity = Gravity.CENTER; setPadding(0, dp(10), 0, 0)
+            })
+            addView(text("github.com/YZH2006517", 13f).apply {
+                setTextColor(Style.ACCENT); typeface = Style.medium
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                Style.pressable(this)
+                setOnClickListener {
+                    runCatching { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse("https://github.com/YZH2006517"))) }
+                }
+            }, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        if (showHeader) addView(header)
+        tabBar?.let { addView(it, LayoutParams(LayoutParams.MATCH_PARENT, dp(44))) }
         addView(Style.hairline(context), LayoutParams(LayoutParams.MATCH_PARENT, 1))
         addView(ScrollView(context).apply { addView(list) }, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
     }

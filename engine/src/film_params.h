@@ -37,10 +37,11 @@ struct alignas(16) FilmParams
   float pf_m = 0.0f;
   float pf_y = 0.0f;
   int32_t couplers = 1;
-  float cp_amt = 0.5f;
-  float langmuir_r = 1.0f;
-  float langmuir_g = 1.0f;
-  float langmuir_b = 1.0f;
+  // fitted to the reference spektrafilm's saturation (its colour chart, 14 negatives)
+  float cp_amt = 1.0f;
+  float langmuir_r = 1.5f;
+  float langmuir_g = 1.5f;
+  float langmuir_b = 1.5f;
   float couplers_radius = 20.0f; // micrometres on the negative
   int32_t halation = 1;
   float halation_radius = 65.0f; // micrometres on the negative
@@ -59,9 +60,23 @@ struct alignas(16) FilmParams
   float scene_tint = 0.0f;
   float film_ill = 0.0f;
   int32_t input_colour = 0; // 0: Rec.2020 linear, which the decode pass always produces
+  // Added here (not in vkdt's filmsim): the frame's long edge on the negative (0: filmsim's
+  // 35 mm), which scales grain, halation and coupler spread; the grain's strength; the
+  // print's contrast per dye layer (crossover).
+  float frame_um = 0.0f;
+  float grain_amount = 1.0f;
+  float gamma_p_r = 1.0f;
+  float gamma_p_g = 1.0f;
+  float gamma_p_b = 1.0f;
+  // The camera's UV- and IR-cut filters (0 none .. 1 full), the reference's filter_uv / filter_ir;
+  // off by default, as there.
+  float uv_cut = 0.0f;
+  float ir_cut = 0.0f;
 };
 static_assert(offsetof(FilmParams, halation_strength) == 160, "std140 vec4 alignment");
 static_assert(offsetof(FilmParams, input_colour) == 208, "std140 layout drifted from head.glsl");
+static_assert(offsetof(FilmParams, gamma_p_b) == 228, "std140 layout drifted from head.glsl");
+static_assert(offsetof(FilmParams, ir_cut) == 236, "std140 layout drifted from head.glsl");
 
 constexpr int kProcessPrint = 0;
 constexpr int kProcessScanNegative = 1;
@@ -113,6 +128,34 @@ struct Stages
   // darkens it, and never pushes its brightest 0.5% past 0.9 (a flash frame: the flash
   // lit the subject, the HAL's exposure often leaves the rest under the viewfinder).
   bool match_lift = false;
+  // 8-bit sources that are finished pictures (imports): with the film off they leave as they
+  // came, not under the neutral tone curve meant for scene light (raw, the viewfinder).
+  bool display = false;
+  // A camera's own exposure judgement on an 8-bit source (scene restore's auto exposure):
+  // off, the picture's brightness is left as it came (imports, "测光" off).
+  bool meter = true;
+  // A diffusion filter in front of the lens: 0 none, 1 Pro-Mist, 2 Black Pro-Mist,
+  // 3 Glimmerglass, 4 Cinebloom; its amount (0..1), size (x1) and warmth (-1..1).
+  int diffusion = 0;
+  float diff_amount = 0.5f;
+  float diff_size = 1.0f;
+  float diff_warm = 0.0f;
+  // The scanner: its softness (pixels of blur), sharpening (amount, radius in pixels) and
+  // black / white points (linear levels).
+  // The reference spektrafilm's scanner sharpens a little (fitted on a photo, with its grain).
+  float scan_blur = 0.0f;
+  float scan_sharp = 0.3f;
+  float scan_radius = 0.7f;
+  // The developer's own spread with grain on (spektrafilm's grain blur): a Gaussian of
+  // this many output pixels over the developed film, softening the grain's finest speckle.
+  float grain_blur = 0.65f;
+  // The film's output compressed softly into the display's gamut ("stage gamut"; off: clipped).
+  bool gamut = true;
+  // Development aid ("stage negative"): a negative scanned as it is, the orange base and all,
+  // without the lab's inversion. Not for pictures; for showing what the film holds.
+  bool negative = false;
+  float black = 0.0f;
+  float white = 1.0f;
 };
 // "stage film" / "stage print" (0 off, otherwise on), "stage restore" (0..1); false for other names.
 bool set_stage(Stages &stages, std::string_view name, float value);

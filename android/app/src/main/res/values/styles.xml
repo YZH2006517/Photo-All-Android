@@ -24,6 +24,13 @@
         <item name="android:activityCloseExitAnimation">@anim/page_close_exit</item>
     </style>
 
+    <!-- A page over the screen it opened on (the update page): it brings in its own ground. -->
+    <style name="FilmSeeThrough" parent="FilmTheme">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+
     <style name="FilmDialog" parent="@android:style/Theme.Material.Dialog.Alert">
         <item name="android:forceDarkAllowed">false</item>
         <item name="android:colorAccent">#F2C14E</item>

@@ -31,6 +31,7 @@ vec3 coupler_inhibit_pre_blur(vec3 d)
 
 vec3 coupler_saturate_post_blur(vec3 c)
 {
-  if(prep.film.model_positive_film == 0) return c;
-  return c * (prep.film.Kr + prep.film.c_ref) / max(prep.film.Kr + c, vec3(1e-6));
+  // the reference spektrafilm's reversal inhibitors act linearly, as the negatives' do;
+  // filmsim's saturation of them held the slides' interimage colour back (chart dE 3.1 -> 1.75)
+  return c;
 }

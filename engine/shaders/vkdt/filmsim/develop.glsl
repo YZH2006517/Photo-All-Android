@@ -1,25 +1,15 @@
 // develop.glsl: grain synthesis and film density development.
 
-vec3 add_grain(ivec2 ipos, vec3 density)
+// One field of grain noise at lattice position [pos]: particles jittered in their cells,
+// each a Gaussian dye cloud, summed and normalised to unit variance.
+vec3 grain_field(vec2 pos, uint random_stream)
 {
-  vec3 np = clamp((density + prep.grain.grain_dmin) * prep.grain.inv_density_range, 0.0, 1.0);
-  vec3 p_dev_0 = clamp(np * prep.grain.inv_layer_fraction_0, 0.0, 1.0);
-  vec3 p_dev_1 = clamp((np - prep.grain.layer_fraction_0) * prep.grain.inv_layer_fraction_1, 0.0, 1.0);
-  vec3 p_dev_2 = clamp((np - prep.grain.layer_fraction_01) * prep.grain.inv_layer_fraction_2, 0.0, 1.0);
-  vec3 var_0 = p_dev_0 * max(1.0 - p_dev_0 * prep.grain.uniformity, 0.0);
-  vec3 var_1 = p_dev_1 * max(1.0 - p_dev_1 * prep.grain.uniformity, 0.0);
-  vec3 var_2 = p_dev_2 * max(1.0 - p_dev_2 * prep.grain.uniformity, 0.0);
-  vec3 var_comb = prep.grain.variance_weight_fast * var_0 + prep.grain.variance_weight_mid * var_1 + prep.grain.variance_weight_slow * var_2;
-  if(all(lessThan(var_comb, vec3(1e-10)))) return density;
-  vec3 std_comb = sqrt(max(var_comb, vec3(0.0)));
-  vec2 pos = vec2(ipos) * prep.grain.lattice_scale + prep.grain.lattice_seed;
   vec2 p = floor(pos);
   vec2 f = fract(pos);
   ivec2 ip = ivec2(p);
   vec3 acc = vec3(0.0);
   float wsq = 0.0;
   int particles_per_cell = prep.grain.particles_per_cell;
-  uint random_stream = prep.grain.random_stream;
   [[loop]] for (int y = -1; y <= 2; y++) {
     float dy_grid = float(y) - f.y;
     float dy_grid_sq = dy_grid * dy_grid;
@@ -47,15 +37,42 @@ vec3 add_grain(ivec2 ipos, vec3 density)
       wsq += cell_wsq * (window * window);
     }
   }
-  vec3 final_noise = acc * inversesqrt(max(wsq, 1e-6)) * std_comb;
-  return max(density + final_noise, prep.grain.grain_dmin * -1.0);
+  return acc * inversesqrt(max(wsq, 1e-6));
+}
+
+// Grain from the film's three sublayers developing together, as the reference's: the
+// density model is the sum of three overlapping characteristic curves (fast, mid, slow), so at
+// any exposure each sublayer has developed its own share p of its silver, and each adds
+// grain of variance ~ p (1 - p u), not one sublayer after another filling up. [y] is the
+// exposure the density came from.
+vec3 add_grain(ivec2 ipos, vec3 density, vec3 y)
+{
+  float mix_ex = clamp(params.exhaust, 0.0, 1.0);
+  // each sublayer's share of its base density too, as the reference adds density_min
+  vec3 dmax_abs = 1.0 / prep.grain.inv_density_range;
+  vec3 k = prep.grain.grain_dmin / max(dmax_abs - prep.grain.grain_dmin, vec3(1e-3));
+  vec3 p0 = (density_cdf(clamp(y * prep.film.model_scale_film[0] + prep.film.model_bias_film[0], vec3(-10.0), vec3(10.0)), mix_ex) + k) / (1.0 + k);
+  vec3 p1 = (density_cdf(clamp(y * prep.film.model_scale_film[1] + prep.film.model_bias_film[1], vec3(-10.0), vec3(10.0)), mix_ex) + k) / (1.0 + k);
+  vec3 p2 = (density_cdf(clamp(y * prep.film.model_scale_film[2] + prep.film.model_bias_film[2], vec3(-10.0), vec3(10.0)), mix_ex) + k) / (1.0 + k);
+  vec3 var_0 = prep.grain.variance_weight_fast * p0 * max(1.0 - p0 * prep.grain.uniformity, 0.0);
+  vec3 var_1 = prep.grain.variance_weight_mid  * p1 * max(1.0 - p1 * prep.grain.uniformity, 0.0);
+  vec3 var_2 = prep.grain.variance_weight_slow * p2 * max(1.0 - p2 * prep.grain.uniformity, 0.0);
+  vec3 var_comb = var_0 + var_1 + var_2;
+  if(all(lessThan(var_comb, vec3(1e-10)))) return density;
+  vec2 pos = vec2(ipos) * prep.grain.lattice_scale + prep.grain.lattice_seed;
+  uint random_stream = prep.grain.random_stream;
+  // One field carries all three: the particles are far below a pixel here (36 mm over a few
+  // thousand pixels), so the sublayers' different particle sizes average out within each
+  // pixel and only their variances tell; separate fields measured the same, at three times the cost.
+  vec3 noise = grain_field(pos, random_stream) * sqrt(max(var_comb, vec3(0.0)));
+  return max(density + noise * params.grain_amount, prep.grain.grain_dmin * -1.0);
 }
 
 vec3 develop_density(vec3 y, ivec2 ipos)
 {
   vec3 density_cmy = eval_film_density(y);
   density_cmy = mix(density_cmy, vec3(0.0), isnan(density_cmy));
-  [[branch]] if(params.grain > 0) density_cmy = add_grain(ipos, density_cmy);
+  [[branch]] if(params.grain > 0) density_cmy = add_grain(ipos, density_cmy, y);
   return density_cmy;
 }
 

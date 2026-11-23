@@ -55,8 +55,11 @@ object Toy {
         else intArrayOf(lighten(p.surface2, 0.16f), lighten(p.surface2, 0.05f), p.surface2)
     val AMBER get() = p.accent
     /** The look roller in the theme's accent; the exposure roller in a hue across from it. */
-    fun lookRoller() = Triple(lighten(p.accent, 0.3f), p.accent, darken(p.accent, 0.3f))
+    fun lookRoller() = if (Skin.rangefinder) chrome() else Triple(lighten(p.accent, 0.3f), p.accent, darken(p.accent, 0.3f))
+    /** 旁轴: the dials knurled chrome, as on the body. */
+    private fun chrome() = Triple(0xffe4e3de.toInt(), 0xffa3a29c.toInt(), 0xff5e5d59.toInt())
     fun exposureRoller(): Triple<Int, Int, Int> {
+        if (Skin.rangefinder) return chrome()
         val hsv = FloatArray(3)
         android.graphics.Color.colorToHSV(p.accent, hsv)
         // a red-only theme (night) keeps both in red; otherwise turn the hue well away
