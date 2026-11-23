@@ -36,8 +36,9 @@ struct RawImage
 };
 
 // `neutral` (camera rgb of a neutral, as DNG AsShotNeutral) replaces the file's own when
-// given: CameraX can write a stale one into its DNGs.
+// given: CameraX can write a stale one into its DNGs. `long_edge`: the size the develop wants,
+// which lets a camera RAW that is demosaiced while read (X-Trans) be read smaller (0: full).
 bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error,
-               const float *neutral = nullptr);
+               const float *neutral = nullptr, int long_edge = 0);
 
 } // namespace film

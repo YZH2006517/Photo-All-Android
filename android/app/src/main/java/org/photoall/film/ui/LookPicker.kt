@@ -94,7 +94,24 @@ class LookPicker(context: Context) : HorizontalScrollView(context) {
         }.start()
     }
 
-    /** The looks rise into place, the middle one first and the rest spreading out from it. */
+    /**
+     * Glides to look [index], chosen elsewhere (the film wheel): no hover or settle on the way,
+     * the choice is made already.
+     */
+    fun follow(index: Int) {
+        if (count == 0) return
+        val target = index.coerceIn(0, count - 1)
+        removeCallbacks(watch)
+        centered = target
+        following = target * itemW
+        if (scrollX == following) { following = -1; return }
+        smoothScrollTo(following, 0)
+    }
+
+    /** The scroll position a [follow] is gliding to (-1: none). */
+    private var following = -1
+
+        /** The looks rise into place, the middle one first and the rest spreading out from it. */
     fun bloom(rise: Float, quick: Boolean = false) {
         for (i in 0 until row.childCount) {
             val v = row.getChildAt(i)
@@ -130,7 +147,9 @@ class LookPicker(context: Context) : HorizontalScrollView(context) {
     override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
         super.onScrollChanged(l, t, oldl, oldt)
         val i = (l.toFloat() / itemW).roundToInt().coerceIn(0, maxOf(0, count - 1))
-        if (i != centered && count > 0) {
+        if (following >= 0) {
+            if (l == following) following = -1
+        } else if (i != centered && count > 0) {
             centered = i
             onHover(i)
         }
@@ -155,6 +174,7 @@ class LookPicker(context: Context) : HorizontalScrollView(context) {
     }
 
     override fun onTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) following = -1 // a finger takes over
         val handled = super.onTouchEvent(ev)
         if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
             removeCallbacks(watch)

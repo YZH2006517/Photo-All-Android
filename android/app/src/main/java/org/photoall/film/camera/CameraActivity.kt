@@ -1326,6 +1326,8 @@ class CameraActivity : ComponentActivity() {
         if (next < 0 || next >= count) { haptics.play(Haptics.Event.LIMIT); return }
         haptics.play(Haptics.Event.TICK)
         applyPick(lookPage, next)
+        // the open picker turns with the wheel, as the wheel turns with the picker
+        if (pickerOpen) { picker.follow(next); markPickerGroup(next) }
     }
 
     /** Where the look in use sits in the picker's list for [page] (0 = straight / scan / none). */
@@ -2287,6 +2289,8 @@ class CameraActivity : ComponentActivity() {
             getSharedPreferences("coach", MODE_PRIVATE).edit().putBoolean("camera", true).apply()
         }
         coach = c
+        // the way back from landscape is offered at any step, not only the one that asks for it
+        c.alwaysThrough = { rotateButton.takeIf { it.alpha > 0.5f } }
         addContentView(c, android.view.ViewGroup.LayoutParams(-1, -1))
         c.start()
     }

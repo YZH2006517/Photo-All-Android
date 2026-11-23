@@ -445,13 +445,14 @@ bool parse_dng_tiff(const uint8_t *data, size_t size, RawImage &out, std::string
 
 } // namespace
 
-bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override)
+bool parse_dng(const uint8_t *data, size_t size, RawImage &out, std::string &error, const float *neutral_override,
+               int long_edge)
 {
   if(parse_dng_tiff(data, size, out, error, neutral_override)) return true;
   if(is_dng(data, size)) return false;
   // not a DNG: a camera's own RAW (NEF, CR2/CR3, ARW, RAF, ORF, RW2 ...), through LibRaw
   std::string raw_error;
-  if(parse_camera_raw(data, size, out, raw_error)) { error.clear(); return true; }
+  if(parse_camera_raw(data, size, out, raw_error, long_edge)) { error.clear(); return true; }
   error = raw_error;
   return false;
 }

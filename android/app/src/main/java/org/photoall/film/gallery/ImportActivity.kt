@@ -771,7 +771,9 @@ class ImportActivity : ComponentActivity() {
         val image = if (digicam == null) developed.bitmap else
             Digicam.apply(this, developed.bitmap, digicam, iso = iso, strength = r.strength, seed = Random.nextInt())
                 .also { if (it !== developed.bitmap) developed.bitmap.recycle() }
-        if (raw == null) Edr.attach(image, bitmap, r.edr)
+        // a RAW's gain map too: worked out from the phone's own rendering of it (what it pressed
+        // under white is what the scene had above), as for any picture
+        Edr.attach(image, bitmap, r.edr)
         return image to developed
     }
 
@@ -837,6 +839,13 @@ class ImportActivity : ComponentActivity() {
             if (e.message?.contains("DNG") != true) { runCatching { engine?.close() }; engine = null }
             // a linear DNG (Samsung Expert RAW, Apple ProRAW): told in plain words, not as a failure
             val msg = e.message.orEmpty()
+            // a format the engine cannot read stays so: decided once per file, not tried again
+            // (and the engine rebuilt) at every slider move
+            if (msg.contains("not supported") && file != null) rawVerdict[file] = when {
+                msg.contains("X-Trans") -> "富士 X-Trans 的 RAF 引擎暂不能按 RAW 冲洗，已用它内置的成片冲洗，EDR 照常可调"
+                else -> "引擎读不了这张 RAW：$msg"
+            }
+            file?.let { rawVerdict[it] }?.let { return fallback(it, e) }
             if (msg.contains("linear DNG")) return fallback(if (msg.contains("52546"))
                 "这是线性 DNG（如三星 Expert RAW，JPEG XL 压缩），引擎暂不能按 RAW 冲洗；已用它内置的全尺寸成片冲洗，效果不受影响"
                 else "这是线性 DNG（如三星 Expert RAW、苹果 ProRAW），引擎暂不能按 RAW 冲洗；已用它内置的全尺寸成片冲洗，效果不受影响", e)

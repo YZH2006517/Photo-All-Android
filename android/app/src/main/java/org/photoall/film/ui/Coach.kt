@@ -87,6 +87,9 @@ class Coach(
 
     private val want = RectF()
     private val shown = RectF()
+    /** A control that takes touches at every step (the rotate offer: turning back must stay possible). */
+    var alwaysThrough: (() -> View?)? = null
+    private val passRect = RectF()
     private var hasMark = false
     private var markAlpha = 0f
     private var ending = false
@@ -273,6 +276,7 @@ class Coach(
             route = when {
                 inCard -> Route.CARD
                 hasMark && step?.through == true && want.contains(e.x, e.y) -> Route.THROUGH
+                rectOf(alwaysThrough?.invoke(), 0f, passRect) && passRect.contains(e.x, e.y) -> Route.THROUGH
                 else -> Route.BLOCK
             }
             if (route == Route.BLOCK) {
