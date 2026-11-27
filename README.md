@@ -8,7 +8,14 @@
 
 ## 下载
 
-在 [Releases](../../releases) 下载 `app-debug.apk` 安装即可（需要允许安装未知来源应用）。
+点下面的链接直接下载安装包，装上即可（需要允许安装未知来源应用）。
+
+| 版本 | 适合 | 下载 |
+|---|---|---|
+| **正式版 0.3.0** | 日常使用，推荐 | [下载 APK](https://github.com/YZH2006517/Photo-All-Android/releases/download/v0.3.0/app-debug.apk) |
+| **测试版 0.3.1-beta9** | 想先试新功能：拼贴相机、AI 相机、AI 修图（开发中，不代表最终效果） | [下载 APK](https://github.com/YZH2006517/Photo-All-Android/releases/download/v0.3.1-beta9/PhotoAll-0.3.1-beta9.apk) |
+
+两个版本签名相同：测试版可以直接覆盖安装在正式版上；从测试版回到正式版需要先卸载。历史版本见 [Releases](../../releases)。
 
 - Android 10（API 29）及以上，64 位 ARM（arm64-v8a）
 - GPU 需支持 Vulkan 1.1
