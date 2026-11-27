@@ -28,8 +28,8 @@ android {
         applicationId = "org.photoall.film"
         minSdk = 29
         targetSdk = 36
-        versionCode = 143
-        versionName = "0.3.0"
+        versionCode = 147
+        versionName = "0.3.1-beta3"
         ndk { abiFilters += "arm64-v8a" }
         buildConfigField("String", "REPORT_URL", "\"${localProps.getProperty("report.url", "")}\"")
         buildConfigField("String", "REPORT_TOKEN", "\"${localProps.getProperty("report.token", "")}\"")

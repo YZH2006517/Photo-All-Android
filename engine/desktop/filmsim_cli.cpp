@@ -205,7 +205,7 @@ int main(int argc, char **argv)
   if(loaded && is_dng)
   {
     std::vector<uint8_t> bytes;
-    loaded = read_file(in_path, bytes) && film::parse_dng(bytes.data(), bytes.size(), raw, error);
+    loaded = read_file(in_path, bytes) && film::parse_dng(bytes.data(), bytes.size(), raw, error, nullptr, options.max_long_edge);
     if(loaded)
       std::cout << "dng: " << raw.width << "x" << raw.height << " white " << raw.white << " black " << raw.black[0]
                 << " wb " << raw.wb[0] << "/" << raw.wb[1] << "/" << raw.wb[2] << " gain map " << raw.map_width << "x"

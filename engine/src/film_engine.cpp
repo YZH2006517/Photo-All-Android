@@ -1452,7 +1452,12 @@ struct FilmEngine::Impl
               options.stages.film && options.stages.gamut && !options.calibrate ? 1.0f : 0.0f},
              {}};
     static_assert(sizeof(encode) == 112, "encode push constants");
-    if(mode == 2) std::memcpy(encode.scan, scan_cal, sizeof(scan_cal));
+    if(mode == 2)
+    {
+      std::memcpy(encode.scan, scan_cal, sizeof(scan_cal));
+      note("冲洗曝光", "直接扫描校准", "中灰 %.2f/%.2f/%.2f，斜率 %.3f/%.3f/%.3f，片基 %.2f/%.2f/%.2f 档", scan_cal[0][0], scan_cal[0][1],
+           scan_cal[0][2], scan_cal[1][0], scan_cal[1][1], scan_cal[1][2], scan_cal[2][0], scan_cal[2][1], scan_cal[2][2]);
+    }
     // a print or a slide: its own base white, its deepest density black (see calibrate_print)
     if(mode == 0 && (print_m != 1.0f || print_q != 0.0f))
     {

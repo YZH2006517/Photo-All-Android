@@ -372,7 +372,7 @@ JNIEXPORT jlongArray JNICALL Java_org_photoall_film_engine_FilmNative_developDng
         // an error escaping a std::thread ends the process: it becomes this frame's error
         try
         {
-          if(film::parse_dng(datas[i], sizes[i], raws[i], errors[i], has_neutral ? neutral : nullptr) && noise_s > 0.0f)
+          if(film::parse_dng(datas[i], sizes[i], raws[i], errors[i], has_neutral ? neutral : nullptr, max_long_edge) && noise_s > 0.0f)
           {
             raws[i].noise_scale = noise_s;
             raws[i].noise_offset = noise_o;

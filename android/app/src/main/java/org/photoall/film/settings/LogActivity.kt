@@ -17,7 +17,7 @@ import org.photoall.film.ui.Style
 /**
  * 日志 (the last entry of the settings): this phone's diagnostics and the errors the app
  * handled lately, shown in full so the user sees exactly what they pass on, with one button
- * to copy it (sending straight to the report cloud function is off for now: it failed).
+ * to copy it and, when the build has the report address, one to send it to the developer.
  * No photos and no account data are in it.
  */
 class LogActivity : Activity() {
@@ -56,6 +56,29 @@ class LogActivity : Activity() {
             status.visibility = View.VISIBLE
         }
 
+        val send = if (!org.photoall.film.ReportSender.enabled) null else button("发送给开发者", false) { b ->
+            if (log.isEmpty() || b.tag == "sent") return@button
+            b.isEnabled = false
+            b.text = "发送中…"
+            Thread {
+                val result = org.photoall.film.ReportSender.send("日志", log, false)
+                runOnUiThread {
+                    if (isFinishing) return@runOnUiThread
+                    b.isEnabled = true
+                    status.visibility = View.VISIBLE
+                    result.onSuccess { id ->
+                        b.tag = "sent"
+                        b.text = "已发送 ✓"
+                        status.text = "报告编号 $id。和开发者联系时报上这个编号就能找到它，谢谢。"
+                    }.onFailure {
+                        b.text = "再试一次"
+                        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Photo All 日志", log))
+                        status.text = "没发出去（${it.message ?: "网络不通"}），日志已复制，可以粘贴给开发者。"
+                    }
+                }
+            }.start()
+        }
+
         val header = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(20), dp(10), dp(8), dp(6))
@@ -71,7 +94,7 @@ class LogActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(4), dp(16), dp(24))
             addView(TextView(this@LogActivity).apply {
-                text = "遇到问题时，复制这份日志发给开发者：里面只有机型、系统、相机能力、拍摄设置与最近的出错记录，不含任何照片。下面就是会发出去的全部内容。"
+                text = "遇到问题时，把这份日志发送或复制给开发者：里面只有机型、系统、相机能力、拍摄设置与最近的出错记录，不含任何照片。下面就是会发出去的全部内容。"
                 textSize = 13f; setTextColor(Style.TEXT_2); setLineSpacing(0f, 1.3f)
             }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
             addView(body, LinearLayout.LayoutParams(-1, -2))
@@ -81,6 +104,7 @@ class LogActivity : Activity() {
             setPadding(dp(16), dp(10), dp(16), dp(12))
             addView(status)
             addView(LinearLayout(this@LogActivity).apply {
+                send?.let { addView(it, LinearLayout.LayoutParams(0, dp(46), 1f).apply { marginEnd = dp(10) }) }
                 addView(copy, LinearLayout.LayoutParams(0, dp(46), 1f))
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         }
