@@ -1474,7 +1474,8 @@ struct FilmEngine::Impl
   // source itself in linear light (transfer decoded first, as everything after the door
   // is linear). Fills decode.comp's tone constants; returns an exposure gain that moves
   // the frame's centre-weighted log-average part of the way to a typical key.
-  float choose_restore(const SourceImage &src, float strength, float tone[4], float tone2[4])
+  float choose_restore(const SourceImage &src, float strength, float tone[4], float tone2[4],
+                       bool quiet = false, float *white_out = nullptr)
   {
     static float eotf[256];
     static bool ready = false;
@@ -1520,6 +1521,8 @@ struct FilmEngine::Impl
     const float key = weight_sum > 0 ? static_cast<float>(std::exp(log_sum / weight_sum)) : 0.18f;
     const float placed = 0.18f * std::pow(key / 0.18f, slope); // the key after the slope
     const float ev = strength * std::clamp(0.5f * std::log2(0.12f / std::max(placed, 1e-4f)), -0.75f, 0.75f);
+    if(white_out) *white_out = white;
+    if(quiet) return std::exp2(ev);
     note("场景还原", "强度", "%.2f", strength);
     note("场景还原", "画面亮度 key（线性）", "%.4f → %.4f", key, placed);
     note("场景还原", "过曝比例", "%.2f%%", clip * 100.0f);
@@ -1967,16 +1970,25 @@ struct FilmEngine::Impl
     ColourSpace output;
     bool slide;
     float m, q, ev;
+    float highlight; // the source's white in scene light (0: a RAW, the paper base is white)
   };
   std::vector<PrintCalibration> print_cache;
   float print_m = 1.0f;  // Y' = m Y + q: the base onto white, the deepest density onto black
   float print_q = 0.0f;
   float print_ev = 0.0f; // the paper exposure (a slide: the film's) that keeps mid grey there
 
-  bool calibrate_print(const FilmParams &base, ColourSpace output, bool slide, std::string &error)
+  bool calibrate_print(const FilmParams &given, ColourSpace output, bool slide, std::string &error, float highlight = 0.0f)
   {
+    // Measured at the neutral exposures: the user's 胶片曝光 / 印放曝光 go on top of the
+    // result (develop_source adds print_ev to them). Measured with them, the mid-grey search
+    // took each change of exposure straight back out again, until it ran into its limit
+    // (+2.5 EV), where the picture then jumped.
+    FilmParams base = given;
+    base.ev_film = 0.0f;
+    base.ev_paper = 0.0f;
     for(const PrintCalibration &c : print_cache)
-      if(c.output == output && c.slide == slide && std::memcmp(&c.params, &base, sizeof(FilmParams)) == 0)
+      if(c.output == output && c.slide == slide && std::abs(c.highlight - highlight) <= 0.02f * highlight &&
+         std::memcmp(&c.params, &base, sizeof(FilmParams)) == 0)
       {
         print_m = c.m;
         print_q = c.q;
@@ -2051,7 +2063,17 @@ struct FilmEngine::Impl
       return false;
     const float white = std::clamp(bare > 1e-6f ? with_base / bare : 1.0f, 0.3f, 1.0f);
     const float black = std::clamp(deepest, 0.0f, white * 0.5f);
-    const float m = (1.0f - kBlack) / std::max(white - black, 1e-4f);
+    float m = (1.0f - kBlack) / std::max(white - black, 1e-4f);
+    // An 8-bit source (a phone's JPEG) has no light above its own white: its 255 comes out of
+    // scene restore only a few stops over mid grey and prints well under the paper's white,
+    // the top of the histogram empty. Its white is put just under the display's instead (the
+    // black stays; mid grey is found again below). A RAW keeps the paper base as white.
+    if(highlight > 0.0f)
+    {
+      float top = 0.0f;
+      if(!measure(highlight, 0.0f, base_full, top)) return false;
+      m = std::max(m, (0.97f - kBlack) / std::max(top - black, 1e-4f));
+    }
     const float q = kBlack - m * black;
     // the exposure that prints mid grey there under the map: secant steps in stops
     auto miss = [&](float y) { return std::log2(std::max(m * y + q, 1e-6f) / kMidGreyPrinted); };
@@ -2068,7 +2090,7 @@ struct FilmEngine::Impl
       e1 = e2; f1 = miss(y2);
     }
     if(print_cache.size() >= 8) print_cache.erase(print_cache.begin());
-    print_cache.push_back({base, output, slide, m, q, e1});
+    print_cache.push_back({base, output, slide, m, q, e1, highlight});
     print_m = m;
     print_q = q;
     print_ev = e1;
@@ -2196,7 +2218,20 @@ struct FilmEngine::Impl
       print_ev = 0.0f;
       // a print, or a slide scanned as it is: both are seen against their own base
       const bool slide = scanning && is_positive_film(params.film);
-      if((printing || slide) && !calibrate_print(base, options.output, slide, error)) return false;
+      float highlight = 0.0f;
+      if(source.rgba8 && (printing || slide))
+      {
+        // the source's 1.0 after scene restore and the frame's exposure, against a 0.184 mid grey
+        float white = 1.0f, gain = 1.0f, t[4], t2[4];
+        if(options.stages.restore > 0.0f)
+        {
+          const float g = choose_restore(source, std::min(options.stages.restore, 1.0f), t, t2, true, &white);
+          if(options.stages.meter) gain = g;
+        }
+        highlight = std::clamp(white * gain * std::exp2(options.exposure_ev) * (0.184f / 0.18f), 0.184f * 4.0f, 0.184f * 32.0f);
+        note("相纸", "白点（8 位原图的白）", "%+.2f EV（中灰之上）", std::log2(highlight / 0.184f));
+      }
+      if((printing || slide) && !calibrate_print(base, options.output, slide, error, highlight)) return false;
       (slide ? params.ev_film : params.ev_paper) += print_ev;
     }
     params.enlarge = 0;

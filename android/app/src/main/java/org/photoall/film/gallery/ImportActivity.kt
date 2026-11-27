@@ -59,6 +59,17 @@ class ImportActivity : ComponentActivity() {
 
     private var uris: List<Uri> = emptyList()
     private var current = 0
+    /**
+     * Each picture's own recipe, kept when the strip moves to another: adjusting one leaves
+     * the others as they were. A picture never shown starts from the recipe the screen opened
+     * with ([startRecipe]); 应用到全部 gives every picture the one on screen.
+     */
+    private val looks = HashMap<Int, Recipe>()
+    /** 冲洗过程动画 is open over this screen; [afterShow] waits for it to close. */
+    private var showing = false
+    private var afterShow: (() -> Unit)? = null
+    /** The recipe the screen opened with: where a picture not yet adjusted starts. */
+    private var startRecipe: Recipe? = null
 
     // the recipe, starting from the camera's (changing it here leaves the camera's alone)
     private var filmOn = true
@@ -176,11 +187,20 @@ class ImportActivity : ComponentActivity() {
         // an HDR window while the preview has a gain map (Edr.fitWindow): its highlights shown,
         // and the original (no gain map) not dimmed when held up for comparison
         for (setting in Settings.all) if (engineParam(setting)) initial[setting.key] = store[setting.key]
+        startRecipe = recipe()
         onBackPressedDispatcher.addCallback(this, closeParams)
         build()
         @Suppress("DEPRECATION")
         val saved = savedInstanceState?.getParcelableArrayList<Uri>(URIS)
         if (!saved.isNullOrEmpty()) choose(saved) else pickPictures()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (showing) {
+            showing = false
+            afterShow?.let { afterShow = null; it() }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -324,6 +344,11 @@ class ImportActivity : ComponentActivity() {
                 override fun onStartTrackingTouch(bar: SeekBar) {}
                 override fun onStopTrackingTouch(bar: SeekBar) = schedulePreview()
             })
+            Style.doubleTapReset(this) {
+                lutStrength = startRecipe?.strength ?: 1f
+                progress = (lutStrength * 100).roundToInt()
+                syncPanel(); schedulePreview()
+            }
         }
         strengthRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -358,7 +383,7 @@ class ImportActivity : ComponentActivity() {
         }
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             setPadding(dp(16), dp(12), dp(16), dp(12))
             addView(pages, LinearLayout.LayoutParams(-1, dp(40)))
             addView(LinearLayout(this@ImportActivity).apply {
@@ -476,19 +501,25 @@ class ImportActivity : ComponentActivity() {
             }
         }
         tuneBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE; setPadding(0, dp(4), 0, 0) }
-        tuneBox.addView(tuneRow("色温", -100, 100, { (temp * 100).roundToInt() }, { v -> temp = v / 100f },
-            { v -> if (v == 0) "±0" else (if (v > 0) "暖 " else "冷 ") + kotlin.math.abs(v) }))
-        tuneBox.addView(tuneRow("色调", -100, 100, { (tint * 100).roundToInt() }, { v -> tint = v / 100f },
-            { v -> if (v == 0) "±0" else (if (v > 0) "绿 " else "品 ") + kotlin.math.abs(v) }))
-        tuneBox.addView(tuneRow("场景还原", 0, 100, { (restore * 100).roundToInt() }, { v -> restore = v / 100f },
-            { v -> "$v%" }))
-        if (Edr.supported) tuneBox.addView(tuneRow("EDR 高光", 0, 25, { (edr * 10).roundToInt() }, { v -> edr = v / 10f },
-            { v -> if (v == 0) "关" else "+%.1f 档".format(Locale.US, v / 10f) }))
+        fillTune()
         syncTune()
     }
 
-    /** One slider: label, bar, value; a double tap on the label puts it back to its default. */
-    private fun tuneRow(name: String, min: Int, max: Int, get: () -> Int, set: (Int) -> Unit, show: (Int) -> String): View {
+    /** The fine-adjustment sliders, drawn from the values in effect (again when another picture is shown). */
+    private fun fillTune() {
+        tuneBox.removeAllViews()
+        tuneBox.addView(tuneRow("色温", -100, 100, 0, { (temp * 100).roundToInt() }, { v -> temp = v / 100f },
+            { v -> if (v == 0) "±0" else (if (v > 0) "暖 " else "冷 ") + kotlin.math.abs(v) }))
+        tuneBox.addView(tuneRow("色调", -100, 100, 0, { (tint * 100).roundToInt() }, { v -> tint = v / 100f },
+            { v -> if (v == 0) "±0" else (if (v > 0) "绿 " else "品 ") + kotlin.math.abs(v) }))
+        tuneBox.addView(tuneRow("场景还原", 0, 100, 100, { (restore * 100).roundToInt() }, { v -> restore = v / 100f },
+            { v -> "$v%" }))
+        if (Edr.supported) tuneBox.addView(tuneRow("EDR 高光", 0, 25, 15, { (edr * 10).roundToInt() }, { v -> edr = v / 10f },
+            { v -> if (v == 0) "关" else "+%.1f 档".format(Locale.US, v / 10f) }))
+    }
+
+    /** One slider: label, bar, value; a double tap on the bar puts it back to [default]. */
+    private fun tuneRow(name: String, min: Int, max: Int, default: Int, get: () -> Int, set: (Int) -> Unit, show: (Int) -> String): View {
         val value = TextView(this).apply { textSize = 13f; setTextColor(Style.TEXT); gravity = Gravity.END; maxLines = 1; Style.numeric(this) }
         val bar = SeekBar(this).apply {
             this.max = max - min
@@ -505,6 +536,11 @@ class ImportActivity : ComponentActivity() {
                 override fun onStartTrackingTouch(bar: SeekBar) {}
                 override fun onStopTrackingTouch(bar: SeekBar) { saveTune(); syncPanel(); schedulePreview() }
             })
+            Style.doubleTapReset(this) {
+                set(default)
+                progress = default - min
+                syncTune(); saveTune(); syncPanel(); schedulePreview()
+            }
         }
         value.text = show(get())
         return LinearLayout(this).apply {
@@ -536,6 +572,7 @@ class ImportActivity : ComponentActivity() {
     private fun choose(chosen: List<Uri>) {
         uris = chosen
         current = 0
+        looks.clear()
         thumbs.removeAllViews()
         thumbScroll.visibility = if (uris.size > 1) View.VISIBLE else View.GONE
         for ((i, uri) in uris.withIndex()) {
@@ -547,7 +584,7 @@ class ImportActivity : ComponentActivity() {
                     override fun getOutline(view: View, outline: android.graphics.Outline) =
                         outline.setRoundRect(0, 0, view.width, view.height, dp(6).toFloat())
                 }
-                setOnClickListener { if (i != current) { current = i; markThumb(); loadCurrent() } }
+                setOnClickListener { if (i != current) switchTo(i) }
             }
             thumbs.addView(thumb, LinearLayout.LayoutParams(dp(56), dp(56)).apply { marginEnd = dp(8) })
             if (uris.size > 1) worker.later {
@@ -555,13 +592,53 @@ class ImportActivity : ComponentActivity() {
                 runOnUiThread { thumb.setImageBitmap(small) }
             }
         }
+        // the recipe on screen onto every picture at once
+        if (uris.size > 1) thumbs.addView(TextView(this).apply {
+            text = "应用到\n全部"
+            textSize = 11f
+            gravity = Gravity.CENTER
+            setTextColor(Style.TEXT)
+            background = GradientDrawable().apply { cornerRadius = dp(6).toFloat(); setColor(Style.SURFACE); setStroke(dp(1), Style.TEXT_3) }
+            Style.pressable(this)
+            contentDescription = "把这张的设置应用到全部照片"
+            setOnClickListener {
+                haptics.play(Haptics.Event.SEGMENT)
+                val r = recipe()
+                for (k in uris.indices) looks[k] = r
+                busy.text = "已把这张的设置应用到全部 ${uris.size} 张"
+                busy.visibility = View.VISIBLE
+                main.postDelayed({ if (busy.text.startsWith("已把")) busy.visibility = View.GONE }, 1600)
+            }
+        }, LinearLayout.LayoutParams(dp(56), dp(56)))
         markThumb()
         syncPanel()
         loadCurrent()
     }
 
+    /** To picture [i]: this one's recipe kept, that one's shown (or, never adjusted, the screen's opening one). */
+    private fun switchTo(i: Int) {
+        looks[current] = recipe()
+        current = i
+        show(looks[i] ?: startRecipe ?: recipe())
+        markThumb()
+        loadCurrent()
+    }
+
+    /** A recipe onto the controls. */
+    private fun show(r: Recipe) {
+        filmOn = r.filmOn; film = r.film; printOn = r.printOn; paper = r.paper
+        lut = r.lut; lutStrength = r.strength; evThirds = (r.ev * 3).roundToInt()
+        temp = r.temp; tint = r.tint; restore = r.restore; edr = r.edr; meter = r.meter
+        local.clear(); local.putAll(r.local)
+        fillPicker(animate = false)
+        fillTune()
+        syncTune()
+        paramsPanel?.refresh()
+        syncPanel()
+    }
+
     private fun markThumb() {
-        for (i in 0 until thumbs.childCount) {
+        for (i in 0 until minOf(thumbs.childCount, uris.size)) {
             val v = thumbs.getChildAt(i)
             v.alpha = if (i == current) 1f else 0.5f
             v.foreground = if (i == current) GradientDrawable().apply {
@@ -721,11 +798,20 @@ class ImportActivity : ComponentActivity() {
     private data class Recipe(val filmOn: Boolean, val film: Int, val printOn: Boolean, val paper: Int,
                               val lut: Int, val strength: Float, val ev: Float,
                               val temp: Float, val tint: Float, val restore: Float, val edr: Float,
-                              val meter: Boolean = true)
+                              val meter: Boolean = true,
+                              /** the engine parameters changed for it (全部参数), the camera's for the rest */
+                              val local: Map<String, Float> = emptyMap())
 
-    private fun recipe() = Recipe(filmOn, film, printOn, paper, lut, lutStrength, evThirds / 3f, temp, tint, restore, edr, meter)
+    private fun recipe() = Recipe(filmOn, film, printOn, paper, lut, lutStrength, evThirds / 3f, temp, tint, restore, edr, meter, HashMap(local))
 
-    private fun params(r: Recipe): Map<String, Float> = values.filmParams().toMutableMap().apply {
+    /** A recipe's own parameters, read as settings (the camera's where it changed none). */
+    private fun valuesOf(r: Recipe) = object : SettingValues {
+        override fun get(key: String) = r.local[key] ?: store[key]
+        override fun set(key: String, value: Float) {}
+        override fun resetAll() {}
+    }
+
+    private fun params(r: Recipe): Map<String, Float> = valuesOf(r).filmParams().toMutableMap().apply {
         this["film"] = r.film.toFloat()
         this["paper"] = r.paper.toFloat()
         this["stage film"] = if (r.filmOn) 1f else 0f
@@ -922,18 +1008,29 @@ class ImportActivity : ComponentActivity() {
         developing = true
         haptics.play(Haptics.Event.SEGMENT)
         syncPanel()
-        val r = recipe()
+        looks[current] = recipe()
+        // a picture never adjusted goes as the screen opened
+        val unseen = startRecipe ?: recipe()
+        val recipes = uris.indices.map { looks[it] ?: unseen }
         val list = uris
         val quality = store[Settings.JPEG_QUALITY].toInt()
         val private = store.flag(Settings.PRIVATE_PHOTOS)
         val longEdge = store.longEdge
         toFrame.clear()
+        // 冲洗过程动画: the picture on screen walked through the engine while the batch develops
+        if (store.flag(Settings.DEVELOP_SHOW)) {
+            val r = recipes[current]
+            showing = true
+            startActivity(DevelopShowActivity.intent(this, params(r), r.lut, r.strength, r.ev, r.meter)
+                .putExtra(DevelopShowActivity.EXTRA_URI, uris[current].toString())
+                .putExtra(DevelopShowActivity.EXTRA_AS_RAW, r.filmOn && sourceDng != null))
+        }
         worker.later {
             var done = 0
             var failed = 0
             for ((i, uri) in list.withIndex()) {
                 runOnUiThread { busy.text = "冲洗中 ${i + 1} / ${list.size}…"; busy.visibility = View.VISIBLE }
-                val ok = runCatching { developOne(uri, r, quality, private, longEdge) }
+                val ok = runCatching { developOne(uri, recipes[i], quality, private, longEdge) }
                     .onFailure { android.util.Log.e("FilmImport", "develop $uri", it) }.isSuccess
                 if (ok) done++ else failed++
             }
@@ -945,12 +1042,16 @@ class ImportActivity : ComponentActivity() {
                 busy.visibility = View.VISIBLE
                 // straight on to the border page, the pictures one after another
                 val frames = if (framed) ArrayList(toFrame) else ArrayList()
-                if (frames.isNotEmpty()) main.postDelayed({
-                    if (isFinishing) return@postDelayed
-                    startActivity(frames.first().putParcelableArrayListExtra(FrameActivity.QUEUE, ArrayList(frames.drop(1))))
-                    if (failed == 0) finish()
-                }, 500)
-                else if (failed == 0) main.postDelayed({ if (!isFinishing) finish() }, 700)
+                val then: () -> Unit = {
+                    if (frames.isNotEmpty()) main.postDelayed({
+                        if (isFinishing) return@postDelayed
+                        startActivity(frames.first().putParcelableArrayListExtra(FrameActivity.QUEUE, ArrayList(frames.drop(1))))
+                        if (failed == 0) finish()
+                    }, 500)
+                    else if (failed == 0) main.postDelayed({ if (!isFinishing) finish() }, 700)
+                }
+                // the process still on show: on from here once it is closed
+                if (showing) afterShow = then else then()
             }
         }
     }

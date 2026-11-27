@@ -81,7 +81,7 @@ class ViewerActivity : Activity() {
             if (android.os.Build.VERSION.SDK_INT >= 31)
                 setRenderEffect(android.graphics.RenderEffect.createBlurEffect(dp(36).toFloat(), dp(36).toFloat(),
                     android.graphics.Shader.TileMode.CLAMP))
-            else setBackgroundColor(Style.BG)
+            else background = org.photoall.film.ui.Style.ground()
         }
     }
     private lateinit var detailRows: LinearLayout
@@ -226,7 +226,7 @@ class ViewerActivity : Activity() {
         setContentView(LinearLayout(this).apply {
             root = this
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             addView(topBar, LinearLayout.LayoutParams(-1, dp(56)))
             addView(FrameLayout(this@ViewerActivity).apply {
                 setBackgroundColor(GalleryActivity.FILM_BASE)

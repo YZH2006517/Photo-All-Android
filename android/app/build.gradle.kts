@@ -28,8 +28,8 @@ android {
         applicationId = "org.photoall.film"
         minSdk = 29
         targetSdk = 36
-        versionCode = 147
-        versionName = "0.3.1-beta3"
+        versionCode = 153
+        versionName = "0.3.1-beta9"
         ndk { abiFilters += "arm64-v8a" }
         buildConfigField("String", "REPORT_URL", "\"${localProps.getProperty("report.url", "")}\"")
         buildConfigField("String", "REPORT_TOKEN", "\"${localProps.getProperty("report.token", "")}\"")
@@ -50,7 +50,8 @@ android {
     }
 
     // spectra/profile LUTs are already compact binary data
-    androidResources { noCompress += "lut" }
+    // models stay uncompressed in the APK: opened in place, copied out by length (Detail)
+    androidResources { noCompress += listOf("lut", "onnx", "data") }
 }
 
 dependencies {
@@ -58,5 +59,8 @@ dependencies {
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
+    implementation("androidx.camera:camera-view:$camerax")
+    // 拼贴相机: the subject cut out on the phone by U²-Net (u2netp, Apache-2.0, assets/segment), run by ONNX Runtime (MIT)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("androidx.activity:activity:1.10.1")
 }

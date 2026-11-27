@@ -1,0 +1,40 @@
+HDRNet - Deep Bilateral Learning for Real-Time Image Enhancement (SIGGRAPH 2017)
+Michael Gharbi, Jiawen Chen, Jonathan T. Barron, Samuel W. Hasinoff, Fredo Durand.
+Copyright 2016 Google Inc. Source code licensed under Apache License 2.0.
+The complete upstream license is included as LICENSE-HDRNet.txt.
+
+Official source: https://github.com/google/hdrnet
+Pinned source commit: e9a5bf59a232ee7562d02a6cf4dc5cef6191b6c6
+Official project: https://groups.csail.mit.edu/graphics/hdrnet/
+Official pretrained artifact:
+https://data.csail.mit.edu/graphics/hdrnet/pretrained_models.zip
+Member: pretrained_models/experts/experts_cm1/expertC/upgraded_from_sig2017.ckpt-0
+Checkpoint member integrity was checked against ZIP CRC, and SHA-256 hashes of
+the actual checkpoint files and bundled assets are recorded in hdrnet-model.json.
+
+Bundled derivative: official HDRNetCurves FiveK Expert C, channel multiplier 1,
+no batch normalization. This is the sRGB photographic enhancement model, not
+the HDR+ model intended for specially processed linear RAW inputs.
+
+Conversion changes: TensorFlow NHWC weights transposed for NCHW ONNX; exact
+TensorFlow SAME stride-2 padding and NHWC fully connected flatten order retained.
+The coefficient predictor alone is exported as hdrnet_fivek_c.onnx. Learned
+CCM, curve shifts/slopes, and channel-mixing guide parameters are exported
+without retraining as hdrnet_guide.bin. HdrNetColor.java applies the learned
+guide, half-cell bilateral sampling with repeating boundaries, the official
+smoothed depth interpolation epsilon 1e-8, and the local 3x4 affine transform.
+The optional app strength blends clamped model output with the input RGB.
+
+Input: float32 RGB sRGB [1,3,256,256], [0,1].
+Grid: float32 [1,16,16,8,3,4] = [batch,y,x,depth,output RGB,input RGB+offset].
+This preserves output image dimensions; low-resolution inference predicts
+full-frame spatial coefficients, then evaluates them at each full-resolution
+pixel. It is not a global LUT and does not generate an upscaled photograph.
+
+Reproduction: tools/fetch_naf_hdr.py downloads the official checkpoint members;
+tools/export_hdrnet.py --extract reads them using TensorFlow, and the default
+export command creates the ONNX and guide assets using PyTorch/ONNX.
+Python environment versions used: tensorflow-cpu 2.20.0, torch 2.7.1+cu128,
+onnx 1.18.0, onnxruntime 1.23.2. ONNX opset 17, float32, no quantization.
+TensorFlow-to-ONNX coefficient max absolute conversion error: 5.960464477539062e-7.
+This is conversion fidelity only; no application/device functional tests were run.

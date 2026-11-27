@@ -8,7 +8,14 @@
 
 ## 下载
 
-在 [Releases](../../releases) 下载 `app-debug.apk` 安装即可（需要允许安装未知来源应用）。
+点下面的链接直接下载安装包，装上即可（需要允许安装未知来源应用）。
+
+| 版本 | 适合 | 下载 |
+|---|---|---|
+| **正式版 0.3.0** | 日常使用，推荐 | [下载 APK](https://github.com/YZH2006517/Photo-All-Android/releases/download/v0.3.0/app-debug.apk) |
+| **测试版 0.3.1-beta9** | 想先试新功能：拼贴相机、AI 相机、AI 修图（开发中，不代表最终效果） | [下载 APK](https://github.com/YZH2006517/Photo-All-Android/releases/download/v0.3.1-beta9/PhotoAll-0.3.1-beta9.apk) |
+
+两个版本签名相同：测试版可以直接覆盖安装在正式版上；从测试版回到正式版需要先卸载。历史版本见 [Releases](../../releases)。
 
 - Android 10（API 29）及以上，64 位 ARM（arm64-v8a）
 - GPU 需支持 Vulkan 1.1
@@ -168,6 +175,13 @@ build/desktop/filmsim_cli --filmsim android/app/src/main/assets/filmsim/filmsim.
 | RAW 降噪着色器（`engine/shaders/denoise/`） | 改写自 vkdt 的 denoise 模块，hanatos | BSD 2-Clause，改动见该目录的 `README.md` |
 | 胶片 / 相纸光谱数据（`assets/filmsim/filmsim.lut`） | [spektrafilm](https://github.com/andreavolpato/spektrafilm)，Andrea Volpato | CC BY-SA 4.0（经 vkdt 打包，未修改） |
 | 光谱上采样表（`assets/filmsim/spectra-em.lut`） | 用 vkdt 的 mkspectra 生成 | 同 vkdt |
+| 拼贴相机抠图模型（`assets/segment/u2netp.onnx`） | [U²-Net](https://github.com/xuebinqin/U-2-Net)（Qin et al.），ONNX 版取自 [rembg](https://github.com/danielgatis/rembg) | Apache-2.0 |
+| 拼贴相机点选抠图（`assets/segment/mobile_sam_encoder.onnx`、`sam_decoder.onnx`） | [MobileSAM](https://github.com/ChaoningZhang/MobileSAM)（Chaoning Zhang et al.）；解码器来自 Meta AI 的 [Segment Anything](https://github.com/facebookresearch/segment-anything)；ONNX 版取自 Acly/MobileSAM | MobileSAM MIT；Segment Anything Apache-2.0 |
+| AI 相机构图（`assets/compose/gaic_mobilenet.onnx`） | [GAIC](https://github.com/HuiZeng/Grid-Anchor-based-Image-Cropping-Pytorch)（Hui Zeng et al.） | MIT |
+| ONNX Runtime | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) | MIT |
+| 编辑器「智能」的修图引擎与模型（`assets/offline/`、`assets/photo_style/`，许可原文随附） | 移植自作者本人的 ZRetouch；模型：Image-Adaptive-3DLUT、SepLUT、AdaInt、HDRNet、IAT（Apache-2.0），NeurOp、Retinexformer、FFDNet / KAIR、WCT2（MIT），Zero-DCE++（仅限学术与非商业），FastPhotoStyle（CC BY-NC-SA 4.0，NVIDIA） | 见各许可文件 |
+| AI 消除（`assets/retouch/migan.onnx`） | [MI-GAN](https://github.com/Picsart-AI-Research/MI-GAN)，Picsart AI Research | MIT |
+| AI 清晰（`assets/retouch/real_esrgan_general_x4v3.*`） | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)，xinntao；ONNX 由 Qualcomm AI Hub 导出 | BSD-3-Clause |
 | JPEG XL 解码（DNG 1.7 的 JPEG XL 压缩，如三星 Expert RAW；构建时取 `third_party/libjxl`） | [libjxl](https://github.com/libjxl/libjxl) 0.11.1 及其依赖 Highway、Brotli、skcms | libjxl BSD-3-Clause；Highway Apache-2.0 / BSD-3；Brotli MIT；skcms BSD-3。只编入解码器 |
 | 相机 RAW 解包（`engine/libraw/`：NEF、CR2/CR3、ARW、RAF、ORF、RW2 等非 DNG 格式） | [LibRaw](https://www.libraw.org) 0.21.4，LibRaw LLC（含 Dave Coffin 的 dcraw 代码） | 按 CDDL 1.0 使用（LibRaw 为 LGPL 2.1 / CDDL 1.0 双许可），文件原样未改，由 `tools/sync_libraw.py` 导入，见 `engine/libraw/README.md`、`LICENSE.CDDL`。只用到解包，去马赛克和之后的步骤都是本引擎自己的；DNG 不经过它 |
 | 创意 LUT（`assets/luts/`） | [NatronGitHub/clut](https://github.com/NatronGitHub/clut)，Pat David、Juan Melara、Marc Roovers 等 | CC BY-SA 4.0，已从 HaldCLUT 8 级转换为 33³，见 `assets/luts/CREDITS.md` |

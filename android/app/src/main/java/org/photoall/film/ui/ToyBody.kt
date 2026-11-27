@@ -42,7 +42,8 @@ object Toy {
     val BODY get() = p.surface
     val BODY_TOP get() = lighten(p.surface, if (light) 0.25f else 0.05f)
     val BODY_BOTTOM get() = darken(p.surface, if (light) 0.06f else 0.3f)
-    val SOCKET get() = if (light) darken(p.surface, 0.14f) else darken(p.bg, 0.25f)
+    // glass: a see-through dark well, so the lit ground shows round it (an opaque one read as a cut-out box)
+    val SOCKET get() = if (Style.glass) 0x47000000 else if (light) darken(p.surface, 0.14f) else darken(p.bg, 0.25f)
     val INK get() = p.text
     val INK2 get() = p.text2
     val SHADOW get() = if (light) 0x66000000 else 0xcc000000.toInt()

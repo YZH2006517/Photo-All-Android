@@ -42,8 +42,10 @@ class Sheet(context: Context, title: String, content: View, header: View? = null
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16f), dp(if (side) 14f else 10f), dp(16f), dp(16f))
             background = GradientDrawable().apply {
-                setColor(Style.SURFACE)
-                val r = dp(22f).toFloat()
+                // glass: a deep frosted panel over the blurred screen (Android 12+ blurs it)
+                setColor(if (!Style.glass) Style.SURFACE else if (Style.palette.light) 0xf2f7f7fa.toInt() else 0xe6142229.toInt())
+                if (Style.glass) setStroke(dp(1f).coerceAtLeast(1), if (Style.palette.light) 0x14000000 else 0x26ffffff)
+                val r = dp(if (Style.glass) 30f else 22f).toFloat()
                 cornerRadii = if (side) floatArrayOf(0f, 0f, r, r, r, r, 0f, 0f)
                     else floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
             }
@@ -130,6 +132,11 @@ class Sheet(context: Context, title: String, content: View, header: View? = null
             setDimAmount(0f)
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
             attributes = attributes.apply { windowAnimations = 0 } // the panel animates itself
+            // glass: the screen behind frosted (Android 12+, where the system allows blur)
+            if (Style.glass && dimTo > 0f && android.os.Build.VERSION.SDK_INT >= 31) {
+                addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
+                attributes = attributes.apply { blurBehindRadius = dp(28f) }
+            }
         }
     }
 
@@ -158,7 +165,13 @@ class Sheet(context: Context, title: String, content: View, header: View? = null
         if (side) away.translationX(-panel.width.toFloat()) else away.translationY(panel.height.toFloat())
         away
             .setInterpolator(android.view.animation.AccelerateInterpolator(1.6f))
-            .withEndAction { super.dismiss() }.start()
+            // the activity may have gone while the sheet sank (a button that finished it): its
+            // window is no longer attached and dismissing would throw (Huawei VOL-AL00 report)
+            .withEndAction {
+                val decor = window?.decorView
+                if (decor == null || !decor.isAttachedToWindow) return@withEndAction
+                try { super.dismiss() } catch (_: IllegalArgumentException) {}
+            }.start()
     }
 
     private fun dim(from: Float, to: Float, ms: Long) {

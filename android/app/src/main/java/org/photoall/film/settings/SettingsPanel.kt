@@ -48,7 +48,7 @@ class SettingsPanel(
 
     init {
         orientation = VERTICAL
-        setBackgroundColor(Style.BG) // opaque: nothing underneath to blend
+        background = org.photoall.film.ui.Style.ground() // opaque: nothing underneath to blend
         val header = LinearLayout(context).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(20), dp(10), dp(8), dp(10))
@@ -354,6 +354,8 @@ class SettingsPanel(
             value.text = label(v)
             store[setting.key] = v
         }
+        // a double tap puts this one setting back, nothing else
+        seek.onDoubleTap = { store[setting.key] = setting.default; sync() }
         return LinearLayout(context).apply {
             orientation = VERTICAL
             setPadding(0, dp(12), 0, dp(8))

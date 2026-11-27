@@ -110,7 +110,7 @@ class LogActivity : Activity() {
         }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             addView(header)
             addView(Style.hairline(this@LogActivity), LinearLayout.LayoutParams(-1, 1))
             addView(ScrollView(this@LogActivity).apply { addView(list) }, LinearLayout.LayoutParams(-1, 0, 1f))

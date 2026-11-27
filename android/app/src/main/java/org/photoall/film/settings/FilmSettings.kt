@@ -41,6 +41,7 @@ object Settings {
     const val REEL_BEFORE = "app.reel.before" // 拍摄录屏: seconds kept from before the shutter
     const val REEL_AFTER = "app.reel.after"   // and recorded after it
     const val PRIVATE_PHOTOS = "app.privatephotos" // photos only in the app's own gallery
+    const val DEVELOP_SHOW = "app.developshow" // after an import or a RAW shot, the develop step by step
     const val SKIN = "app.skin"       // ui.Skin: 0 classic (the theme's), 1 sacred, 2 camera body, 3 anime
     const val THEME = "app.theme"     // index into ui.Style.palettes
     const val HAPTICS = "app.haptics" // 0 off, 1 light, 2 standard
@@ -134,6 +135,7 @@ object Settings {
         listOf(
             Setting.Choice(THEME, "主题", "界面", listOf("暗盒（暖黑 · 片盒黄）", "暗房红灯（夜拍，只用红光）",
                 "相纸（白天户外，浅色）", "黄铜（旁轴蒙皮与黄铜）", "冷银（冷灰 · 冰蓝）") + org.photoall.film.ui.Skin.names.drop(1), 0),
+            Setting.Toggle(DEVELOP_SHOW, "冲洗过程动画（导入或 RAW 拍摄后播放）", "界面", false),
             Setting.Choice(HAPTICS, "震动反馈（快门、拨盘、对焦确认）", "界面", listOf("关", "轻", "标准"), 2),
             Setting.Choice(FRAME, "边框样式", "边框", org.photoall.film.gallery.Frames.Kind.entries.map { it.label }, 1),
             Setting.Choice(FRAME_TEXT, "片边文字", "边框", listOf("跟随胶片", "不印"), 0),

@@ -14,6 +14,7 @@
     <!-- Only to list the app's own folder again after its data was cleared or it was
          reinstalled: the system then no longer counts those photos as the app's. -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <application
@@ -30,11 +31,21 @@
             android:screenOrientation="portrait"
             android:rotationAnimation="jumpcut"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|colorMode|layoutDirection|locale|touchscreen">
+        </activity>
+        <!-- the first screen: 胶片相机 or 拼贴相机 -->
+        <activity android:name=".collage.LaunchActivity" android:exported="true" android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".collage.CollageHomeActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".collage.StickerMakerActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".collage.StickerLibraryActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".collage.CollageActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".collage.CollageCameraActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".collage.PhotoPickerActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".collage.StickerEditActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".settings.SettingsActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".settings.LogActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".settings.WhatsNewActivity" android:exported="false" android:screenOrientation="portrait"
@@ -43,6 +54,7 @@
         <activity android:name=".settings.GuideActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.GalleryActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.ViewerActivity" android:exported="false" android:screenOrientation="portrait" />
+        <activity android:name=".gallery.DevelopShowActivity" android:exported="false" android:screenOrientation="portrait" />
         <activity android:name=".gallery.LightboxActivity" android:exported="false" android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".gallery.FrameActivity" android:exported="false" android:screenOrientation="portrait" />

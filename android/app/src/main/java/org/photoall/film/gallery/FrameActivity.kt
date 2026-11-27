@@ -1287,6 +1287,16 @@ class FrameActivity : Activity() {
     private inner class PillSlider(context: Context, start: Float, private val track: Int, private val fill: Int,
                                    private val onChange: (Float) -> Unit) : View(context) {
         private var value = start.coerceIn(0f, 1f)
+        /** A double tap: back to where the slider started (the style's own value). */
+        private val rest = value
+        private val taps = android.view.GestureDetector(context, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                value = rest
+                invalidate()
+                onChange(value)
+                return true
+            }
+        })
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val knob = dp(12).toFloat()
         override fun onDraw(canvas: Canvas) {
@@ -1306,6 +1316,7 @@ class FrameActivity : Activity() {
             canvas.drawCircle(x, cy, knob, paint)
         }
         override fun onTouchEvent(e: MotionEvent): Boolean {
+            if (taps.onTouchEvent(e) && e.actionMasked != MotionEvent.ACTION_MOVE) return true
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
                     parent?.requestDisallowInterceptTouchEvent(true)

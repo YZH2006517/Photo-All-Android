@@ -1,0 +1,39 @@
+{
+  "name": "Official HDRNetCurves FiveK Expert C (channel multiplier 1)",
+  "source": "https://github.com/google/hdrnet",
+  "source_commit": "e9a5bf59a232ee7562d02a6cf4dc5cef6191b6c6",
+  "checkpoint_source": "https://data.csail.mit.edu/graphics/hdrnet/pretrained_models.zip",
+  "checkpoint_member": "pretrained_models/experts/experts_cm1/expertC/upgraded_from_sig2017.ckpt-0",
+  "checkpoint_sha256": {
+    "upgraded_from_sig2017.ckpt-0.data-00000-of-00001": "e84026b9875dc7f73579e0ecc3bd8bb4254ce0ba2c486ffcac0e3cc631cc6f63",
+    "upgraded_from_sig2017.ckpt-0.index": "67b18a617d313b0c73a4166f0b48813b21b1a0f7e2753a66210e54cb06dafb5c",
+    "upgraded_from_sig2017.ckpt-0.meta": "e037bf391e94feb8662129d624f6efa2a32e98be7fc17f65a8d15c0183d76b9b"
+  },
+  "parameters": {
+    "spatial_bin": 16,
+    "luma_bins": 8,
+    "net_input_size": 256,
+    "channel_multiplier": 1,
+    "model_name": "HDRNetCurves",
+    "batch_norm": false
+  },
+  "license": "Apache-2.0 (official HDRNet repository)",
+  "assets": {
+    "hdrnet_fivek_c.onnx": {
+      "sha256": "998445785996a5f3467ca709870f67559a64130ff56dd57911fbe93ed941663b",
+      "bytes": 1941597
+    },
+    "hdrnet_guide.bin": {
+      "sha256": "319d7bcc199dcb96cdfd0f425b115600279b3154d304746f6a04934d8630963b",
+      "bytes": 456
+    }
+  },
+  "onnx_input": "image float32 RGB sRGB [1,3,256,256] in [0,1]",
+  "onnx_output": "grid float32 [1,16,16,8,3,4], y,x,depth,output RGB,input RGB+offset",
+  "guide_layout": "little endian int32 magic 0x48445231, int32 count112, float32 ccm9,bias3,shifts48,slopes48,mix3,mix_bias1",
+  "slicing": "official half-cell centers, repeating boundaries; depth smoothed lerp sqrt(delta^2+1e-8)",
+  "conversion_fidelity": {
+    "tensorflow_onnx_max_abs_grid_error": 5.960464477539062e-07,
+    "scope": "synthetic tensor for checkpoint conversion only; no app/device functional tests"
+  }
+}

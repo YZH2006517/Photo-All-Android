@@ -51,6 +51,7 @@ import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
+import org.photoall.film.camera.Lenses.LensOption
 import org.photoall.film.MainActivity
 import org.photoall.film.engine.DevelopOptions
 import org.photoall.film.engine.Developed
@@ -1033,8 +1034,23 @@ class CameraActivity : ComponentActivity() {
             addView(slot, FrameLayout.LayoutParams(-2, -2,
                 if (landscape) Gravity.CENTER else Gravity.TOP or Gravity.CENTER_HORIZONTAL))
         }
-        for (v in listOf(thumbnail, shutter, quickButton)) (v.parent as? android.view.ViewGroup)?.removeView(v)
+        val apple = applePortrait(landscape)
+        for (v in if (apple) listOf(thumbnail, shutter) else listOf(thumbnail, shutter, quickButton)) (v.parent as? android.view.ViewGroup)?.removeView(v)
         styleForBody(landscape)
+        if (apple) {
+            (facingButton.parent as? android.view.ViewGroup)?.removeView(facingButton)
+            // round frosted keys on the light grey; on the dark camera, Apple's grey disc
+            facingButton.background = Style.surface(this, fill = Style.SURFACE, radiusDp = 24f)
+            facingButton.setPadding(dp(12), dp(12), dp(12), dp(12))
+            facingButton.setImageDrawable(Icon(Icon.Kind.FLIP, if (Style.palette.light) Style.TEXT else 0xffffffff.toInt(), 1.8f))
+            quickButton.background = Style.surface(this, fill = Color.TRANSPARENT, radiusDp = 24f)
+            quickButton.setPadding(dp(13), dp(13), dp(13), dp(13))
+            thumbnail.background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(if (Style.palette.light) 0x14000000 else 0x1fffffff)
+                setStroke(dp(1), if (Style.palette.light) 0xccffffff.toInt() else 0x33ffffff)
+            }
+        }
         frameCount.setTextColor(if (landscape) 0xfff2f0ea.toInt() else Style.TEXT)
         frameCount.textSize = if (landscape) 16f else 20f
         frameNote.setTextColor(if (landscape) 0xffb4ada3.toInt() else Style.TEXT_2)
@@ -1045,7 +1061,7 @@ class CameraActivity : ComponentActivity() {
         if (skinned) frameCount.typeface = org.photoall.film.ui.Skin.figures()
         stage.show(slot, LinearLayout(this).apply {
             orientation = if (landscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             if (skinned && !landscape) background = org.photoall.film.ui.Skin.Backdrop(resources.displayMetrics.density, false)
             if (landscape) {
                 // the phone as a toy camera: the viewfinder sunk in the middle, controls either side
@@ -1072,7 +1088,13 @@ class CameraActivity : ComponentActivity() {
                 // viewfinder and controls together under the top bar; spare height goes
                 // below them, toward the shutter
                 finderHost.removeView(slot)
-                val shutterRow = gridRow(
+                val shutterRow = if (apple) gridRow(
+                    cell(thumbnail, 1f, dp(48)),
+                    cell(shutter, 1f, dp(78)),
+                    cell(facingButton, 1f, dp(48)),
+                    height = dp(104),
+                ).apply { setPadding(dp(28), 0, dp(28), dp(8)) }
+                else gridRow(
                     cell(thumbnail, 1f, dp(52)),
                     cell(shutter, 1f, dp(80)),
                     cell(quickButton, 1f, dp(52)),
@@ -1262,7 +1284,7 @@ class CameraActivity : ComponentActivity() {
         }
         if (!body) Style.pressable(quickButton)
         // portrait: the front / back switch goes back onto the picture's lower right
-        if (!body && facingButton.parent !== viewfinderFrame) {
+        if (!body && !applePortrait(false) && facingButton.parent !== viewfinderFrame) {
             (facingButton.parent as? android.view.ViewGroup)?.removeView(facingButton)
             viewfinderFrame.addView(facingButton, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.BOTTOM or Gravity.END).apply {
                 bottomMargin = dp(12); marginEnd = dp(12)
@@ -1872,8 +1894,15 @@ class CameraActivity : ComponentActivity() {
      * Flash and HDR on the left; the frame counter and settings on the right. The middle
      * stays free for a centred camera hole (the histogram switch is in the settings sheet).
      */
+    /**
+     * The default theme upright, laid out as Apple's Camera: black, the zoom pills on the
+     * picture, then the album at the left of a plain white shutter and the front / back
+     * switch at its right; the shooting settings move up to the top bar.
+     */
+    private fun applePortrait(landscape: Boolean) = !landscape && Style.glass && !org.photoall.film.ui.Skin.active
+
     private fun fillTopBar(landscape: Boolean) {
-        for (v in listOf(flashIcon, frameCount, frameNote, histogramIcon, settingsIcon))
+        for (v in listOf(flashIcon, frameCount, frameNote, histogramIcon, settingsIcon) + if (applePortrait(landscape)) listOf(quickButton) else emptyList())
             (v.parent as? android.view.ViewGroup)?.removeView(v)
         (frameCount.parent as? android.view.ViewGroup)?.let { (it.parent as? android.view.ViewGroup)?.removeView(it) }
         topBar.removeAllViews()
@@ -1894,6 +1923,7 @@ class CameraActivity : ComponentActivity() {
             addView(frameCount)
             addView(frameNote, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(5) })
         }, LinearLayout.LayoutParams(-2, if (landscape) dp(32) else -1).apply { marginEnd = dp(4) })
+        if (applePortrait(landscape)) topBar.addView(quickButton, LinearLayout.LayoutParams(icon, icon))
         topBar.addView(settingsIcon, LinearLayout.LayoutParams(icon, icon))
     }
 
@@ -2004,6 +2034,7 @@ class CameraActivity : ComponentActivity() {
             return
         }
         val generation = viewfinder.surfaceGeneration
+        developShow?.close() // laid over the old layout's viewfinder
         attachLayout()
         coach?.event("turn")
         // The viewfinder kept its surface and the camera keeps running: only the turn from
@@ -2012,6 +2043,33 @@ class CameraActivity : ComponentActivity() {
         if (turning) turnIn()
         // should the GL surface have been made anew on the way, the camera needs it handed over
         main.postDelayed({ if (viewfinder.surfaceGeneration != generation) bindCamera() }, 400)
+    }
+
+    /** 冲洗过程动画 of the last shot, laid over the viewfinder (null: none playing). */
+    private var developShow: org.photoall.film.gallery.DevelopShowView? = null
+
+    /** Plays a shot's develop in the viewfinder's place, its shape and corners; a newer shot's replaces it. */
+    private fun showDevelop(spec: Intent) {
+        developShow?.close()
+        val content = findViewById<android.view.ViewGroup>(android.R.id.content)
+        val at = IntArray(2).also { viewfinderFrame.getLocationOnScreen(it) }
+        val origin = IntArray(2).also { content.getLocationOnScreen(it) }
+        if (viewfinderFrame.width == 0) return
+        lateinit var view: org.photoall.film.gallery.DevelopShowView
+        view = org.photoall.film.gallery.DevelopShowView(this, spec) {
+            content.removeView(view)
+            if (developShow === view) developShow = null
+        }
+        val radius = overlay.cornerRadius
+        view.outlineProvider = object : android.view.ViewOutlineProvider() {
+            override fun getOutline(v: View, outline: android.graphics.Outline) = outline.setRoundRect(0, 0, v.width, v.height, radius)
+        }
+        view.clipToOutline = true
+        content.addView(view, android.widget.FrameLayout.LayoutParams(viewfinderFrame.width, viewfinderFrame.height).apply {
+            leftMargin = at[0] - origin[0]
+            topMargin = at[1] - origin[1]
+        })
+        developShow = view
     }
 
     /** The screen turned: the running camera's pictures turn with it, without a rebind. */
@@ -2755,6 +2813,10 @@ class CameraActivity : ComponentActivity() {
                             ShutterSound.play(this@CameraActivity, ShutterSound.kind(this@CameraActivity).let { if (it == ShutterSound.Kind.OFF) ShutterSound.Kind.SYSTEM else it })
                         }
                     })
+                    Style.doubleTapReset(this) {
+                        progress = 50
+                        ShutterSound.setVolume(this@CameraActivity, 0.5f)
+                    }
                 }, LinearLayout.LayoutParams(0, -2, 1f))
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
         }
@@ -2896,6 +2958,7 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        developShow?.close() // its engine is not kept while the camera is away
         closeFlashModes()
         if (eyepiece) stopEyeMotion() // the gyroscope only while the screen is shown
         zsl?.let {
@@ -3004,106 +3067,24 @@ class CameraActivity : ComponentActivity() {
 
     // ----- camera -----------------------------------------------------------
 
-    /** Cameras of the current facing that apps can open. */
-    private fun lenses(provider: ProcessCameraProvider): List<CameraInfo> {
-        val facing = if (front) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-        return provider.availableCameraInfos.filter { it.lensFacing == facing }.sortedBy { equivalentMm(it) }
-    }
+    // The lenses (detection, the main camera, focal lengths, the rules for RAW): [Lenses], shared
+    // with 拼贴相机's camera.
+    private fun lenses(provider: ProcessCameraProvider) = Lenses.lenses(provider, front)
+    private fun lensOptions(provider: ProcessCameraProvider) = Lenses.lensOptions(this, provider, front, lensDeadIds())
+    private fun snapRatio(r: Float) = Lenses.snapRatio(r)
+    private fun mainCamera(cameras: List<CameraInfo>) = Lenses.mainCamera(cameras)
+    private fun equivalentMm(info: CameraInfo) = Lenses.equivalentMm(info)
 
-    /** A lens the user can pick: which camera to bind and the zoom ratio that selects it. */
-    private class LensOption(val camera: CameraInfo, val zoom: Float, val ratio: Float, val physicalId: String? = null)
-
-    /**
-     * Every real lens, as a magnification of the main camera. Phones like the Galaxy
-     * S23 Ultra hide their 3x and 10x telephotos inside one logical camera that
-     * switches lens by zoom ratio; their physical cameras give the real focal lengths.
-     * Phones that expose each lens as its own camera are listed camera by camera.
-     */
-    private fun lensOptions(provider: ProcessCameraProvider): List<LensOption> {
-        val cameras = lenses(provider)
-        val main = mainCamera(cameras) ?: return emptyList()
-        val reference = equivalentMm(main).takeIf { it > 0f } ?: return emptyList()
-        val options = mutableListOf<LensOption>()
-        for (camera in cameras) {
-            val physical = runCatching { camera.physicalCameraInfos }.getOrDefault(emptySet())
-            val zoom = camera.zoomState.value
-            if (physical.size > 1 && zoom != null) {
-                // The logical camera's own focal length is its 1x lens.
-                val base = equivalentMm(camera).takeIf { it > 0f } ?: continue
-                val scale = base / reference
-                for (lens in physical) {
-                    val mm = equivalentMm(lens)
-                    if (mm <= 0f) continue
-                    val z = snapRatio(mm / base).coerceIn(zoom.minZoomRatio, zoom.maxZoomRatio)
-                    options += LensOption(camera, z, snapRatio(z * scale), runCatching { Camera2CameraInfo.from(lens).cameraId }.getOrNull())
-                }
-                options += LensOption(camera, 1f, snapRatio(scale))
-            } else {
-                val ratio = snapRatio(equivalentMm(camera) / reference)
-                if (camera !== main && lensDeadIds().contains(Camera2CameraInfo.from(camera).cameraId)) {
-                    // a lens this phone would not open: the same focal length by the main camera's zoom
-                    val range = main.zoomState.value
-                    val z = range?.let { ratio.coerceIn(it.minZoomRatio, it.maxZoomRatio) } ?: continue
-                    if (Math.abs(z / ratio - 1f) < 0.1f) options += LensOption(main, z, ratio)
-                } else options += LensOption(camera, 1f, ratio)
-            }
-        }
-        // One button per magnification; prefer the logical camera (zooms smoothly between lenses).
-        val unique = options.sortedBy { it.ratio }.fold(mutableListOf<LensOption>()) { acc, o ->
-            val last = acc.lastOrNull()
-            if (last != null && Math.abs(last.ratio / o.ratio - 1) < 0.08f) {
-                val more = o.camera.physicalCameraInfosOrEmpty().size - last.camera.physicalCameraInfosOrEmpty().size
-                // the logical camera first; on it, the main camera's own stop over a lens at the same ratio
-                if (more > 0 || (more == 0 && o.camera === last.camera && o.physicalId == null && last.physicalId != null))
-                    acc[acc.lastIndex] = o
-            } else acc += o
-            acc
-        }
-        // The usual stops up to the main camera's reach where no lens is listed: many phones keep
-        // their telephoto out of the lists apps see, yet switch to it by zoom ratio.
-        // Only when no telephoto is listed at all: a phone that lists its lenses keeps just them.
-        val max = main.zoomState.value?.maxZoomRatio ?: 1f
-        if (unique.none { it.ratio > 1.5f })
-            for (r in listOf(2f, 3f, 5f, 10f))
-                if (r <= max && unique.none { Math.abs(it.ratio / r - 1) < 0.15f }) unique += LensOption(main, r, r)
-        unique.sortBy { it.ratio }
-        return unique
-    }
-
-    private fun CameraInfo.physicalCameraInfosOrEmpty(): Set<CameraInfo> =
-        runCatching { physicalCameraInfos }.getOrDefault(emptySet())
-
-    /** Snap to the magnifications phones print on their lenses (0.6x, 3x, 10x...). */
-    private fun snapRatio(r: Float): Float {
-        val nice = floatArrayOf(0.5f, 0.6f, 0.7f, 1f, 1.5f, 2f, 2.5f, 3f, 3.5f, 4f, 5f, 6f, 10f)
-        val near = nice.minByOrNull { Math.abs(it / r - 1) } ?: r
-        return if (Math.abs(near / r - 1) < 0.1f) near else (r * 10).roundToInt() / 10f
-    }
-
-    /** The main camera: a logical one spanning lenses, else the highest resolution sensor. */
-    private fun mainCamera(cameras: List<CameraInfo>): CameraInfo? =
-        cameras.firstOrNull { it.physicalCameraInfosOrEmpty().size > 1 } ?: cameras.maxByOrNull { info ->
-            Camera2CameraInfo.from(info).getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                ?.let { it.width().toLong() * it.height() } ?: 0L
-        }
-
-    /** 35 mm equivalent focal length from the physical sensor diagonal. */
-    private fun equivalentMm(info: CameraInfo): Float {
-        val c = Camera2CameraInfo.from(info)
-        val focal = c.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return 0f
-        val sensor = c.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return focal
-        val diagonal = Math.hypot(sensor.width.toDouble(), sensor.height.toDouble())
-        return (focal * 43.27 / diagonal).toFloat()
-    }
-
-    /**
-     * [option] is the main camera at 1x (RAW); every other focal length shoots JPEG: other
-     * lenses, and the 2/3/5/10x stops (where a phone may switch to a telephoto it hides).
-     */
-    private fun onMain(option: LensOption): Boolean {
+    /** Rule 1: whether [o] is a lens opened by its own id (RAW then comes from that sensor). */
+    private fun rawRoute(o: LensOption): Boolean {
+        if (o.hiddenId != null) return o.hiddenId !in lensDeadIds()
+        if (o.physicalId != null || abs(o.zoom - 1f) >= 0.05f) return false
         val main = provider?.let { mainCamera(lenses(it)) } ?: return true
-        return option.camera === main && option.physicalId == null && Math.abs(option.zoom - 1f) < 0.05f
+        return o.camera === main || o.camera.physicalCameraInfosOrEmpty().size <= 1
     }
+
+    /** The found lens in use for RAW (LensProbe), or null. */
+    private var hiddenLens: String? = null
 
     /** Lenses that refused the zero-lag RAW session on this phone (kept across launches). */
     private val zslBlocked: MutableSet<String> by lazy {
@@ -3149,6 +3130,7 @@ class CameraActivity : ComponentActivity() {
         }
         fun switchNow() {
             front = !front; lensId = null; lastBoundId = null; lensWaits = 0; lensJpeg = false; lensExpected = null; pendingZoom = null
+            hiddenLens = null
             zslBusyTries = 0; reopenTries = 0
             viewfinder.onSessionFrame = { main.postDelayed({ reveal() }, 90) }
             main.postDelayed({ reveal() }, 3000) // a camera slow to come: uncovered all the same
@@ -3246,6 +3228,8 @@ class CameraActivity : ComponentActivity() {
             main.post {
                 if (zsl !== session) return@post
                 org.photoall.film.CrashReport.note(this@CameraActivity, "零延迟 RAW 会话失败（镜头 $id）", IllegalStateException(message))
+                // a found lens (rule 3): one refusal is enough; a passing "busy" gets its retries
+                if (id == hiddenLens && !(message.contains("被占用") && zslBusyTries < 2)) { hiddenFailed(id, message); return@post }
                 if (!refused) {
                     status.text = message
                     // still held by the camera before it, or taken away: connected again, twice
@@ -3446,8 +3430,14 @@ class CameraActivity : ComponentActivity() {
         if (count < 2) { trail("相机 $id 打开时出错一次，先照常重连"); return }
         fatalAtOpen.remove(id)
         val quirks = getSharedPreferences("camera_quirks", MODE_PRIVATE)
-        // a step down each time, kept for this lens: plain streams first, then no RAW
+        // a step down each time, kept for this lens (rule 4): the Xiaomi identity first, plain
+        // streams, the plainest requests, then no RAW
         val step = when {
+            vendorOn == id && !quirks.getBoolean("vendor_client_off_$id", false) -> {
+                quirks.edit().putBoolean("vendor_client_off_$id", true).apply()
+                vendorOn = null
+                "不再声明系统相机身份"
+            }
             !quirks.getBoolean("plain_streams_$id", false) -> {
                 quirks.edit().putBoolean("plain_streams_$id", true).apply()
                 "简化输出流"
@@ -3467,6 +3457,26 @@ class CameraActivity : ComponentActivity() {
         degraded("相机驱动出错，已自动改用更稳的设置（$step）重新连接")
         reopenTries = 0 // a new setting: its own tries
         main.postDelayed({ if (!isFinishing) bindCamera() }, 800)
+    }
+
+    /** The lens the Xiaomi identity was put on, this binding (rule 4 takes it off first). */
+    private var vendorOn: String? = null
+
+    /**
+     * Xiaomi (HyperOS / MIUI): the session says it is the system camera app, the vendor key
+     * com.xiaomi.sessionparams.clientName (the idea from PhotonCamera); the logical camera
+     * then switches to its telephotos for us as it does for the phone's own camera. Only on
+     * phones that list the key, and never again on a lens whose driver failed with it.
+     */
+    private fun vendorIdentity(id: String, extender: Camera2Interop.Extender<*>) {
+        if (!android.os.Build.MANUFACTURER.equals("xiaomi", ignoreCase = true)) return
+        if (getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("vendor_client_off_$id", false)) return
+        val full = runCatching { (getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager).getCameraCharacteristics(id) }.getOrNull() ?: return
+        val listed = full.availableSessionKeys.orEmpty() + full.availableCaptureRequestKeys
+        if (listed.none { it.name == XIAOMI_CLIENT }) return
+        extender.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.Key(XIAOMI_CLIENT, String::class.java), "com.android.camera")
+        if (vendorOn != id) trail("小米：会话声明系统相机身份（镜头 $id）")
+        vendorOn = id
     }
 
     private fun watchCameraState(bound: androidx.camera.core.Camera, id: String) {
@@ -3491,6 +3501,21 @@ class CameraActivity : ComponentActivity() {
         // one). A camera still OPENING is on its way (some phones take seconds the first time,
         // a nubia Red Magic among them): it is given up to 12 s before anything is done.
         checkOpened(bound, id, 0)
+    }
+
+    /** Rule 3 for a found lens: put aside for good, its focal length shot as JPEG by the zoom, said once. */
+    private fun hiddenFailed(id: String, why: String) {
+        lensDeadNow += id
+        getSharedPreferences("camera_quirks", MODE_PRIVATE).edit().putBoolean("lens_dead_$id", true).apply()
+        val mm = runCatching { LensProbe.equivalentMm((getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager)
+            .getCameraCharacteristics(id)).roundToInt() }.getOrDefault(0)
+        hiddenLens = null
+        lensJpeg = true
+        trail("找到的镜头 $id 打不开：$why")
+        org.photoall.film.CrashReport.note(this, "未列出的镜头打不开，改由手机变焦拍 JPEG（镜头 $id，${mm}mm）", IllegalStateException(why))
+        degraded("这台手机不让应用直接打开 ${mm}mm 镜头，这个焦段改拍 JPEG，由手机自己切换镜头")
+        buildZoomButtons()
+        bindCamera()
     }
 
     /** Lenses that would not open: for this run, and those that failed twice (kept). */
@@ -3644,13 +3669,26 @@ class CameraActivity : ComponentActivity() {
                 }
                 .build()
             val chars = Camera2CameraInfo.from(info)
-            val capabilities = chars.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+            // a found lens for RAW (rule 1): its own description; it is opened by the Camera2
+            // session below. Not with a flash mode that session does not take: JPEG then.
+            val flashOk = store[Settings.FLASH].toInt().let { it == 0 || it == Settings.FLASH_STEADY }
+            val hiddenId = hiddenLens?.takeIf { rawWanted() && flashOk }
+            val hiddenFull = hiddenId?.let { id ->
+                runCatching { (getSystemService(CAMERA_SERVICE) as android.hardware.camera2.CameraManager).getCameraCharacteristics(id) }.getOrNull()
+            }?.takeIf { ZslCamera.supported(it) }
+            if (hiddenLens != null && hiddenFull == null) {
+                lensJpeg = true // its focal length by the zoom (rule 2) this time
+                if (!flashOk && toldLens.add("hidden_flash")) degraded("闪光模式下这个焦段改拍 JPEG，由手机自己切换镜头")
+            }
+            fun <T> charOf(key: CameraCharacteristics.Key<T>): T? = if (hiddenFull != null) hiddenFull.get(key) else chars.getCameraCharacteristic(key)
+            val useId = if (hiddenFull != null) hiddenId!! else chars.cameraId
+            val capabilities = charOf(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
             // Calibrated white balance needs to write the colour matrix ourselves.
-            val calibration = Calibration { key -> chars.getCameraCharacteristic(key) }.takeIf {
+            val calibration = Calibration { key -> charOf(key) }.takeIf {
                 it.valid && CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING in capabilities
             }
             val view = object : Characteristics {
-                override fun <T> get(key: CameraCharacteristics.Key<T>): T? = chars.getCameraCharacteristic(key)
+                override fun <T> get(key: CameraCharacteristics.Key<T>): T? = charOf(key)
             }
             val controller = FilmExposure(view, calibration) { options ->
                 camera?.let { Camera2CameraControl.from(it.cameraControl).setCaptureRequestOptions(options) }
@@ -3658,8 +3696,8 @@ class CameraActivity : ComponentActivity() {
             exposure = controller
             getSharedPreferences("camera_quirks", MODE_PRIVATE).let { q ->
                 // a lens whose driver died at opening: only the settings it lists, and the plain ones
-                controller.strict = q.getBoolean("strict_requests_${chars.cameraId}", false)
-                controller.plain = controller.strict || q.getBoolean("raw_plain_${chars.cameraId}", false)
+                controller.strict = q.getBoolean("strict_requests_$useId", false)
+                controller.plain = controller.strict || q.getBoolean("raw_plain_$useId", false)
                 controller.systemTone = !store.flag(Settings.FILM_ON)
             }
             boundInfo = info
@@ -3680,6 +3718,11 @@ class CameraActivity : ComponentActivity() {
             }
             zsl?.close(wait = true) // released before any camera opens
             zsl = null
+            if (hiddenFull != null) {
+                trail("找到的镜头 $useId：用 Camera2 直接打开拍 RAW")
+                bindZsl(provider, useId, hiddenFull, controller)
+                return@addListener
+            }
             // HDR on a lens that streams RAW: the zero-lag session instead of CameraX.
             // a lens whose RAW this app cannot develop (an unreadable DNG format): JPEG
             val rawUnusable = getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_unusable_${chars.cameraId}", false)
@@ -3696,6 +3739,7 @@ class CameraActivity : ComponentActivity() {
             // The phone's 3A meters; its per-frame results drive the live readout and stills.
             val previewBuilder = Preview.Builder().setResolutionSelector(fourThree)
             Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(controller.captureCallback)
+            vendorIdentity(chars.cameraId, Camera2Interop.Extender(previewBuilder))
             val preview = previewBuilder.build()
             preview.surfaceProvider = viewfinder
             previewCase = preview
@@ -3726,6 +3770,7 @@ class CameraActivity : ComponentActivity() {
             val builder = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                 .setResolutionSelector(stillSize)
+            vendorIdentity(chars.cameraId, Camera2Interop.Extender(builder))
             if (rawCapture) builder.setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW)
             val imageCapture = builder.build()
             provider.unbindAll()
@@ -3952,6 +3997,10 @@ class CameraActivity : ComponentActivity() {
             lensButtons += option to b
         }
         facingButton.contentDescription = if (front) "切换到后置镜头" else "切换到前置镜头"
+        if (Style.glass && !org.photoall.film.ui.Skin.active && options.size > 1) {
+            lensRow.background = GradientDrawable().apply { cornerRadius = dp(24).toFloat(); setColor(0x40000000) }
+            lensRow.setPadding(dp(3), dp(3), dp(3), dp(3))
+        } else { lensRow.background = null; lensRow.setPadding(0, 0, 0, 0) }
         updateZoom()
     }
 
@@ -3969,8 +4018,8 @@ class CameraActivity : ComponentActivity() {
      */
     private fun formatOf(o: LensOption, main: CameraInfo?): String {
         if (!store.flag(Settings.RAW)) return "JPEG"
-        if (o.camera !== main || o.physicalId != null || abs(o.zoom - 1f) >= 0.05f) return "JPEG"
-        val id = Camera2CameraInfo.from(o.camera).cameraId
+        if (!rawRoute(o)) return "JPEG"
+        val id = o.hiddenId ?: Camera2CameraInfo.from(o.camera).cameraId
         if (getSharedPreferences("camera_quirks", MODE_PRIVATE).getBoolean("raw_unusable_$id", false)) return "JPEG"
         // bound on it now: what the camera really gives
         val bound = zsl?.cameraId ?: camera?.let { Camera2CameraInfo.from(it.cameraInfo).cameraId }
@@ -4294,12 +4343,22 @@ class CameraActivity : ComponentActivity() {
         markLens(option)
         // RAW from the lens itself, not the main sensor cropped: pin it (or unpin) and bind again
         // another lens than the main camera: JPEG (see lensJpeg); a change of format binds again
-        val jpeg = !onMain(option)
+        val jpeg = !rawRoute(option)
         // the lens to compare with what the camera reports: a listed lens, not a zoom stop
         val mainCam = provider?.let { mainCamera(lenses(it)) }
         lensExpected = option.physicalId ?: Camera2CameraInfo.from(option.camera).cameraId.takeIf { option.camera !== mainCam }
         if (jpeg && store.flag(Settings.RAW) && toldLens.add("jpeg"))
-            android.widget.Toast.makeText(this, "RAW 只用主摄（1 倍）拍；其他焦段拍 JPEG", android.widget.Toast.LENGTH_LONG).show()
+            android.widget.Toast.makeText(this, "RAW 只从镜头本身拍（主摄和各颗独立镜头）；变焦档位拍 JPEG，由手机自己切换镜头", android.widget.Toast.LENGTH_LONG).show()
+        // a found lens (rule 1) in or out: the camera is bound again for it
+        val hidden = option.hiddenId?.takeIf { !jpeg && store.flag(Settings.RAW) }
+        if (hidden != hiddenLens) {
+            hiddenLens = hidden
+            lensJpeg = jpeg
+            lensId = Camera2CameraInfo.from(option.camera).cameraId
+            pendingZoom = option.zoom
+            rebindForLens()
+            return
+        }
         if (jpeg != lensJpeg && store.flag(Settings.RAW)) {
             lensJpeg = jpeg
             lensId = Camera2CameraInfo.from(option.camera).cameraId
@@ -4976,6 +5035,17 @@ class CameraActivity : ComponentActivity() {
                             else -> "RAW"
                         }
                         handTuneShot { files[developed].copyTo(it, overwrite = true) }
+                        // 冲洗过程动画: this shot walked through the engine (its own copy of the frame)
+                        if (store.flag(Settings.DEVELOP_SHOW)) runCatching {
+                            val copy = File(cacheDir, "show_$stamp.dng")
+                            files[developed].copyTo(copy, overwrite = true)
+                            val lut = currentLut()
+                            val show = org.photoall.film.gallery.DevelopShowActivity.intent(this@CameraActivity, params,
+                                lut.first, lut.second, developOptions.exposureEv, true)
+                                .putExtra(org.photoall.film.gallery.DevelopShowActivity.EXTRA_DNG, copy.path)
+                                .putExtra(org.photoall.film.gallery.DevelopShowActivity.EXTRA_DELETE, true)
+                            runOnUiThread { if (!isFinishing) showDevelop(show) }
+                        }
                         finish(stamp, recipe, quality, kind, shot, log) {
                             try {
                                 engine().developDng(files.map { it.path },
@@ -6177,6 +6247,7 @@ class CameraActivity : ComponentActivity() {
             runOnUiThread {
                 // the new photo lands in the corner
                 thumbnail.setImageBitmap(thumb)
+                if (org.photoall.film.ui.Style.glass) org.photoall.film.ui.Style.setAmbient(thumb, thumb)
                 thumbnail.scaleX = 0.5f; thumbnail.scaleY = 0.5f; thumbnail.alpha = 0f
                 thumbnail.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(300)
                     .setInterpolator(android.view.animation.OvershootInterpolator(1.6f)).start()
@@ -7205,6 +7276,7 @@ class CameraActivity : ComponentActivity() {
                 Photos.thumbnail(this, latest)
             }
             runOnUiThread { thumbnail.setImageBitmap(thumb) }
+            if (org.photoall.film.ui.Style.glass) thumb?.let { org.photoall.film.ui.Style.setAmbient(it, it) }
         }
     }
 
@@ -7324,6 +7396,8 @@ class CameraActivity : ComponentActivity() {
     companion object {
         /** Zoomed this far on the main camera, a telephoto's reach: the shot goes to JPEG (see settleZoomLens). */
         private const val TELE_FROM = 1.8f
+        /** Xiaomi's vendor key naming the app a session belongs to (see vendorIdentity). */
+        private const val XIAOMI_CLIENT = "com.xiaomi.sessionparams.clientName"
         private const val TURN_OUT = 150L // the controls draw back
         private const val TURN_IN = 320L  // the new controls come in
         private const val CURTAIN_SHUT = 0L  // the blackout is instant

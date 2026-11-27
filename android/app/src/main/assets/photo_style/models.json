@@ -1,0 +1,39 @@
+{
+  "models": [
+    {
+      "source": "https://github.com/NVIDIA/FastPhotoStyle",
+      "commit": "af0c8fecce58aa71f76488546231214f6684be02",
+      "algorithm": "PhotoWCT 4-to-1, with the fast guided smoothing variant",
+      "checkpoint_sha256": {
+        "PhotoWCTModels/photo_wct.pth": "bedc114a83833de79e92b7166b37bc522db71a30bbfa13d0c4f36387789c8af5"
+      },
+      "asset_sha256": {
+        "fast_encoder1.onnx": "37642ec3420ba54614d8100cf7b62a0d499504c737b22bf9cf28b7aa7ead8257",
+        "fast_decoder1.onnx": "07bd97e42010ac5ab006a962845503bc5e84fbb59db992727e1eeccac1becfcf",
+        "fast_encoder2.onnx": "da5696f3e1e8d0b32e6f1a4cc98c33b7c5d8edf6991fa5f10dc104188e2c4ad6",
+        "fast_decoder2.onnx": "aae4f3c29288d93407d14095e5e6d44c7ce88816fc44a01cad55da5148ea7b84",
+        "fast_encoder3.onnx": "8e1d7e7e88480de4fd464f92152baee5fd6597304f18670b569be1cf8ac02aa5",
+        "fast_decoder3.onnx": "6c80ad80a2b7f39fcd4ba95f863fb370f38cbc653297fb9b1a9a7d28e3cdcfe5",
+        "fast_encoder4.onnx": "22c320933fe69058265fb30d05dd7d122cf285cc027ed12207783ca17068756e",
+        "fast_decoder4.onnx": "0840cdc2a9aace5cb6d6bd530559379ea7310289c89725f3d5702bfe52f15cd0"
+      }
+    },
+    {
+      "source": "https://github.com/clovaai/WCT2",
+      "commit": "05d17c02c6eb78a3e0afdbc1cf1d7549d4ad1543",
+      "algorithm": "WCT2 sum, low-frequency encoder transfer (-e)",
+      "checkpoint_sha256": {
+        "model_checkpoints/wave_encoder_sum_l4.pth": "8a7de006d6689e55cadbb152974b6a3f4f472d35d9e7a6ae5d862808f46f5a79",
+        "model_checkpoints/wave_decoder_sum_l4.pth": "447c2f1102c799af81b26f6b3eacee5aa6c98916105ca762bdb0fb01d9ca2b67"
+      },
+      "asset_sha256": {
+        "wave_encoder1.onnx": "f872d139d59868d335855d491d3c4d4b63fca5656aa3a272d10fd4d8b116f0b3",
+        "wave_encoder2.onnx": "07e2e1e2fb0050781272e6e138aecd4bdd076f0f6f02da520015d2e1d73a21b5",
+        "wave_encoder3.onnx": "360f6b1b003e68c0cf8ad0e3152f7d48a6767972ce0f2b36cfff39565daf20e9",
+        "wave_encoder4.onnx": "e60bea0689a3a696b5fb961488e4866fb6cf362a30f64ae7c28b6bb704611791",
+        "wave_decoder.onnx": "114dcc8adeceb4c8742c5e122260cef989bdad6a0a927c794ff75c1990501c16"
+      }
+    }
+  ],
+  "matmul_sha256": "2ed65aead25d45a6232e482424d42546fa0c87d3d89a2a938e9b4852e039a826"
+}

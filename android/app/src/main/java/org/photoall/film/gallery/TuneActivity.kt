@@ -202,7 +202,7 @@ class TuneActivity : ComponentActivity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             addView(top, LinearLayout.LayoutParams(-1, dp(52f)))
             // the picture a fixed share of the screen, whatever the display size: the settings
             // below keep the rest
@@ -362,6 +362,7 @@ class TuneActivity : ComponentActivity() {
             override fun onStartTrackingTouch(b: SeekBar) {}
             override fun onStopTrackingTouch(b: SeekBar) = show()
         })
+        Style.doubleTapReset(bar) { set(k, default(k)); show() }
         show()
         standardRefreshers += ::show
     }

@@ -34,6 +34,8 @@ class LensButton(context: Context) : View(context) {
     private var active = false
     private var t = 0f // 0 idle .. 1 in use (animated)
     private var animator: ValueAnimator? = null
+    /** The default theme: Apple's pills (dark discs, the one in use in yellow). */
+    private val apple = Style.glass && !Skin.active
 
     init {
         isClickable = true
@@ -61,9 +63,9 @@ class LensButton(context: Context) : View(context) {
         val cx = width / 2f
         val cy = height / 2f
         val r = min(width, height) / 2f * (0.86f + 0.14f * t)
-        disc.color = mix(0x80151515.toInt(), 0xf2e6e4dc.toInt(), t)
-        canvas.drawCircle(cx, cy, r, disc)
-        val ink = mix(0xfff2f0ea.toInt(), 0xff1c1c1a.toInt(), t)
+        disc.color = if (apple) mix(0x4d1c1c1e, 0x991c1c1e.toInt(), t) else mix(0x80151515.toInt(), 0xf2e6e4dc.toInt(), t)
+        canvas.drawCircle(cx, cy, if (apple) min(width, height) / 2f * (0.8f + 0.2f * t) else r, disc)
+        val ink = if (apple) mix(0xffffffff.toInt(), 0xffffd60a.toInt(), t) else mix(0xfff2f0ea.toInt(), 0xff1c1c1a.toInt(), t)
         number.color = ink
         unit.color = ink
         val nh = number.descent() - number.ascent()

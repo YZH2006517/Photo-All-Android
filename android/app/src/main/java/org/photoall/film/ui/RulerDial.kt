@@ -61,9 +61,12 @@ class RulerDial(context: Context) : View(context) {
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         // the ruler fades out towards both ends, into the panel
+        // glass: the panel is see-through, so the ticks themselves fade (erased towards the ends)
+        val edge = if (Style.glass) 0xff000000.toInt() else Style.SURFACE
         fadePaint.shader = LinearGradient(0f, 0f, w.toFloat(), 0f,
-            intArrayOf(Style.SURFACE, Style.SURFACE and 0x00ffffff, Style.SURFACE and 0x00ffffff, Style.SURFACE),
+            intArrayOf(edge, edge and 0x00ffffff, edge and 0x00ffffff, edge),
             floatArrayOf(0f, 0.18f, 0.82f, 1f), Shader.TileMode.CLAMP)
+        fadePaint.xfermode = if (Style.glass) android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.DST_OUT) else null
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -103,6 +106,7 @@ class RulerDial(context: Context) : View(context) {
     private var lastX = 0f
 
     override fun onDraw(canvas: Canvas) {
+        val layer = if (Style.glass) canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), null) else -1
         val cx = width / 2f
         val base = height * 0.6f
         val offset = -drag.coerceIn(-spacing, spacing) * 0.5f // a little give while dragging
@@ -119,6 +123,7 @@ class RulerDial(context: Context) : View(context) {
             }
         }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), fadePaint)
+        if (layer >= 0) canvas.restoreToCount(layer)
         // the hold: after a moment's grace, a line filling along the foot
         if (holdFrom != 0L) {
             val held = android.os.SystemClock.uptimeMillis() - holdFrom

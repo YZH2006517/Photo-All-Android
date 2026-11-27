@@ -1,0 +1,23 @@
+{
+  "model": "SepLUT-S (FiveK sRGB)",
+  "source": "https://github.com/ImCharlesY/SepLUT",
+  "commit": "49d8bc3f42c5dfc09140786d0da1e47e3adb0619",
+  "checkpoint": "SepLUT-FiveK-sRGB-M6#3D9#1D9.pth",
+  "checkpoint_sha256": "5f1651501c60abb8f61813dffeee2a12d7473553e9f6625b162cabea7f301ef8",
+  "asset_sha256": "83b948cd9b1e68c9cfffac9bc59b26c03496b75005bd2662b6c9e4ae8262c04c",
+  "checkpoint_tensor_count": 23,
+  "layout": {
+    "curves": [
+      1,
+      3,
+      9
+    ],
+    "cube": [
+      1,
+      3,
+      9,
+      9,
+      9
+    ]
+  }
+}

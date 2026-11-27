@@ -73,6 +73,25 @@ class StudioEntry(context: Context) : View(context) {
 
     private val moving get() = !Skin.calm && isAttachedToWindow && isShown && windowVisibility == VISIBLE
 
+    /**
+     * Glass (the default theme): the capsule as liquid glass, a thick clear pane over its
+     * scene: what is inside bends inward towards the rim, magnified a touch, a hair of
+     * colour split at the edge, light caught along the top rim and glowing up from the
+     * bottom one (Android 13+; before it the frosted pane alone).
+     */
+    private fun liquid(w: Int, h: Int) {
+        if (android.os.Build.VERSION.SDK_INT < 33 || w <= 0 || h <= 0) return
+        runCatching {
+            val rs = android.graphics.RuntimeShader(LIQUID)
+            val lip = 2 * d
+            rs.setFloatUniform("box", lip, lip, w - lip, h - lip)
+            rs.setFloatUniform("radius", (h - 2 * lip) / 2f)
+            rs.setFloatUniform("edge", (h - 2 * lip) * 0.42f)
+            rs.setFloatUniform("bend", 7f * d)
+            setRenderEffect(android.graphics.RenderEffect.createRuntimeShaderEffect(rs, "content"))
+        }.onFailure { android.util.Log.w("StudioEntry", "liquid glass", it) }
+    }
+
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
         if (visibility == VISIBLE) invalidate()
@@ -80,6 +99,7 @@ class StudioEntry(context: Context) : View(context) {
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
+
         under?.recycle(); over?.recycle(); under = null; over = null
     }
 
@@ -93,6 +113,7 @@ class StudioEntry(context: Context) : View(context) {
     override fun onDraw(c: Canvas) {
         val w = width.toFloat(); val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
+        if (face == 0 && Style.glass) { flat(c, w, h); return }
         val t = if (Skin.calm) 3.1f else ((System.nanoTime() - born) / 1e9).toFloat()
         val lip = 2 * d
         r.set(lip, lip, w - lip, h - lip)
@@ -123,11 +144,42 @@ class StudioEntry(context: Context) : View(context) {
         if (moving) postInvalidateDelayed(33)
     }
 
+    private val pane by lazy { Style.Glass(d, 0x1fffffff, 999f) }
+    private val faded = Paint().apply {
+        colorFilter = android.graphics.ColorMatrixColorFilter(android.graphics.ColorMatrix().apply { setSaturation(0.55f) })
+        alpha = 225
+    }
+
+    /**
+     * Glass (the default theme), flat: a frosted pill and in it the film in use, its 3D
+     * cartridge lying on its side, its colours softened. Still; looked at again now and
+     * then for a change of film.
+     */
+    private fun flat(c: Canvas, w: Float, h: Float) {
+        val lip = 2 * d
+        r.set(lip, lip, w - lip, h - lip)
+        pane.state = drawableState
+        pane.setBounds(r.left.toInt(), r.top.toInt(), r.right.toInt(), r.bottom.toInt())
+        pane.callback = this
+        pane.draw(c)
+        val store = org.photoall.film.settings.SettingsStore(context)
+        val name = if (store.flag(org.photoall.film.settings.Settings.FILM_ON))
+            org.photoall.film.engine.FilmEngine.filmStocks.getOrNull(store["film"].toInt()) ?: "" else ""
+        val stock = name.ifBlank { "kodak portra 400" }
+        // lying down: the cartridge's height runs across the pill
+        val len = minOf(r.width() * 0.62f, r.height() * 1.9f)
+        c.saveLayer(r.left, r.top, r.right, r.bottom, faded)
+        c.rotate(-90f, r.centerX(), r.centerY())
+        CartridgeSprites.draw(c, r.centerX(), r.centerY() + len / 2, len, stock, shadow = 0f) { invalidate() }
+        c.restore()
+        if (moving) postInvalidateDelayed(1500)
+    }
+
     private fun layer(draw: (Canvas) -> Unit): Bitmap? = runCatching {
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { draw(Canvas(it)) }
     }.getOrNull()
 
-    private fun bezelWidth() = when (face) { 7 -> 3.2f * d; 2, 8 -> 2.2f * d; else -> 2.6f * d }
+    private fun bezelWidth() = if (face == 0 && Style.glass) 1.4f * d else when (face) { 7 -> 3.2f * d; 2, 8 -> 2.2f * d; else -> 2.6f * d }
 
     /** The still part under the scene: the window's ground, its texture. */
     private fun background(c: Canvas) {
@@ -135,7 +187,10 @@ class StudioEntry(context: Context) : View(context) {
         c.save()
         clip.reset(); clip.addRoundRect(win, wr, wr, Path.Direction.CW); c.clipPath(clip)
         when (face) {
-            0 -> { vertical(c, 0xff1d1915.toInt(), 0xff0c0a08.toInt()); grain(c, 0x14ffffff, 900, 7) }
+            0 -> if (Style.glass) {
+                // glass: the ground shows through a frosted pane
+                p.color = 0x24ffffff; c.drawRect(win, p)
+            } else { vertical(c, 0xff1d1915.toInt(), 0xff0c0a08.toInt()); grain(c, 0x14ffffff, 900, 7) }
             1 -> {
                 vertical(c, 0xff1a0605.toInt(), 0xff0a0202.toInt())
                 // darkroom tiles on the wall
@@ -197,6 +252,15 @@ class StudioEntry(context: Context) : View(context) {
                 glass(c, 0.45f)
                 return
             }
+        }
+        if (face == 0 && Style.glass) { // glass: a rim of light, no metal
+            line.shader = LinearGradient(0f, r.top, 0f, r.bottom, intArrayOf(0x66ffffff, 0x14ffffff, 0x0affffff, 0x33ffffff),
+                floatArrayOf(0f, 0.35f, 0.7f, 1f), Shader.TileMode.CLAMP)
+            line.color = OPAQUE; line.strokeWidth = 1f * d
+            c.drawRoundRect(RectF(r.left + 0.5f * d, r.top + 0.5f * d, r.right - 0.5f * d, r.bottom - 0.5f * d), rr, rr, line)
+            line.shader = null
+            glass(c, 0.55f)
+            return
         }
         // a machined bezel: metal lit from above, a dark seat inside it
         val (lit, dark) = when (face) {
@@ -1081,3 +1145,38 @@ class StudioEntry(context: Context) : View(context) {
         p.color = ultra; c.drawCircle(ox, oy, 1.2f * d, p)
     }
 }
+
+private const val LIQUID = """
+    uniform shader content;
+    uniform float4 box;
+    uniform float radius;
+    uniform float edge;
+    uniform float bend;
+    float sd(float2 p, float2 b, float r) {
+        float2 q = abs(p) - b + r;
+        return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+    }
+    half4 main(float2 p) {
+        float2 c = (box.xy + box.zw) * 0.5;
+        float2 h = (box.zw - box.xy) * 0.5;
+        float2 lp = p - c;
+        float d = sd(lp, h, radius);
+        if (d > 0.0) return content.eval(p);
+        float t = clamp(1.0 + d / edge, 0.0, 1.0);
+        float2 n = float2(sd(lp + float2(1, 0), h, radius) - sd(lp - float2(1, 0), h, radius),
+                          sd(lp + float2(0, 1), h, radius) - sd(lp - float2(0, 1), h, radius));
+        n = n / max(length(n), 1e-4);
+        float k = t * t * t * bend;
+        float2 q = c + lp * 0.94 - n * k;
+        half4 col = content.eval(q);
+        col.r = content.eval(q - n * k * 0.3).r;
+        col.b = content.eval(q + n * k * 0.3).b;
+        // light on the rim: bright along the top, a softer glow up from the bottom
+        float top = pow(t, 6.0) * max(0.0, -n.y);
+        float bottom = pow(t, 5.0) * max(0.0, n.y);
+        col.rgb += half3(0.55 * top + 0.22 * bottom);
+        // the pane's body: a faint cool lift over the middle
+        col.rgb = mix(col.rgb, half3(1.0), half(0.05 + 0.08 * t));
+        return half4(col.rgb, max(col.a, half(0.9)));
+    }
+"""

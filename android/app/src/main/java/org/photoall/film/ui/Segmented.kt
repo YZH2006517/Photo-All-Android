@@ -24,10 +24,10 @@ class Segmented(context: Context, private val options: List<String>) : View(cont
     var enabled: (Int) -> Boolean = { true }
     var onPick: (Int) -> Unit = {}
     var onBlocked: (Int) -> Unit = {}
-    var trackColor = Style.BG
-    var indicatorColor = Style.SURFACE_2
+    var trackColor = if (!Style.glass) Style.BG else if (Style.palette.light) 0x14000000 else 0x1affffff
+    var indicatorColor = if (!Style.glass) Style.SURFACE_2 else if (Style.palette.light) 0xffffffff.toInt() else 0x40ffffff
     /** A capsule (round ends) instead of rounded corners; the thumb lifted with a soft shadow. */
-    var pill = false
+    var pill = Style.glass
     /** The words' colours, chosen and not (null: the theme's). */
     var onText: Int? = null
     var offText: Int? = null

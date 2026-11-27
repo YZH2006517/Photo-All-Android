@@ -1,0 +1,16 @@
+{
+  "zero_dce_curves.onnx": {
+    "source": "https://github.com/Li-Chongyi/Zero-DCE_extension",
+    "checkpoint": "Zero-DCE++/snapshots_Zero_DCE++/Epoch99.pth",
+    "authors": "Chongyi Li, Chunle Guo, Chen Change Loy",
+    "license": "CC BY-NC 4.0, academic research per upstream",
+    "sha256": "e8e1d4a1d3d949515dd29b68b9cdeb4c7f6db388c35b4641d915d42465c8d82a"
+  },
+  "ffdnet_rgb.onnx": {
+    "source": "https://github.com/cszn/KAIR",
+    "checkpoint": "releases/v1.0/ffdnet_color.pth",
+    "authors": "Kai Zhang, Wangmeng Zuo, Lei Zhang",
+    "license": "MIT (KAIR repository)",
+    "sha256": "1ebe3ad2f7628ae18d1a814379c354a4a6ddab2ded802301f792ff66da047cbe"
+  }
+}

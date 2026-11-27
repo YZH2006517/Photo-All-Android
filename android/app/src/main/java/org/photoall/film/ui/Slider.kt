@@ -17,7 +17,8 @@ import kotlin.math.roundToInt
  * messages (thousands per second with ~30 sliders) and drops frames. This one draws a
  * hairline track, the filled part and a round thumb, and decides by the first movement
  * whether a touch is a horizontal drag (the value) or a vertical one (the list scrolls).
- * A tap sets the value where it lands.
+ * A tap sets the value where it lands; with [onDoubleTap] set, a double tap calls it instead
+ * (the setting back to its default), the single tap then waiting a moment to be sure.
  */
 class Slider(context: Context) : View(context) {
     var max = 1000
@@ -26,6 +27,11 @@ class Slider(context: Context) : View(context) {
         set(value) { field = value.coerceIn(0, max); invalidate() }
     /** Called with the new progress when the user changes it. */
     var onChange: (Int) -> Unit = {}
+    /** A double tap: the value back to its default (null: a tap is only a tap). */
+    var onDoubleTap: (() -> Unit)? = null
+    private var lastTapAt = 0L
+    private var lastTapX = 0f
+    private var pendingTap: Runnable? = null
 
     private val density = resources.displayMetrics.density
     private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Style.HAIRLINE; strokeWidth = 2 * density; strokeCap = Paint.Cap.ROUND }
@@ -91,7 +97,7 @@ class Slider(context: Context) : View(context) {
                 return dragging || undecided
             }
             MotionEvent.ACTION_UP -> {
-                if (undecided) setFrom(event.x) // a tap
+                if (undecided) tap(event.x, event.eventTime) // a tap
                 val was = dragging
                 dragging = false
                 undecided = false
@@ -106,6 +112,22 @@ class Slider(context: Context) : View(context) {
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    private fun tap(x: Float, at: Long) {
+        val reset = onDoubleTap ?: return setFrom(x)
+        val again = at - lastTapAt < ViewConfiguration.getDoubleTapTimeout() && abs(x - lastTapX) < 6 * slop
+        pendingTap?.let { removeCallbacks(it) }
+        pendingTap = null
+        if (again) {
+            lastTapAt = 0L
+            reset()
+            return
+        }
+        lastTapAt = at
+        lastTapX = x
+        // a single tap sets the value once it is clear no second one follows
+        pendingTap = Runnable { pendingTap = null; setFrom(x) }.also { postDelayed(it, ViewConfiguration.getDoubleTapTimeout().toLong()) }
     }
 
     override fun performClick(): Boolean = super.performClick()

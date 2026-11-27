@@ -31,6 +31,9 @@ object Diagnostics {
         append("\n—— 本机已记下的兼容处理 ——\n")
         if (quirks.isEmpty()) append("无\n") else quirks.forEach { (k, v) -> append(k).append(" = ").append(v).append('\n') }
 
+        append("\n—— 未列出的镜头（逐个编号找过）——\n")
+        append(org.photoall.film.camera.LensProbe.notes(context)).append('\n')
+
         append("\n—— 相机（应用看到的样子）——\n")
         val manager = context.getSystemService(CameraManager::class.java)
         val ids = runCatching { manager.cameraIdList.toList() }.getOrDefault(emptyList())

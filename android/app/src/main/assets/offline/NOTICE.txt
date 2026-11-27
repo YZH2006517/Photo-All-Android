@@ -1,0 +1,58 @@
+ZRetouch offline adaptive color enhancement
+
+The bundled classifier and three learned LUT basis tensors are exported without
+retraining from Hui Zeng's Image-Adaptive-3DLUT sRGB pretrained checkpoints.
+
+Source: https://github.com/HuiZeng/Image-Adaptive-3DLUT
+Paper: Hui Zeng, Jianrui Cai, Lida Li, Zisheng Cao, Lei Zhang.
+Learning Image-adaptive 3D Lookup Tables for High Performance Photo Enhancement
+in Real-time. IEEE Transactions on Pattern Analysis and Machine Intelligence.
+
+The accompanying LICENSE.txt reproduces the upstream Apache License 2.0.
+manifest.json records source revision, checkpoint and exported-asset hashes.
+
+This mode runs a compact CNN and learned color transformation locally.
+It does not run the original VeraRetouch or SmartPhotoCrafter large models.
+
+Additional models in this app:
+
+Zero-DCE++, Chongyi Li, Chunle Guo and Chen Change Loy
+Source: https://github.com/Li-Chongyi/Zero-DCE_extension
+Upstream use: academic research, CC BY-NC 4.0
+License: https://creativecommons.org/licenses/by-nc/4.0/
+Modification: the original Epoch99 curve predictor is exported to ONNX. The
+published curve is applied to the full output image in the Android pipeline.
+
+FFDNet, Kai Zhang, Wangmeng Zuo and Lei Zhang
+Source: https://github.com/cszn/KAIR
+License: see LICENSE-KAIR.txt.
+Modification: original RGB weights are exported to an even-size ONNX graph;
+the Android pipeline handles tile padding and combines the results.
+
+SepLUT-S, Canqian Yang and coauthors
+Source: https://github.com/ImCharlesY/SepLUT
+License: Apache-2.0, reproduced in LICENSE-SepLUT.txt.
+The official FiveK-sRGB small checkpoint is exported with all learned weights.
+Android applies the generated 1D and 3D LUTs with the upstream interpolation.
+seplut-model.json records the source revision and asset hashes.
+
+NeurOp, Yili Wang and coauthors
+Source: https://github.com/amberwangyili/neurop
+License: MIT, reproduced in LICENSE-NeurOp.txt.
+The official FiveK-Lite checkpoint is exported as a strength predictor and
+three sequential pointwise operators for black clipping, exposure and vibrance.
+Android interpolates a 65 x 65 x 65 RGB lattice evaluated by those operators.
+
+AdaInt, Canqian Yang and coauthors
+Source: https://github.com/ImCharlesY/AdaInt
+License: Apache-2.0, reproduced in LICENSE-AdaInt.txt.
+The official FiveK-sRGB checkpoint is exported as a predictor for the 3D LUT
+and its nonuniform sampling vertices. Android applies the upstream adaptive
+trilinear interpolation to all output pixels.
+
+additional-color-models.json records the NeurOp and AdaInt checkpoint
+provenance, exported asset hashes and numerical export audit.
+
+Reference matching uses color statistics inspired by Reinhard et al.,
+Color Transfer between Images (DOI: 10.1109/38.946629), in Oklab as defined
+by Björn Ottosson (https://bottosson.github.io/posts/oklab/).

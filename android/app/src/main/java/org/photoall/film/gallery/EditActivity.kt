@@ -121,6 +121,9 @@ class EditActivity : Activity() {
     private lateinit var blendSlider: LineSlider
     private lateinit var balanceSlider: LineSlider
     private var saving: View? = null
+    /** 智能: AI under the hand edits (see [SmartTools]). */
+    private lateinit var smart: SmartTools
+    private var autoDone = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Style.apply(this)
@@ -139,13 +142,12 @@ class EditActivity : Activity() {
                 Style.pressable(this)
                 setOnClickListener { leave() }
             }, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.START or Gravity.CENTER_VERTICAL).apply { marginStart = dp(16) })
-            addView(TextView(this@EditActivity).apply {
-                text = "编辑"; textSize = 16f; typeface = Style.medium; setTextColor(Style.TEXT)
-            }, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
             addView(LinearLayout(this@EditActivity).apply {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(6), 0, dp(6), 0)
                 background = Style.surface(this@EditActivity, fill = Style.SURFACE, radiusDp = 22f)
+                addView(capsule("撤销", Style.TEXT_2, false) { undo() }.also { undoKey = it })
+                addView(View(this@EditActivity).apply { setBackgroundColor(Style.HAIRLINE) }, LinearLayout.LayoutParams(dp(1), dp(18)))
                 addView(capsule("还原", Style.TEXT_2, false) { resetAll() })
                 addView(View(this@EditActivity).apply { setBackgroundColor(Style.HAIRLINE) }, LinearLayout.LayoutParams(dp(1), dp(18)))
                 addView(capsule("存储", Style.ACCENT, true) { save() })
@@ -223,7 +225,13 @@ class EditActivity : Activity() {
         val curvePanel = curvePanel()
         val mixPanel = mixPanel()
         val gradePanel = gradePanel()
-        panels += listOf(adjustPanel, curvePanel, mixPanel, gradePanel, cropPanel)
+        smart = SmartTools(this, haptics) { b ->
+            // a new picture under the hand edits: graded again from it
+            base = b
+            basePx = IntArray(b.width * b.height).also { b.getPixels(it, 0, b.width, 0, 0, b.width, b.height) }
+            regrade()
+        }
+        panels += listOf(adjustPanel, curvePanel, mixPanel, gradePanel, smart.panel, cropPanel)
         for (p in panels) if (p !== adjustPanel) p.visibility = View.GONE
 
         val tabBar = LinearLayout(this).apply {
@@ -247,7 +255,7 @@ class EditActivity : Activity() {
             addView(tabBar, LinearLayout.LayoutParams(-1, dp(52)))
         }
         setContentView(FrameLayout(this).apply {
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             addView(column, FrameLayout.LayoutParams(-1, -1))
             setOnApplyWindowInsetsListener { v, insets ->
                 val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
@@ -258,6 +266,8 @@ class EditActivity : Activity() {
         choose(Adjust.EXPOSURE)
         paintTabs()
         paintAspects()
+        // opened for a tool (the chooser's AI 修图 → 智能): that tool showing
+        intent.getStringExtra(TOOL)?.let { t -> TOOLS.indexOf(t).takeIf { it >= 0 }?.let { setMode(it) } }
 
         worker.later {
             val b = decode(1600)?.let { srgb(it) }
@@ -267,6 +277,11 @@ class EditActivity : Activity() {
             runOnUiThread {
                 if (b == null) { Toast.makeText(this, "读不出这张照片", Toast.LENGTH_SHORT).show(); finish(); return@runOnUiThread }
                 base = b; basePx = px
+                smart.origin = b
+                groundFrom(b)
+                // from the AI camera: 一键 at once, the photo shown retouched (undo or 还原 takes it back)
+                if (intent.getBooleanExtra(AUTO, false) && !autoDone) { autoDone = true; smart.auto() }
+                editor.removeCallbacks(watch); editor.post(watch)
                 curveView.histogram = hist
                 editor.shown = b
                 editor.invalidate()
@@ -274,7 +289,14 @@ class EditActivity : Activity() {
         }
     }
 
+    @Deprecated("the photo picker for 智能 → 仿色")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        if (!smart.onResult(requestCode, resultCode, data)) super.onActivityResult(requestCode, resultCode, data)
+    }
+
     override fun onDestroy() {
+        editor.removeCallbacks(watch)
+        smart.close()
         worker.shutdownNow()
         grader.shutdownNow()
         super.onDestroy()
@@ -285,7 +307,7 @@ class EditActivity : Activity() {
 
     // ---- the edit ------------------------------------------------------------------------------
 
-    private fun edited() = look.edited || turns != 0 || flip || angle != 0f ||
+    private fun edited() = look.edited || smart.edited || turns != 0 || flip || angle != 0f ||
         crop.left > 0.0005f || crop.top > 0.0005f || crop.right < 0.9995f || crop.bottom < 0.9995f
 
     private fun choose(a: Adjust) {
@@ -530,9 +552,90 @@ class EditActivity : Activity() {
         editor.flipIn()
     }
 
+    // ---- 撤销 ---------------------------------------------------------------------------------------
+
+    /** Everything an edit is: the hand edits, the geometry, the 智能 steps. */
+    private class Snap(val look: Look, val turns: Int, val flip: Boolean, val angle: Float, val crop: RectF,
+                       val aspect: Aspect, val smart: SmartTools.State) {
+        fun same(o: Snap) = look.v.contentEquals(o.look.v) && (0..3).all { look.curves[it].contentEquals(o.look.curves[it]) } &&
+            look.hsl.contentEquals(o.look.hsl) && look.wheels.contentEquals(o.look.wheels) &&
+            turns == o.turns && flip == o.flip && angle == o.angle && crop == o.crop && aspect === o.aspect && smart == o.smart
+    }
+
+    private val history = ArrayDeque<Snap>()
+    private var committed: Snap? = null
+    private var undoKey: TextView? = null
+
+    private fun snap() = Snap(look.copy(), turns, flip, angle, RectF(crop), aspect, smart.state())
+
+    /**
+     * A step is kept once the edit has stood still a moment (a slider's drag is one step, not
+     * a hundred): the state before it goes on the stack.
+     */
+    private val watch = object : Runnable {
+        override fun run() {
+            checkpoint()
+            editor.postDelayed(this, 450)
+        }
+    }
+
+    private fun checkpoint() {
+        if (base == null) return
+        val now = snap()
+        val last = committed
+        if (last == null) { committed = now; return }
+        if (last.same(now)) return
+        history.addLast(last)
+        while (history.size > 50) history.removeFirst()
+        committed = now
+        paintUndo()
+    }
+
+    private fun paintUndo() = undoKey?.setTextColor(if (history.isEmpty()) Style.TEXT_2 else Style.TEXT)
+
+    /**
+     * The ground behind the editor from the photo being edited: its main colours picked out and
+     * laid as a smooth gradient with a glow (as a collage's), the glass over it bending them.
+     */
+    private fun groundFrom(photo: Bitmap) {
+        val g = window.decorView.background as? Style.Ambient ?: return
+        Thread {
+            val img = runCatching {
+                val tones = org.photoall.film.collage.Tones.of(photo)
+                Bitmap.createBitmap(72, 156, Bitmap.Config.ARGB_8888).also {
+                    org.photoall.film.collage.Tones.paint(android.graphics.Canvas(it), 72f, 156f, tones)
+                }
+            }.getOrNull() ?: return@Thread
+            runOnUiThread { if (!isFinishing) { g.own = img; window.decorView.invalidate(); editor.rootView.invalidate() } }
+        }.start()
+    }
+
+    /** Back one step: the edit as it stood before the last change. */
+    private fun undo() {
+        checkpoint()
+        val prev = history.removeLastOrNull() ?: return
+        haptics.play(Haptics.Event.SEGMENT)
+        prev.look.v.copyInto(look.v)
+        for (i in 0..3) look.curves[i] = prev.look.curves[i].copyOf()
+        prev.look.hsl.copyInto(look.hsl)
+        prev.look.wheels.copyInto(look.wheels)
+        turns = prev.turns; flip = prev.flip; angle = prev.angle
+        crop.set(prev.crop); aspect = prev.aspect
+        smart.restore(prev.smart)
+        committed = snap()
+        syncColourPanels()
+        slider.setValueQuiet(values[selected.ordinal]); straighten.setValueQuiet(angle)
+        chips.forEach { it.invalidate() }
+        paintAspects()
+        paintUndo()
+        regrade()
+        editor.invalidate()
+    }
+
     private fun resetAll() {
         if (!edited()) return
         look.resetAll()
+        smart.reset()
         syncColourPanels()
         turns = 0; flip = false; angle = 0f
         aspect = aspects[0]
@@ -620,20 +723,26 @@ class EditActivity : Activity() {
         saving = veil()
         worker.later {
             val result = runCatching {
-                val src = decode(8192)?.let { srgb(it) } ?: error("读不出原图")
+                // the AI steps hold whole pictures in memory several times: a smaller full size for them
+                val decoded = decode(if (smart.edited) 4800 else 8192)?.let { srgb(it) } ?: error("读不出原图")
+                val src = if (smart.edited) smart.fullOnModels(decoded) { msg -> runOnUiThread { saving?.findViewWithTag<TextView>("veil")?.text = "正在存储 · $msg" } }
+                    .also { if (it !== decoded) decoded.recycle() } else decoded
                 val out = render(src, v, t, f, a, c)
                 src.recycle()
-                Photos.saveJpeg(this, out, newName, store[Settings.JPEG_QUALITY].roundToInt(),
-                    listOf(description, "已编辑").filter { it.isNotEmpty() }.joinToString(" · "),
+                val saved = Photos.saveJpeg(this, out, newName, store[Settings.JPEG_QUALITY].roundToInt(),
+                    listOf(description, if (smart.edited) "AI 修图" else "", "已编辑").filter { it.isNotEmpty() }.joinToString(" · "),
                     ShotInfo.read(this, uri), private = private)
                 out.recycle()
+                saved
             }
             runOnUiThread {
                 saving?.let { (it.parent as? ViewGroup)?.removeView(it) }
                 saving = null
-                result.onSuccess {
+                result.onSuccess { saved ->
                     haptics.play(Haptics.Event.DEVELOPED)
-                    Toast.makeText(this, "已存为一张新照片", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, if (smart.detailSkipped) "已存为一张新照片；上次全尺寸「AI 清晰」让应用退出了，这次没有加清晰，下次会再试" else "已存为一张新照片",
+                        if (smart.detailSkipped) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+                    setResult(RESULT_OK, android.content.Intent().setData(saved)) // the collage takes the edited photo on
                     finish()
                 }.onFailure { Toast.makeText(this, "存储失败：${it.message}", Toast.LENGTH_LONG).show() }
             }
@@ -657,6 +766,7 @@ class EditActivity : Activity() {
                 }, LinearLayout.LayoutParams(dp(40), dp(40)))
                 addView(TextView(this@EditActivity).apply {
                     text = "正在按原图尺寸存储…"; textSize = 15f; setTextColor(Style.TEXT); typeface = Style.medium
+                    tag = "veil"
                 }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(14) })
             }, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         }
@@ -665,13 +775,52 @@ class EditActivity : Activity() {
         return v
     }
 
-    private fun decode(maxLong: Int): Bitmap? = runCatching {
-        ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, info, _ ->
-            val s = minOf(1f, maxLong.toFloat() / maxOf(info.size.width, info.size.height))
-            decoder.setTargetSize((info.size.width * s).toInt(), (info.size.height * s).toInt())
-            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+    /**
+     * The photo, at most [maxLong] on its long edge, 8-bit sRGB. A 10-bit HEIF or an HDR picture
+     * (HLG / PQ, as a Xiaomi 13 Ultra keeps them) is mapped to sRGB by the decoder itself. When
+     * the system decoder refuses the file, the older one reads it (sampled, turned by its EXIF);
+     * either failure is noted for the problem report, so a blank editor can be traced.
+     */
+    private fun decode(maxLong: Int): Bitmap? {
+        val sRGB = ColorSpace.get(ColorSpace.Named.SRGB)
+        val first = runCatching {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, info, _ ->
+                val s = minOf(1f, maxLong.toFloat() / maxOf(info.size.width, info.size.height))
+                decoder.setTargetSize(maxOf(1, (info.size.width * s).toInt()), maxOf(1, (info.size.height * s).toInt()))
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                decoder.setTargetColorSpace(sRGB)
+                decoder.setOnPartialImageListener { true } // a damaged tail: what was read is shown
+            }
         }
-    }.getOrNull()
+        first.getOrNull()?.let { return it }
+        val second = runCatching {
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            contentResolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxLong) sample *= 2
+            val b = contentResolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, android.graphics.BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                    inPreferredColorSpace = sRGB
+                })
+            } ?: error("旧解码器也读不出")
+            val degrees = contentResolver.openInputStream(uri)?.use {
+                when (android.media.ExifInterface(it).getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)) {
+                    android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            } ?: 0
+            if (degrees == 0) b else Bitmap.createBitmap(b, 0, 0, b.width, b.height, Matrix().apply { postRotate(degrees.toFloat()) }, true)
+                .also { if (it !== b) b.recycle() }
+        }
+        val why = first.exceptionOrNull() ?: IllegalStateException("ImageDecoder 返回空")
+        org.photoall.film.CrashReport.note(this,
+            if (second.isSuccess) "编辑：系统解码器读不出照片，已改用旧解码器" else "编辑：读不出照片（${second.exceptionOrNull()?.message}）", why)
+        return second.getOrNull()
+    }
 
     // ---- views ----------------------------------------------------------------------------------------
 
@@ -737,8 +886,21 @@ class EditActivity : Activity() {
         private val path = Path()
         private var scale = 1f
         private val showOld = Runnable { showOriginal = true; haptics.play(Haptics.Event.SEGMENT); invalidate() }
+        /** Looking closer (two fingers, outside 裁切): 1 is the whole picture. */
+        private var zoom = 1f
+        private var panX = 0f
+        private var panY = 0f
+
+        private fun zoomTo(k: Float, x: Float = 0f, y: Float = 0f) {
+            ValueAnimator.ofFloat(0f, 1f).apply {
+                val z0 = zoom; val x0 = panX; val y0 = panY
+                duration = 240; interpolator = PathInterpolator(0.3f, 0f, 0.1f, 1f)
+                addUpdateListener { val q = it.animatedValue as Float; zoom = z0 + (k - z0) * q; panX = x0 + (x - x0) * q; panY = y0 + (y - y0) * q; invalidate() }
+            }.start()
+        }
 
         fun animateMode(on: Boolean) {
+            if (on && zoom != 1f) zoomTo(1f)
             ValueAnimator.ofFloat(t, if (on) 1f else 0f).apply {
                 duration = 320; interpolator = PathInterpolator(0.3f, 0f, 0.1f, 1f)
                 addUpdateListener { t = it.animatedValue as Float; invalidate() }
@@ -774,7 +936,7 @@ class EditActivity : Activity() {
 
         override fun onDraw(c: Canvas) {
             val b0 = base ?: return
-            val b = if (showOriginal) b0 else (shown ?: b0)
+            val b = if (showOriginal) (smart.origin ?: b0) else (shown ?: b0)
             val fw = frameW().toFloat(); val fh = frameH().toFloat()
             full.set(0f, 0f, fw, fh)
             cropPx.set(crop.left * fw, crop.top * fh, crop.right * fw, crop.bottom * fh)
@@ -785,6 +947,8 @@ class EditActivity : Activity() {
             view.setTranslate(-win.centerX(), -win.centerY())
             view.postScale(scale, scale)
             view.postTranslate(width / 2f, height / 2f)
+            val z = 1f + (zoom - 1f) * (1f - t)
+            if (z != 1f) { view.postScale(z, z, width / 2f, height / 2f); view.postTranslate(panX * (1f - t), panY * (1f - t)) }
             frameMatrix(b.width, b.height, turns, flip, angle, m)
             m.postConcat(view)
             frameV.set(full); view.mapRect(frameV)
@@ -886,15 +1050,74 @@ class EditActivity : Activity() {
             return true
         }
 
+        private var pinchDist = 0f
+        private var pinchMid = floatArrayOf(0f, 0f)
+        private var lastX = 0f
+        private var lastY = 0f
+        private var moved = false
+        private var pinched = false
+        private var lastUp = 0L
+
+        /** Hold: the photo as it was. Two fingers: closer, moved about; one then moves it; double tap: whole again. */
         private fun holdToCompare(e: MotionEvent): Boolean {
             when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> postDelayed(showOld, 160)
+                MotionEvent.ACTION_DOWN -> {
+                    moved = false; pinched = false
+                    lastX = e.x; lastY = e.y
+                    postDelayed(showOld, 160)
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> if (e.pointerCount == 2) {
+                    removeCallbacks(showOld)
+                    if (showOriginal) showOriginal = false
+                    pinched = true
+                    parent.requestDisallowInterceptTouchEvent(true)
+                    pinchDist = hypot(e.getX(1) - e.getX(0), e.getY(1) - e.getY(0)).coerceAtLeast(1f)
+                    pinchMid = floatArrayOf((e.getX(0) + e.getX(1)) / 2, (e.getY(0) + e.getY(1)) / 2)
+                    invalidate()
+                }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    // the finger left behind carries on moving the picture
+                    val i = if (e.actionIndex == 0) 1 else 0
+                    lastX = e.getX(i); lastY = e.getY(i)
+                }
+                MotionEvent.ACTION_MOVE -> if (e.pointerCount >= 2) {
+                    val dd = hypot(e.getX(1) - e.getX(0), e.getY(1) - e.getY(0)).coerceAtLeast(1f)
+                    val mid = floatArrayOf((e.getX(0) + e.getX(1)) / 2, (e.getY(0) + e.getY(1)) / 2)
+                    val k = (zoom * dd / pinchDist).coerceIn(1f, 8f) / zoom
+                    // about the fingers: the point under them stays under them
+                    val cx = width / 2f; val cy = height / 2f
+                    panX = (panX + cx - pinchMid[0]) * k - cx + mid[0]
+                    panY = (panY + cy - pinchMid[1]) * k - cy + mid[1]
+                    zoom = (zoom * k).coerceIn(1f, 8f)
+                    pinchDist = dd; pinchMid = mid
+                    clampPan(); invalidate()
+                } else {
+                    val dx = e.x - lastX; val dy = e.y - lastY
+                    if (!moved && hypot(dx, dy) > 8 * d) { moved = true; removeCallbacks(showOld) }
+                    if (moved && zoom > 1.01f && !showOriginal) {
+                        parent.requestDisallowInterceptTouchEvent(true)
+                        panX += dx; panY += dy; clampPan(); invalidate()
+                    }
+                    if (moved) { lastX = e.x; lastY = e.y }
+                }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     removeCallbacks(showOld)
                     if (showOriginal) { showOriginal = false; invalidate() }
+                    if (e.actionMasked == MotionEvent.ACTION_UP && !moved && !pinched) {
+                        val now = e.eventTime
+                        if (now - lastUp < 280 && zoom > 1.01f) { zoomTo(1f); lastUp = 0 } else lastUp = now
+                    }
+                    if (zoom < 1.02f && zoom != 1f) zoomTo(1f)
                 }
             }
             return true
+        }
+
+        /** The picture kept over the view when closer: no further out than its own edges. */
+        private fun clampPan() {
+            // never a range turned inside out: zoom can land a hair under 1 after a pinch
+            val mx = (zoom - 1f).coerceAtLeast(0f) * width / 2f; val my = (zoom - 1f).coerceAtLeast(0f) * height / 2f
+            panX = panX.coerceIn(-mx, mx); panY = panY.coerceIn(-my, my)
         }
 
         private fun hit(x: Float, y: Float): Int {
@@ -1071,8 +1294,12 @@ class EditActivity : Activity() {
         const val NAME = "name"
         const val PRIVATE = "private"
         const val DESCRIPTION = "description"
+        /** The tool to open on, by its name in [TOOLS] (e.g. 智能). */
+        const val TOOL = "tool"
+        /** 智能's 一键 applied as the photo arrives (the AI camera). */
+        const val AUTO = "auto"
         /** The tools along the bottom; 裁切 last. */
-        val TOOLS = listOf("调整", "曲线", "混色", "分级", "裁切")
+        val TOOLS = listOf("调整", "曲线", "混色", "分级", "智能", "裁切")
 
         /**
          * The frame (the photo after its quarter turns, fw × fh) from a w × h picture: turned,

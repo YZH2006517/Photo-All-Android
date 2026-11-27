@@ -94,18 +94,45 @@ class GalleryActivity : Activity() {
         }
     }
 
+    /**
+     * The default theme (light frosted): laid out as Apple's Photos. Square photos edge to edge
+     * with hairline gaps, no captions, running under a header of frosted capsules that fades
+     * into them. The other themes keep the contact sheet (sprockets, frame numbers, film names).
+     */
+    private var apple = false
+    /** The header's fade into the photos (its colour follows the ground). */
+    private var headerFade: View? = null
+    /** The photo the ground was last made from. */
+    private var groundOf: android.net.Uri? = null
+    /** The user has moved the grid: a late header height no longer puts it back to the top. */
+    private var scrolledByHand = false
+    /** Thumbnails being read: each once, however often its cell is laid out meanwhile. */
+    private val pending = HashSet<String>()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         Style.apply(this)
         super.onCreate(savedInstanceState)
+        apple = Style.glass
         val settings = org.photoall.film.settings.SettingsStore(this)
+        // opened on one kind (拼贴相机's 作品 → 拼贴): that filter chosen
+        intent.getStringExtra(EXTRA_FILM)?.let { film = it }
         haptics = org.photoall.film.ui.Haptics(window.decorView) { settings[org.photoall.film.settings.Settings.HAPTICS].toInt() }
         title = TextView(this).apply {
             text = "相册"
             textSize = 16f; typeface = Style.medium; setTextColor(Style.TEXT); gravity = Gravity.CENTER
+            if (apple) { textSize = 28f; typeface = Typeface.create(Typeface.DEFAULT, 700, false); gravity = Gravity.START; includeFontPadding = false }
         }
         subtitle = TextView(this).apply {
             textSize = 10f; typeface = Typeface.MONOSPACE; setTextColor(Style.TEXT_2); gravity = Gravity.CENTER
             letterSpacing = 0.06f
+            if (apple) { textSize = 12f; typeface = Style.regular; letterSpacing = 0f; gravity = Gravity.START }
+        }
+        val openLightbox = {
+            haptics.play(org.photoall.film.ui.Haptics.Event.TICK)
+            startActivity(Intent(this@GalleryActivity, LightboxActivity::class.java)
+                .putExtra(ViewerActivity.FAVORITES, favoritesOnly)
+                .putExtra(ViewerActivity.FILM, film)
+                .putExtra(ViewerActivity.PRIVATE, privateOnly))
         }
         browseBar = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -113,21 +140,20 @@ class GalleryActivity : Activity() {
             addView(iconButton(Icon.Kind.BACK, "返回") { finish() }, LinearLayout.LayoutParams(dp(48), dp(48)))
             addView(LinearLayout(this@GalleryActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
+                gravity = if (apple) Gravity.START or Gravity.CENTER_VERTICAL else Gravity.CENTER
+                if (apple) setPadding(dp(8), 0, 0, 0)
                 addView(title)
                 addView(subtitle)
             }, LinearLayout.LayoutParams(0, -2, 1f))
             // the light table: this album's photos, roll by roll, under the same filter
-            addView(LightboxEntry(this@GalleryActivity).apply {
-                setOnClickListener {
-                    haptics.play(org.photoall.film.ui.Haptics.Event.TICK)
-                    startActivity(Intent(this@GalleryActivity, LightboxActivity::class.java)
-                        .putExtra(ViewerActivity.FAVORITES, favoritesOnly)
-                        .putExtra(ViewerActivity.FILM, film)
-                        .putExtra(ViewerActivity.PRIVATE, privateOnly))
-                }
-            }, LinearLayout.LayoutParams(dp(76), dp(34)).apply { marginEnd = dp(4) })
-            addView(textButton("选择") { selecting = true; refreshSelection() }, LinearLayout.LayoutParams(dp(56), dp(48)))
+            if (apple) {
+                addView(capsuleButton("观片台") { openLightbox() }, LinearLayout.LayoutParams(-2, dp(36)).apply { marginEnd = dp(8) })
+                addView(capsuleButton("选择") { selecting = true; refreshSelection() }, LinearLayout.LayoutParams(-2, dp(36)))
+            } else {
+                addView(LightboxEntry(this@GalleryActivity).apply { setOnClickListener { openLightbox() } },
+                    LinearLayout.LayoutParams(dp(76), dp(34)).apply { marginEnd = dp(4) })
+                addView(textButton("选择") { selecting = true; refreshSelection() }, LinearLayout.LayoutParams(dp(56), dp(48)))
+            }
         }
         selectTitle = TextView(this).apply {
             textSize = 16f; typeface = Style.medium; setTextColor(Style.ACCENT); gravity = Gravity.CENTER_VERTICAL
@@ -162,10 +188,10 @@ class GalleryActivity : Activity() {
         }
         grid = GridView(this).apply {
             numColumns = 3
-            horizontalSpacing = dp(6)
-            verticalSpacing = dp(10)
+            horizontalSpacing = if (apple) dp(2) else dp(6)
+            verticalSpacing = if (apple) dp(2) else dp(10)
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
-            setPadding(dp(12), dp(12), dp(12), dp(24))
+            if (apple) setPadding(0, 0, 0, dp(24)) else setPadding(dp(12), dp(12), dp(12), dp(24))
             clipToPadding = false
             selector = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
             // the contact sheet comes up cell by cell, row by row
@@ -205,16 +231,70 @@ class GalleryActivity : Activity() {
         // The film base: a strip of sprocket holes along the top, frames below.
         val sheet = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG) // the theme's ground, as the rest of the app
+            background = org.photoall.film.ui.Style.ground() // the theme's ground, as the rest of the app
             addView(SprocketStrip(this@GalleryActivity), LinearLayout.LayoutParams(-1, dp(12)))
             addView(FrameLayout(this@GalleryActivity).apply {
                 addView(grid, FrameLayout.LayoutParams(-1, -1))
                 addView(empty, FrameLayout.LayoutParams(-1, -1))
             }, LinearLayout.LayoutParams(-1, 0, 1f))
         }
+        if (apple) {
+            // the photos fill the screen; the header floats over them, fading into them
+            val header = LinearLayout(this).also { headerFade = it }.apply {
+                orientation = LinearLayout.VERTICAL
+                background = android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(0xf7f2f2f7.toInt(), 0xe6f2f2f7.toInt(), 0x00f2f2f7))
+                addView(browseBar, LinearLayout.LayoutParams(-1, dp(64)))
+                addView(selectBar, LinearLayout.LayoutParams(-1, dp(56)))
+                addView(HorizontalScrollView(this@GalleryActivity).apply {
+                    isHorizontalScrollBarEnabled = false
+                    clipToPadding = false
+                    addView(chips)
+                })
+                addView(restoreBanner, LinearLayout.LayoutParams(-1, -2).apply {
+                    marginStart = dp(12); marginEnd = dp(12); bottomMargin = dp(10)
+                })
+                setPadding(0, 0, 0, dp(14))
+            }
+            browseBar.setPadding(dp(8), 0, dp(12), 0)
+            chips.setPadding(dp(12), dp(2), dp(12), dp(6))
+            var barsBottom = 0
+            header.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+                val pad = bottom - top - dp(10)
+                if (pad != grid.paddingTop) {
+                    grid.setPadding(0, pad, 0, barsBottom + dp(24))
+                    if (!scrolledByHand) grid.post { grid.setSelection(0) }
+                }
+            }
+            grid.setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
+                override fun onScrollStateChanged(v: android.widget.AbsListView, state: Int) {
+                    if (state == android.widget.AbsListView.OnScrollListener.SCROLL_STATE_TOUCH_SCROLL) scrolledByHand = true
+                }
+                override fun onScroll(v: android.widget.AbsListView, first: Int, visible: Int, total: Int) {}
+            })
+            // the contact sheet built above is not used: its grid and empty note move here
+            for (v in listOf(grid, empty)) (v.parent as? ViewGroup)?.removeView(v)
+            setContentView(FrameLayout(this).apply {
+                background = org.photoall.film.ui.Style.ground()
+                addView(FrameLayout(this@GalleryActivity).apply {
+                    addView(grid, FrameLayout.LayoutParams(-1, -1))
+                    addView(empty, FrameLayout.LayoutParams(-1, -1))
+                }, FrameLayout.LayoutParams(-1, -1))
+                addView(header, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+                setOnApplyWindowInsetsListener { view, insets ->
+                    val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                    view.setPadding(bars.left, 0, bars.right, 0)
+                    header.setPadding(0, bars.top, 0, dp(14))
+                    barsBottom = bars.bottom
+                    if (grid.paddingBottom != bars.bottom + dp(24)) grid.setPadding(0, grid.paddingTop, 0, bars.bottom + dp(24))
+                    insets
+                }
+            })
+            return
+        }
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             addView(browseBar, LinearLayout.LayoutParams(-1, dp(56)))
             addView(selectBar, LinearLayout.LayoutParams(-1, dp(56)))
             addView(HorizontalScrollView(this@GalleryActivity).apply { isHorizontalFadingEdgeEnabled = true; setFadingEdgeLength((28 * resources.displayMetrics.density).toInt());
@@ -321,7 +401,36 @@ class GalleryActivity : Activity() {
             val list = Photos.list(this, favoritesOnly)
             runOnUiThread {
                 all = list
+                groundFromLatest()
                 applyFilter()
+            }
+        }
+    }
+
+    /**
+     * The ground (Apple's Photos layout): the latest photo's own colours, deep and frosted — its main
+     * tone at the top into its second, a soft glow up high, darker corners, a fine grain — so the
+     * album wears the colour of what was last taken. The header's fade takes the same colour.
+     */
+    private fun groundFromLatest() {
+        if (!apple) return
+        val latest = all.firstOrNull() ?: return
+        if (latest.uri == groundOf) return
+        groundOf = latest.uri
+        loader.later {
+            val thumb = Photos.thumbnail(this, latest) ?: return@later
+            val soft = if (thumb.config == android.graphics.Bitmap.Config.HARDWARE) thumb.copy(android.graphics.Bitmap.Config.ARGB_8888, false) else thumb
+            val t = org.photoall.film.collage.Tones.palette(soft ?: return@later)
+            // a wallpaper of the photo's colours: a pool of each, deep and frosted
+            val ground = org.photoall.film.collage.CollageUi.ToneGround(t)
+            val top = ground.top
+            runOnUiThread {
+                if (isFinishing) return@runOnUiThread
+                window.setBackgroundDrawable(ground)
+                // the content's own ground steps aside for the window's
+                (window.decorView.findViewById<android.view.ViewGroup>(android.R.id.content).getChildAt(0))?.background = null
+                headerFade?.background = android.graphics.drawable.GradientDrawable(android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf((top and 0x00ffffff) or 0xf2000000.toInt(), (top and 0x00ffffff) or 0xcc000000.toInt(), top and 0x00ffffff))
             }
         }
     }
@@ -549,11 +658,13 @@ class GalleryActivity : Activity() {
                     }, LinearLayout.LayoutParams(-2, -2))
                 })
             }
-            cell.layoutParams = AbsListView.LayoutParams(width, width * 4 / 3 + dp(18))
+            cell.layoutParams = AbsListView.LayoutParams(width, if (apple) width else width * 4 / 3 + dp(18))
             val frame = cell.getChildAt(0) as FrameLayout
             val image = frame.getChildAt(0) as ImageView
             val mark = frame.getChildAt(1) as ImageView
             val edge = cell.getChildAt(1) as LinearLayout
+            edge.visibility = if (apple) View.GONE else View.VISIBLE
+            if (apple) image.outlineProvider = android.view.ViewOutlineProvider.BOUNDS
             val photo = photos[position]
             val isSelected = photo.uri in selected
             image.animate().cancel()
@@ -576,11 +687,20 @@ class GalleryActivity : Activity() {
             image.tag = key
             val cached = cache.get(key)
             image.setImageBitmap(cached)
-            if (cached == null) loader.later {
-                val thumb = Photos.thumbnail(this@GalleryActivity, photo) ?: return@later
-                cache.put(key, thumb)
+            if (cached == null && pending.add(key)) loader.later {
+                val thumb = Photos.thumbnail(this@GalleryActivity, photo)
+                if (thumb != null) cache.put(key, thumb)
                 runOnUiThread {
-                    if (image.tag != key) return@runOnUiThread
+                    pending.remove(key)
+                    if (thumb == null) return@runOnUiThread
+                    // the cell went to another photo meanwhile: whichever cell shows this one now
+                    if (image.tag != key) {
+                        for (i in 0 until grid.childCount) {
+                            val other = ((grid.getChildAt(i) as? LinearLayout)?.getChildAt(0) as? FrameLayout)?.getChildAt(0) as? ImageView
+                            if (other?.tag == key) other.setImageBitmap(thumb)
+                        }
+                        return@runOnUiThread
+                    }
                     // frames develop in: a short fade as each thumbnail arrives, to the
                     // frame's own brightness (never to wherever an earlier fade had got to)
                     val target = if (selecting && photo.uri !in selected) 0.45f else 1f
@@ -633,7 +753,11 @@ class GalleryActivity : Activity() {
                 addView(edgeText().apply { text = "IMPORT" }, LinearLayout.LayoutParams(-2, -2))
             })
         }
-        cell.layoutParams = AbsListView.LayoutParams(width, width * 4 / 3 + dp(18))
+        cell.layoutParams = AbsListView.LayoutParams(width, if (apple) width else width * 4 / 3 + dp(18))
+        if (apple && convertView == null) (cell as LinearLayout).let {
+            it.getChildAt(1).visibility = View.GONE
+            it.getChildAt(0).background = Style.surface(this, fill = Style.SURFACE, radiusDp = 0f)
+        }
         cell.alpha = if (selecting) 0.35f else 1f
         return cell
     }
@@ -652,7 +776,7 @@ class GalleryActivity : Activity() {
         contentDescription = description
         setImageDrawable(Icon(kind, Style.TEXT))
         setPadding(dp(13), dp(13), dp(13), dp(13))
-        background = Style.surface(this@GalleryActivity, fill = Color.TRANSPARENT, radiusDp = 24f)
+        background = Style.surface(this@GalleryActivity, fill = if (apple) Style.SURFACE else Color.TRANSPARENT, radiusDp = 24f)
         setOnClickListener { onClick() }
     }
 
@@ -813,6 +937,16 @@ class GalleryActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
+    /** Apple's capsule button over the photos: frosted white, ink words. */
+    private fun capsuleButton(text: String, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text; textSize = 15f; typeface = Style.medium; setTextColor(Style.TEXT)
+        gravity = Gravity.CENTER
+        setPadding(dp(16), 0, dp(16), 0)
+        background = Style.surface(this@GalleryActivity, fill = Style.SURFACE, radiusDp = 18f)
+        Style.pressable(this)
+        setOnClickListener { onClick() }
+    }
+
     /** A filter chip: filled in the text colour when on, outlined when off. */
     private fun chip(text: String, on: Boolean, onClick: () -> Unit) = Button(this).apply {
         this.text = text
@@ -826,8 +960,9 @@ class GalleryActivity : Activity() {
         setPadding(paddingLeft, dp(5), paddingRight, dp(5))
         minHeight = dp(32); minimumHeight = dp(32)
         Style.pressable(this)
-        background = Style.surface(this@GalleryActivity, fill = if (on) Style.TEXT else Color.TRANSPARENT, radiusDp = 16f,
-            stroke = if (on) 0 else Style.HAIRLINE)
+        background = if (apple) Style.surface(this@GalleryActivity, fill = if (on) Style.TEXT else Style.SURFACE, radiusDp = 16f)
+            else Style.surface(this@GalleryActivity, fill = if (on) Style.TEXT else Color.TRANSPARENT, radiusDp = 16f,
+                stroke = if (on) 0 else Style.HAIRLINE)
         setTextColor(if (on) Style.BG else Style.TEXT_2)
         typeface = if (on) Style.medium else Style.regular
         setOnClickListener { onClick() }
@@ -866,6 +1001,8 @@ class GalleryActivity : Activity() {
 
     companion object {
         // Film base and edge print: the same in every theme.
+        /** The filter to open on (a film, or 拼贴 / 拼贴相机 / AI 修图 as photos are described). */
+        const val EXTRA_FILM = "film"
         const val FILM_BASE = 0xff121110.toInt()
         private const val READ_REQUEST = 3
         private val IMPORT = Any()

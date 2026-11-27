@@ -1,0 +1,59 @@
+[
+  {
+    "source": "https://github.com/amberwangyili/neurop",
+    "commit": "c24d731ea8e1d28e3650c4e62eeae02bdc36c0be",
+    "checkpoint": "pretrained_models/neurop_fivek_lite.pth",
+    "checkpoint_sha256": "dc7656818fb5625b3751f54100365b720060d5369dfaf3a4ce2cba8e68663699",
+    "checkpoint_tensor_count": 28,
+    "asset_sha256": {
+      "neurop_predictor.onnx": "655f52f4fc85c01b4ed7f81a8b28fa494db7355b0d73ebb8119a460a3ec91aa5",
+      "neurop_renderer.onnx": "50a901a53729482065fe779a757208ea970f860a906792554a619be93f10228e"
+    },
+    "model": "NeurOp (FiveK-Lite)",
+    "strengths": [
+      "black clipping",
+      "exposure",
+      "vibrance"
+    ],
+    "strengths_range": [
+      -1,
+      1
+    ],
+    "full_size_lattice_edge": 65,
+    "audit": {
+      "predictor_max_abs_error": 1.7881393432617188e-07,
+      "renderer_max_abs_error": 1.7434358596801758e-06,
+      "lattice_max_8bit_error": 7.0,
+      "lattice_highest_mean_8bit_error": 0.1881335973739624
+    }
+  },
+  {
+    "source": "https://github.com/ImCharlesY/AdaInt",
+    "commit": "5678851339dff90becb09c3dec41e7214207ccbc",
+    "checkpoint": "pretrained/AiLUT-FiveK-sRGB.pth",
+    "checkpoint_sha256": "bca51f280f148b1edaa71a863e6f57a78668162e2cc35fcd93b5a8c1ed81eacf",
+    "checkpoint_tensor_count": 23,
+    "asset_sha256": {
+      "adaint_fivek_srgb.onnx": "f97a816cbad13ffdf34bdace25c0cb6e49e73598e7445d3be324cf5a95176ff6"
+    },
+    "model": "AdaInt (FiveK sRGB)",
+    "layout": {
+      "vertices": [
+        1,
+        3,
+        33
+      ],
+      "cube": [
+        1,
+        3,
+        33,
+        33,
+        33
+      ]
+    },
+    "audit": {
+      "vertices": 2.384185791015625e-07,
+      "cube": 3.5762786865234375e-07
+    }
+  }
+]

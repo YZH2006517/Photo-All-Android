@@ -1,0 +1,51 @@
+{
+  "model": "iat",
+  "task": "LOL-v1 low-light RGB enhancement",
+  "repository": "https://github.com/cuiziteng/Illumination-Adaptive-Transformer",
+  "commit": "c76472265247f47cea57649af28b15018bb64cb1",
+  "checkpoint": "IAT_enhance/best_Epoch_lol_v1.pth",
+  "checkpoint_url": "https://github.com/cuiziteng/Illumination-Adaptive-Transformer/blob/c76472265247f47cea57649af28b15018bb64cb1/IAT_enhance/best_Epoch_lol_v1.pth",
+  "checkpoint_sha256": "6fb32236152283d3f3633ea1b79601c7e819efbf9d87d6b4767e1db0f1f3435b",
+  "checkpoint_tensor_count": 161,
+  "asset": "iat.onnx",
+  "asset_sha256": "f594e7666d1e8b7b17beff5de9b598a44fde317fb1fe64cab02e62eec4775bcd",
+  "asset_bytes": 518829,
+  "license": "Apache-2.0",
+  "license_file": "LICENSE-IAT.txt",
+  "input": {
+    "name": "image",
+    "dtype": "float32",
+    "shape": [
+      1,
+      3,
+      256,
+      256
+    ],
+    "range": [
+      0,
+      1
+    ],
+    "channels": "RGB",
+    "mean_std_normalization": false
+  },
+  "output": {
+    "name": "restored",
+    "dtype": "float32",
+    "shape": [
+      1,
+      3,
+      256,
+      256
+    ],
+    "channels": "RGB",
+    "postprocess": "clamp each channel to [0,1]"
+  },
+  "export": {
+    "opset": 17,
+    "runtime": "ONNX Runtime Android 1.23.2 CPU",
+    "modifications": "IAT output-selection wrapper only; original trained layers and weights retained",
+    "retinex_gt_mean_scaling": false,
+    "inference": "256x256 tiles with caller-owned overlap at original image resolution"
+  },
+  "functional_testing": "Not run at user's request"
+}

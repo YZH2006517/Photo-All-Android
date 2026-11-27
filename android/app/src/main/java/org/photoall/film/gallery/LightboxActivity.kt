@@ -261,7 +261,7 @@ class LightboxActivity : Activity() {
         }
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Style.BG)
+            background = org.photoall.film.ui.Style.ground()
             setOnApplyWindowInsetsListener { view, insets ->
                 // immersive: edge to edge, into the camera's cutout too
                 val bars = if (immersive) android.graphics.Insets.NONE
@@ -1021,7 +1021,7 @@ class LightboxActivity : Activity() {
             body.addView(content, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
             target = content
         }
-        fun slider(label: String, min: Float, max: Float, value: Float, format: (Float) -> String, onChange: (Float) -> Unit) {
+        fun slider(label: String, min: Float, max: Float, value: Float, format: (Float) -> String, default: Float, onChange: (Float) -> Unit) {
             val readout = TextView(this).apply { textSize = 13f; setTextColor(Style.TEXT_2); Style.numeric(this); text = format(value) }
             target.addView(LinearLayout(this).apply {
                 gravity = Gravity.CENTER_VERTICAL
@@ -1032,6 +1032,12 @@ class LightboxActivity : Activity() {
                 this.max = 1000
                 progress = (((value - min) / (max - min)) * 1000).roundToInt()
                 this.onChange = { p -> val v = min + (max - min) * p / 1000f; readout.text = format(v); onChange(v) }
+                // a double tap: this one back to its default
+                onDoubleTap = {
+                    progress = (((default - min) / (max - min)) * 1000).roundToInt()
+                    readout.text = format(default)
+                    onChange(default)
+                }
             }, LinearLayout.LayoutParams(-1, -2))
         }
 
@@ -1109,7 +1115,7 @@ class LightboxActivity : Activity() {
         pick(table.offColor, isCustom)
 
         section("背光")
-        slider("背光亮度", 40f, 160f, table.brightness.toFloat(), { "${it.roundToInt()}%" }) { v ->
+        slider("背光亮度", 40f, 160f, table.brightness.toFloat(), { "${it.roundToInt()}%" }, 100f) { v ->
             table.brightness = v.roundToInt(); prefs.edit().putInt("brightness", table.brightness).apply()
         }
 
@@ -1152,10 +1158,10 @@ class LightboxActivity : Activity() {
         }, LinearLayout.LayoutParams(-2, dp(40)).apply { topMargin = dp(6) })
 
         section("放大镜")
-        slider("镜片大小", 0.12f, 0.45f, table.lensSize, { "${(it * 200).roundToInt()}%" }) { v ->
+        slider("镜片大小", 0.12f, 0.45f, table.lensSize, { "${(it * 200).roundToInt()}%" }, 0.35f) { v ->
             table.lensSize = v; prefs.edit().putFloat("lens_size", v).apply()
         }
-        slider("倍率", 1.5f, 8f, table.magnification, { "%.1f×".format(it) }) { v ->
+        slider("倍率", 1.5f, 8f, table.magnification, { "%.1f×".format(it) }, 3f) { v ->
             table.magnification = v; table.refresh(); prefs.edit().putFloat("magnification", v).apply()
         }
 
@@ -1165,7 +1171,7 @@ class LightboxActivity : Activity() {
             select(if (table.stripHorizontal) 1 else 0, animate = false)
             onPick = { i -> table.stripHorizontal = i == 1; prefs.edit().putBoolean("strip_horizontal", i == 1).apply() }
         }, LinearLayout.LayoutParams(-1, dp(36)).apply { topMargin = dp(8); bottomMargin = dp(4) })
-        slider("每张停留", 2f, 15f, table.secondsPerFrame, { "%.1f 秒".format(it) }) { v ->
+        slider("每张停留", 2f, 15f, table.secondsPerFrame, { "%.1f 秒".format(it) }, 6f) { v ->
             table.secondsPerFrame = v; prefs.edit().putFloat("seconds", v).apply()
         }
         target.addView(TextView(this).apply {
